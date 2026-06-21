@@ -308,9 +308,13 @@ def _try_enable_pgvector(conn) -> bool:
     work via the REAL[] column + numpy fallback.
     """
     try:
-        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # Savepoint: if CREATE EXTENSION fails (not installed / no privilege), only
+        # this is rolled back — NOT the surrounding init transaction (which holds the
+        # embedding column and all other schema). A bare conn.rollback() here would
+        # silently undo the whole init.
+        with conn.transaction():
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     except Exception as exc:  # noqa: BLE001
-        conn.rollback()
         _log.info("pgvector not enabled (%s); using REAL[] + numpy fallback", exc)
         return False
     if not has_pgvector(conn):

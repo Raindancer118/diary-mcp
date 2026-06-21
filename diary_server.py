@@ -1544,6 +1544,7 @@ def _ensure_remote_schema(conn) -> None:
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]")
     # Remove the legacy updated_at trigger if present — it corrupts last-write-wins sync.
     conn.execute("DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes")
 
