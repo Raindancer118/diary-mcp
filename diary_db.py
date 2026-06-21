@@ -19,6 +19,8 @@ from typing import Generator
 import psycopg
 from psycopg.rows import dict_row
 
+from diary_embed import EMBED_DIM
+
 _log = logging.getLogger(__name__)
 
 DATA_DIR_PATH = None  # kept for diary_http_receiver compatibility; actual DB is Postgres
@@ -242,6 +244,9 @@ _SCHEMA = [
     # origin: 'curated' = von Claude bewusst gespeichert (Default-Suche).
     #         'extracted' = automatisch aus Chat-Transkripten geerntet (nur auf Anfrage).
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'",
+    # Semantic search: embedding vector stored as REAL[] (cosine computed in Python,
+    # no pgvector needed at this scale). NULL until embedded.
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]",
     "CREATE INDEX IF NOT EXISTS memory_nodes_autoinject_idx ON memory_nodes(auto_inject) WHERE auto_inject",
     "CREATE INDEX IF NOT EXISTS memory_nodes_origin_idx ON memory_nodes(origin)",
     # Knowledge-graph: associative links between memory nodes
@@ -289,10 +294,41 @@ _SEED_CATEGORIES = [
 ]
 
 
+def has_pgvector(conn) -> bool:
+    """True if the pgvector extension is installed in the connected database."""
+    row = conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
+    return row is not None
+
+
+def _try_enable_pgvector(conn) -> bool:
+    """Create the pgvector extension and the indexed vector column if possible.
+
+    Returns True if pgvector is available afterwards. Degrades gracefully: if the
+    extension can't be created (not installed / no privilege), embeddings still
+    work via the REAL[] column + numpy fallback.
+    """
+    try:
+        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        _log.info("pgvector not enabled (%s); using REAL[] + numpy fallback", exc)
+        return False
+    if not has_pgvector(conn):
+        return False
+    # Indexed vector column derived from the canonical REAL[] `embedding`.
+    conn.execute(f"ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding_v vector({EMBED_DIM})")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS memory_nodes_embv_idx "
+        "ON memory_nodes USING hnsw (embedding_v vector_cosine_ops)"
+    )
+    return True
+
+
 def init_db() -> None:
     with get_db() as conn:
         for stmt in _SCHEMA:
             conn.execute(stmt)
+        _try_enable_pgvector(conn)
         for path, _, type_, title in _SEED_CATEGORIES:
             slug = path.strip("/")
             conn.execute(

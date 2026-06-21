@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 import psycopg
 from psycopg.rows import dict_row
 
+import diary_embed
 from diary_config import load_config, save_config
 from diary_db import (
     _BACKFILL_PARENT_SQL,
@@ -934,6 +935,28 @@ def memory_get(path: str) -> str:
     return "\n".join(lines)
 
 
+_pgvector_cache: dict[str, bool] = {}
+
+
+def _pgvector_ready(conn) -> bool:
+    """Cache whether the connected DB has pgvector (per database URL)."""
+    from diary_db import get_database_url, has_pgvector
+    url = get_database_url()
+    if url not in _pgvector_cache:
+        _pgvector_cache[url] = has_pgvector(conn)
+    return _pgvector_cache[url]
+
+
+def _refresh_vector(conn, path: str, embedding) -> None:
+    """Populate the indexed embedding_v column from the REAL[] embedding (pgvector only)."""
+    if embedding is None or not _pgvector_ready(conn):
+        return
+    conn.execute(
+        "UPDATE memory_nodes SET embedding_v = embedding::vector WHERE path = %s",
+        (path,),
+    )
+
+
 @mcp.tool()
 def memory_upsert(
     path: str,
@@ -961,6 +984,7 @@ def memory_upsert(
     """
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
     valid_until_val = valid_until.strip() if valid_until else None
+    embedding = diary_embed.embed(f"{title}\n{body}")  # None if model unavailable
 
     with get_db() as conn:
         parent_id = _ensure_memory_parent(conn, path)
@@ -970,16 +994,19 @@ def memory_upsert(
         if existing:
             conn.execute(
                 "UPDATE memory_nodes SET title=%s, body=%s, type=%s, tags=%s, "
-                "importance=%s, valid_until=%s, auto_inject=%s, origin=%s, updated_at=now() WHERE path=%s",
-                (title, body, type, tag_list, importance, valid_until_val, auto_inject, origin, path),
+                "importance=%s, valid_until=%s, auto_inject=%s, origin=%s, embedding=%s, "
+                "updated_at=now() WHERE path=%s",
+                (title, body, type, tag_list, importance, valid_until_val, auto_inject, origin, embedding, path),
             )
+            _refresh_vector(conn, path, embedding)
             return f"Memory '{path}' aktualisiert."
         else:
             conn.execute(
-                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, auto_inject, origin),
+                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, embedding) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, auto_inject, origin, embedding),
             )
+            _refresh_vector(conn, path, embedding)
             return f"Memory '{path}' erstellt."
 
 
@@ -1109,22 +1136,119 @@ def memory_search(query: str, include_extracted: bool = False) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def memory_search_semantic(query: str, top_k: int = 8, include_extracted: bool = False) -> str:
+    """Semantische Suche im Memory-Tree über Embeddings (sprachübergreifend).
+
+    Im Gegensatz zu memory_search (lexikalisch, Stichwort-basiert) findet diese
+    Suche Memories nach BEDEUTUNG — auch wenn andere Wörter oder eine andere
+    Sprache verwendet werden (z.B. deutsche Anfrage findet englischen Inhalt).
+    Nutze sie, wenn du ein Konzept suchst und die genauen Begriffe nicht kennst.
+
+    Bei vielen Memories nutzt sie automatisch den pgvector-HNSW-Index (schnell);
+    sonst einen numpy-Fallback. include_extracted=True bezieht die auto-extrahierten
+    Memories mit ein (kostspieliger).
+    """
+    qvec = diary_embed.embed(query)
+    if qvec is None:
+        return ("Semantische Suche nicht verfügbar (Embedding-Modell konnte nicht geladen "
+                "werden). Nutze stattdessen memory_search(query).")
+
+    qlit = "[" + ",".join(repr(float(x)) for x in qvec) + "]"  # pgvector text format
+    origin_clause = "" if include_extracted else "AND origin = 'curated'"
+    with get_db() as conn:
+        if _pgvector_ready(conn):
+            rows = conn.execute(
+                f"""SELECT path, title, type, origin,
+                           1 - (embedding_v <=> %s::vector) AS score,
+                           substr(coalesce(body,''), 1, 160) AS snippet
+                    FROM memory_nodes
+                    WHERE embedding_v IS NOT NULL {origin_clause}
+                    ORDER BY embedding_v <=> %s::vector LIMIT %s""",
+                (qlit, qlit, top_k),
+            ).fetchall()
+            backend = "pgvector/HNSW"
+        else:
+            candidates = conn.execute(
+                f"SELECT path, title, type, origin, embedding, "
+                f"substr(coalesce(body,''),1,160) AS snippet "
+                f"FROM memory_nodes WHERE embedding IS NOT NULL {origin_clause}"
+            ).fetchall()
+            scored = []
+            for c in candidates:
+                s = diary_embed.cosine(qvec, c["embedding"])
+                scored.append({**c, "score": s})
+            scored.sort(key=lambda r: r["score"], reverse=True)
+            rows = scored[:top_k]
+            backend = "numpy"
+
+    if not rows:
+        return f"Keine semantischen Treffer für '{query}'. (Tipp: memory_reembed_all falls Embeddings fehlen.)"
+
+    lines = [f"Semantische Suche [{backend}] für '{query}':"]
+    for r in rows:
+        tag = "" if r.get("origin", "curated") == "curated" else " ⟨auto-extrahiert⟩"
+        lines.append(f"\n[{r['type']}] {r['path']} — {r['title']}{tag}  (Score {r['score']:.2f})")
+        if r.get("snippet"):
+            lines.append(f"  {r['snippet']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def memory_reembed_all(only_missing: bool = True) -> str:
+    """(Re-)berechnet Embeddings für Memories und füllt den Vektor-Index.
+
+    only_missing=True (Default): nur Nodes ohne Embedding. False: alle neu berechnen
+    (z.B. nach Modellwechsel). Nötig nach dem ersten Aktivieren der semantischen Suche
+    oder nach dem Import bestehender Memories.
+    """
+    if not diary_embed.is_available():
+        return "Embedding-Modell nicht verfügbar — fastembed/Modell konnte nicht geladen werden."
+
+    with get_db() as conn:
+        cond = "WHERE embedding IS NULL" if only_missing else ""
+        rows = conn.execute(
+            f"SELECT path, title, body FROM memory_nodes {cond}"
+        ).fetchall()
+        if not rows:
+            return "Nichts zu embedden — alle Memories haben bereits Embeddings."
+
+        texts = [f"{r['title']}\n{r['body'] or ''}" for r in rows]
+        vecs = diary_embed.embed_many(texts)
+
+        done = 0
+        pgv = _pgvector_ready(conn)
+        for r, v in zip(rows, vecs):
+            if v is None:
+                continue
+            conn.execute("UPDATE memory_nodes SET embedding = %s WHERE path = %s", (v, r["path"]))
+            if pgv:
+                conn.execute(
+                    "UPDATE memory_nodes SET embedding_v = embedding::vector WHERE path = %s",
+                    (r["path"],),
+                )
+            done += 1
+
+    backend = "pgvector-Index aktualisiert" if pgv else "numpy-Fallback (kein pgvector)"
+    return f"{done} Memories (re-)embedded. {backend}."
+
+
 _SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
-              "valid_until, auto_inject, origin, created_at, updated_at")
+              "valid_until, auto_inject, origin, embedding, created_at, updated_at")
 _SYNC_INSERT = """INSERT INTO memory_nodes
-       (path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, created_at, updated_at)
-       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+       (path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, embedding, created_at, updated_at)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
        ON CONFLICT (path) DO UPDATE SET
            type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
            tags=EXCLUDED.tags, importance=EXCLUDED.importance,
            valid_until=EXCLUDED.valid_until, auto_inject=EXCLUDED.auto_inject,
-           origin=EXCLUDED.origin, updated_at=EXCLUDED.updated_at"""
+           origin=EXCLUDED.origin, embedding=EXCLUDED.embedding, updated_at=EXCLUDED.updated_at"""
 
 
 def _sync_row(n: dict) -> tuple:
     return (n["path"], n["slug"], n["type"], n["title"], n["body"], n["tags"],
             n["importance"], n["valid_until"], n["auto_inject"], n["origin"],
-            n["created_at"], n["updated_at"])
+            n["embedding"], n["created_at"], n["updated_at"])
 
 
 @mcp.tool()
@@ -1186,9 +1310,14 @@ def memory_sync() -> str:
                     local_conn.execute(_SYNC_INSERT, _sync_row(remote_n))
                     pulled += 1
 
-        # Re-link parent_id on both sides after path-based upserts
+        # Re-link parent_id on both sides + refresh vector index for newly pulled rows
         with get_db() as local_conn:
             local_conn.execute(_BACKFILL_PARENT_SQL)
+            if _pgvector_ready(local_conn):
+                local_conn.execute(
+                    "UPDATE memory_nodes SET embedding_v = embedding::vector "
+                    "WHERE embedding IS NOT NULL AND embedding_v IS NULL"
+                )
         with remote_db_url() as rurl:
             rc = psycopg.connect(rurl)
             try:
