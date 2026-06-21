@@ -241,6 +241,9 @@ _SCHEMA = [
     # Migrations: add columns to existing tables (idempotent)
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ",
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE",
+    # reinject_on_compact: re-inject this memory into context after a compaction
+    # (for setups that compact often). Independent of auto_inject (session start).
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS reinject_on_compact BOOLEAN DEFAULT FALSE",
     # origin: 'curated' = von Claude bewusst gespeichert (Default-Suche).
     #         'extracted' = automatisch aus Chat-Transkripten geerntet (nur auf Anfrage).
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'",

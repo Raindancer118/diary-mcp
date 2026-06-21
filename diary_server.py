@@ -20,9 +20,11 @@ from diary_db import (
     get_remote_db,
     get_remote_ssh_host,
     get_remote_url,
+    has_pgvector,
     init_db,
     remote_db_url,
 )
+from diary_embed import EMBED_DIM
 
 _log = logging.getLogger(__name__)
 mcp = FastMCP("Diary")
@@ -1234,22 +1236,26 @@ def memory_reembed_all(only_missing: bool = True) -> str:
 
 
 _SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
-              "valid_until, auto_inject, origin, embedding, config, created_at, updated_at")
+              "valid_until, auto_inject, reinject_on_compact, origin, embedding, config, "
+              "created_at, updated_at")
 _SYNC_INSERT = """INSERT INTO memory_nodes
-       (path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, embedding, config, created_at, updated_at)
-       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+       (path, slug, type, title, body, tags, importance, valid_until, auto_inject,
+        reinject_on_compact, origin, embedding, config, created_at, updated_at)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
        ON CONFLICT (path) DO UPDATE SET
            type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
            tags=EXCLUDED.tags, importance=EXCLUDED.importance,
            valid_until=EXCLUDED.valid_until, auto_inject=EXCLUDED.auto_inject,
+           reinject_on_compact=EXCLUDED.reinject_on_compact,
            origin=EXCLUDED.origin, embedding=EXCLUDED.embedding,
            config=EXCLUDED.config, updated_at=EXCLUDED.updated_at"""
 
 
 def _sync_row(n: dict) -> tuple:
     return (n["path"], n["slug"], n["type"], n["title"], n["body"], n["tags"],
-            n["importance"], n["valid_until"], n["auto_inject"], n["origin"],
-            n["embedding"], json.dumps(n["config"]) if n.get("config") is not None else "{}",
+            n["importance"], n["valid_until"], n["auto_inject"], n["reinject_on_compact"],
+            n["origin"], n["embedding"],
+            json.dumps(n["config"]) if n.get("config") is not None else "{}",
             n["created_at"], n["updated_at"])
 
 
@@ -1324,6 +1330,10 @@ def memory_sync() -> str:
             rc = psycopg.connect(rurl)
             try:
                 rc.execute(_BACKFILL_PARENT_SQL)
+                # Populate the remote HNSW index from synced REAL[] embeddings (if pgvector).
+                if has_pgvector(rc):
+                    rc.execute("UPDATE memory_nodes SET embedding_v = embedding::vector "
+                               "WHERE embedding IS NOT NULL AND embedding_v IS NULL")
                 rc.commit()
             finally:
                 rc.close()
@@ -1481,6 +1491,28 @@ def memory_set_auto_inject(path: str, enabled: bool = True) -> str:
 
 
 @mcp.tool()
+def memory_set_reinject_on_compact(path: str, enabled: bool = True) -> str:
+    """Markiert ein Memory, damit es nach einer Kontext-Kompaktierung neu injiziert wird.
+
+    Für Setups/Modelle, die häufig kompaktieren: so markierte Memories werden vom
+    SessionStart-Hook (source='compact') automatisch wieder in den Kontext geladen,
+    damit kritische Infos eine Kompaktierung „überleben". Unabhängig von auto_inject
+    (das nur beim normalen Session-Start greift). Ebenfalls sparsam einsetzen —
+    jede Kompaktierung lädt diese Memories erneut.
+    """
+    with get_db() as conn:
+        result = conn.execute(
+            "UPDATE memory_nodes SET reinject_on_compact = %s, updated_at = now() "
+            "WHERE path = %s RETURNING path",
+            (enabled, path),
+        ).fetchone()
+        if not result:
+            return f"Node '{path}' nicht gefunden."
+    state = "aktiviert" if enabled else "deaktiviert"
+    return f"Reinject-on-Compact für '{path}' {state}."
+
+
+@mcp.tool()
 def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> str:
     """Liefert den Memory-Kontext für ein Projekt — gedacht zum automatischen Injizieren beim Projektstart.
 
@@ -1591,11 +1623,23 @@ def _ensure_remote_schema(conn) -> None:
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS importance REAL DEFAULT 0.5")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS reinject_on_compact BOOLEAN DEFAULT FALSE")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'")
     # Remove the legacy updated_at trigger if present — it corrupts last-write-wins sync.
     conn.execute("DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes")
+    # If the remote has pgvector, give it the indexed vector column + HNSW too, so
+    # semantic search runs natively there (not just numpy fallback).
+    try:
+        with conn.transaction():
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    except Exception:
+        pass
+    if has_pgvector(conn):
+        conn.execute(f"ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding_v vector({EMBED_DIM})")
+        conn.execute("CREATE INDEX IF NOT EXISTS memory_nodes_embv_idx "
+                     "ON memory_nodes USING hnsw (embedding_v vector_cosine_ops)")
 
 
 def main() -> None:
