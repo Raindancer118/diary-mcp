@@ -247,6 +247,8 @@ _SCHEMA = [
     # Semantic search: embedding vector stored as REAL[] (cosine computed in Python,
     # no pgvector needed at this scale). NULL until embedded.
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]",
+    # Per-node settings (e.g. per-project {"auto_extract": true}). JSONB for extensibility.
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'",
     "CREATE INDEX IF NOT EXISTS memory_nodes_autoinject_idx ON memory_nodes(auto_inject) WHERE auto_inject",
     "CREATE INDEX IF NOT EXISTS memory_nodes_origin_idx ON memory_nodes(origin)",
     # Knowledge-graph: associative links between memory nodes

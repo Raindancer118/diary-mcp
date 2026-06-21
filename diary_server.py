@@ -1234,21 +1234,23 @@ def memory_reembed_all(only_missing: bool = True) -> str:
 
 
 _SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
-              "valid_until, auto_inject, origin, embedding, created_at, updated_at")
+              "valid_until, auto_inject, origin, embedding, config, created_at, updated_at")
 _SYNC_INSERT = """INSERT INTO memory_nodes
-       (path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, embedding, created_at, updated_at)
-       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+       (path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, embedding, config, created_at, updated_at)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
        ON CONFLICT (path) DO UPDATE SET
            type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
            tags=EXCLUDED.tags, importance=EXCLUDED.importance,
            valid_until=EXCLUDED.valid_until, auto_inject=EXCLUDED.auto_inject,
-           origin=EXCLUDED.origin, embedding=EXCLUDED.embedding, updated_at=EXCLUDED.updated_at"""
+           origin=EXCLUDED.origin, embedding=EXCLUDED.embedding,
+           config=EXCLUDED.config, updated_at=EXCLUDED.updated_at"""
 
 
 def _sync_row(n: dict) -> tuple:
     return (n["path"], n["slug"], n["type"], n["title"], n["body"], n["tags"],
             n["importance"], n["valid_until"], n["auto_inject"], n["origin"],
-            n["embedding"], n["created_at"], n["updated_at"])
+            n["embedding"], json.dumps(n["config"]) if n.get("config") is not None else "{}",
+            n["created_at"], n["updated_at"])
 
 
 @mcp.tool()
@@ -1519,6 +1521,52 @@ def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> 
     return "\n".join(lines)
 
 
+def _ensure_project_node(conn, slug: str) -> str:
+    """Ensure the /projects/<slug> category node exists; return its path."""
+    path = f"/projects/{slug.strip('/')}"
+    parent_id = _ensure_memory_parent(conn, path)
+    conn.execute(
+        """INSERT INTO memory_nodes (parent_id, path, slug, type, title)
+           VALUES (%s, %s, %s, 'category', %s)
+           ON CONFLICT (path) DO NOTHING""",
+        (parent_id, path, slug.strip("/"), slug.strip("/").replace("-", " ").title()),
+    )
+    return path
+
+
+@mcp.tool()
+def memory_set_project_config(project_slug: str, auto_extract: bool = None) -> str:
+    """Setzt projektspezifische Einstellungen (gespeichert am /projects/<slug>-Node).
+
+    auto_extract: Wenn True, erfasst der SessionEnd-Hook für DIESES Projekt
+    deterministisch die User-Turns als tier-2 Memories (kein AI/API). Pro Projekt
+    einzeln steuerbar; Default ist AUS. None lässt die Einstellung unverändert.
+    """
+    with get_db() as conn:
+        path = _ensure_project_node(conn, project_slug)
+        row = conn.execute("SELECT config FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+        cfg = dict(row["config"] or {}) if row else {}
+        if auto_extract is not None:
+            cfg["auto_extract"] = bool(auto_extract)
+        conn.execute(
+            "UPDATE memory_nodes SET config = %s, updated_at = now() WHERE path = %s",
+            (json.dumps(cfg), path),
+        )
+    return f"Projekt-Config für '{project_slug}': {json.dumps(cfg)}"
+
+
+@mcp.tool()
+def memory_get_project_config(project_slug: str) -> str:
+    """Zeigt die projektspezifischen Einstellungen des /projects/<slug>-Nodes."""
+    path = f"/projects/{project_slug.strip('/')}"
+    with get_db() as conn:
+        row = conn.execute("SELECT config FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+    if not row:
+        return f"Projekt '{project_slug}' hat noch keinen Node/Config."
+    cfg = row["config"] or {}
+    return f"Config für '{project_slug}': {json.dumps(cfg, ensure_ascii=False)}"
+
+
 def _ensure_remote_schema(conn) -> None:
     """Creates / upgrades the memory_nodes table on the remote if needed."""
     conn.execute("""
@@ -1545,6 +1593,7 @@ def _ensure_remote_schema(conn) -> None:
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'")
     # Remove the legacy updated_at trigger if present — it corrupts last-write-wins sync.
     conn.execute("DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes")
 
