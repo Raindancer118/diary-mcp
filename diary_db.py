@@ -8,6 +8,10 @@ For the remote sync target set DIARY_REMOTE_URL (e.g. to Dorn's Postgres).
 """
 import logging
 import os
+import socket
+import subprocess
+import time
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Generator
@@ -55,6 +59,81 @@ def get_remote_db() -> Generator:
         raise
     finally:
         conn.close()
+
+
+def get_remote_ssh_host() -> str | None:
+    """If set, memory_sync opens an SSH tunnel to this host to reach the remote DB."""
+    return os.environ.get("DIARY_REMOTE_SSH_HOST")
+
+
+def _rebuild_netloc(parsed: urllib.parse.ParseResult, host: str, port: int) -> str:
+    auth = ""
+    if parsed.username:
+        auth = parsed.username
+        if parsed.password:
+            auth += f":{parsed.password}"
+        auth += "@"
+    return f"{auth}{host}:{port}"
+
+
+@contextmanager
+def remote_db_url() -> Generator[str, None, None]:
+    """Yield a connectable remote DB URL.
+
+    If DIARY_REMOTE_SSH_HOST is set, opens an ephemeral SSH tunnel to the host's
+    DB endpoint (parsed from DIARY_REMOTE_URL) on a free local port, yields the
+    rewritten URL, and tears the tunnel down on exit. Otherwise yields
+    DIARY_REMOTE_URL unchanged.
+    """
+    url = get_remote_url()
+    if not url:
+        raise ValueError("DIARY_REMOTE_URL not configured")
+
+    ssh_host = get_remote_ssh_host()
+    if not ssh_host:
+        yield url
+        return
+
+    parsed = urllib.parse.urlparse(url)
+    target_host = parsed.hostname or "127.0.0.1"
+    target_port = parsed.port or 5432
+
+    # Reserve a free local port for the tunnel.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    local_port = s.getsockname()[1]
+    s.close()
+
+    proc = subprocess.Popen(
+        ["ssh", "-N",
+         "-o", "ExitOnForwardFailure=yes",
+         "-o", "BatchMode=yes",
+         "-o", "ServerAliveInterval=5",
+         "-L", f"{local_port}:{target_host}:{target_port}", ssh_host],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                raise RuntimeError(f"SSH tunnel to {ssh_host} exited early: {err.strip()}")
+            try:
+                with socket.create_connection(("127.0.0.1", local_port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.3)
+        else:
+            raise RuntimeError(f"SSH tunnel to {ssh_host} did not come up within 15s")
+
+        tunneled = parsed._replace(netloc=_rebuild_netloc(parsed, "127.0.0.1", local_port))
+        yield urllib.parse.urlunparse(tunneled)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def get_project_id(conn: psycopg.Connection, project_name: str) -> int | None:
@@ -152,11 +231,19 @@ _SCHEMA = [
         access_count INTEGER DEFAULT 0,
         accessed_at  TIMESTAMPTZ,
         valid_until  TIMESTAMPTZ,
+        auto_inject  BOOLEAN DEFAULT FALSE,
+        origin       TEXT NOT NULL DEFAULT 'curated',
         created_at   TIMESTAMPTZ DEFAULT now(),
         updated_at   TIMESTAMPTZ DEFAULT now()
     )""",
-    # Migration: add valid_until to existing tables (idempotent)
+    # Migrations: add columns to existing tables (idempotent)
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ",
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE",
+    # origin: 'curated' = von Claude bewusst gespeichert (Default-Suche).
+    #         'extracted' = automatisch aus Chat-Transkripten geerntet (nur auf Anfrage).
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'",
+    "CREATE INDEX IF NOT EXISTS memory_nodes_autoinject_idx ON memory_nodes(auto_inject) WHERE auto_inject",
+    "CREATE INDEX IF NOT EXISTS memory_nodes_origin_idx ON memory_nodes(origin)",
     # Knowledge-graph: associative links between memory nodes
     # rel_type: related | supports | contradicts | requires | derived_from
     """CREATE TABLE IF NOT EXISTS memory_links (
@@ -176,21 +263,23 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS memory_links_to_idx      ON memory_links(to_id)",
     """CREATE INDEX IF NOT EXISTS memory_nodes_fts_idx ON memory_nodes
         USING GIN(to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')))""",
-    """CREATE OR REPLACE FUNCTION update_updated_at()
-       RETURNS TRIGGER LANGUAGE plpgsql AS $$
-       BEGIN NEW.updated_at = now(); RETURN NEW; END; $$""",
-    """CREATE OR REPLACE TRIGGER memory_nodes_updated_at
-       BEFORE UPDATE ON memory_nodes
-       FOR EACH ROW EXECUTE FUNCTION update_updated_at()""",
-    # Backfill parent_id from path for any unlinked nodes (idempotent self-heal).
-    # The parent path is the node path with its last "/segment" stripped; true roots
-    # (e.g. /user) map to '' which matches nothing, so they correctly stay NULL.
-    """UPDATE memory_nodes child SET parent_id = parent.id
+    # NOTE: no updated_at trigger — it would fire on the parent_id backfill below and
+    # bump timestamps, corrupting the last-write-wins sync (endless ping-pong / stale
+    # overwrites). All app-level UPDATEs set updated_at=now() explicitly instead.
+    "DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes",
+]
+
+# Backfill parent_id from path for any unlinked nodes (idempotent self-heal).
+# The parent path is the node path with its last "/segment" stripped; true roots
+# (e.g. /user) map to '' which matches nothing, so they correctly stay NULL.
+# Reused by init_db and after sync upserts (which insert by path, not parent_id).
+_BACKFILL_PARENT_SQL = """UPDATE memory_nodes child SET parent_id = parent.id
        FROM memory_nodes parent
        WHERE child.parent_id IS NULL
          AND parent.path = regexp_replace(child.path, '/[^/]+$', '')
-         AND regexp_replace(child.path, '/[^/]+$', '') <> ''""",
-]
+         AND regexp_replace(child.path, '/[^/]+$', '') <> ''"""
+
+_SCHEMA.append(_BACKFILL_PARENT_SQL)
 
 _SEED_CATEGORIES = [
     ("/user",       None,    "user",      "User"),

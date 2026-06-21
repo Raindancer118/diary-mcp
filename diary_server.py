@@ -7,8 +7,21 @@ from datetime import datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 
+import psycopg
+from psycopg.rows import dict_row
+
 from diary_config import load_config, save_config
-from diary_db import apply_log_retention, get_db, get_project_id, get_remote_db, get_remote_url, init_db
+from diary_db import (
+    _BACKFILL_PARENT_SQL,
+    apply_log_retention,
+    get_db,
+    get_project_id,
+    get_remote_db,
+    get_remote_ssh_host,
+    get_remote_url,
+    init_db,
+    remote_db_url,
+)
 
 _log = logging.getLogger(__name__)
 mcp = FastMCP("Diary")
@@ -800,15 +813,19 @@ def memory_context() -> str:
     """Session-Start-Snapshot: liefert den kompletten Memory-Tree als Übersicht + kürzlich geänderte Nodes mit vollem Inhalt."""
     with get_db() as conn:
         nodes = conn.execute(
-            "SELECT path, type, title, updated_at FROM memory_nodes ORDER BY path"
+            "SELECT path, type, title, updated_at FROM memory_nodes "
+            "WHERE origin = 'curated' ORDER BY path"
         ).fetchall()
         recent_cutoff = datetime.now() - timedelta(days=14)
         recent = conn.execute(
             "SELECT path, title, body, updated_at FROM memory_nodes "
-            "WHERE body IS NOT NULL AND body != '' AND updated_at > %s "
+            "WHERE origin = 'curated' AND body IS NOT NULL AND body != '' AND updated_at > %s "
             "ORDER BY updated_at DESC",
             (recent_cutoff,),
         ).fetchall()
+        extracted_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM memory_nodes WHERE origin = 'extracted'"
+        ).fetchone()["c"]
 
     lines = ["=== Claude Memory Context ===\n", "MEMORY TREE:"]
     for node in nodes:
@@ -826,21 +843,34 @@ def memory_context() -> str:
             lines.append(node["body"] or "")
             lines.append("---")
 
+    if extracted_count:
+        lines.append(
+            f"\n\n(+ {extracted_count} auto-extrahierte Memories aus Chat-Transkripten — "
+            f"standardmäßig NICHT geladen/durchsucht, da kostspieliger. "
+            f"Bei Bedarf gezielt via memory_search(query, include_extracted=True).)"
+        )
+
     return "\n".join(lines)
 
 
 @mcp.tool()
-def memory_tree(path: str = "/") -> str:
-    """Gibt den Memory-Tree ab einem bestimmten Pfad aus (default: Wurzel)."""
+def memory_tree(path: str = "/", include_extracted: bool = False) -> str:
+    """Gibt den Memory-Tree ab einem bestimmten Pfad aus (default: Wurzel).
+
+    include_extracted=False (Default) blendet die automatisch aus Transkripten
+    extrahierten Memories aus, damit der Baum kompakt und hochwertig bleibt.
+    """
+    origin_clause = "" if include_extracted else "AND origin = 'curated'"
     with get_db() as conn:
         if path == "/":
             nodes = conn.execute(
-                "SELECT path, type, title, updated_at FROM memory_nodes ORDER BY path"
+                f"SELECT path, type, title, updated_at FROM memory_nodes "
+                f"WHERE TRUE {origin_clause} ORDER BY path"
             ).fetchall()
         else:
             nodes = conn.execute(
-                "SELECT path, type, title, updated_at FROM memory_nodes "
-                "WHERE path = %s OR path LIKE %s ORDER BY path",
+                f"SELECT path, type, title, updated_at FROM memory_nodes "
+                f"WHERE (path = %s OR path LIKE %s) {origin_clause} ORDER BY path",
                 (path, f"{path}/%"),
             ).fetchall()
 
@@ -888,7 +918,8 @@ def memory_get(path: str) -> str:
         f"=== Memory: {node['title']} ==={expired_note}",
         f"Pfad:       {node['path']}",
         f"Typ:        {node['type']}",
-        f"Wichtigkeit: {node['importance']:.1f} | Zugriffe: {node['access_count']}",
+        f"Wichtigkeit: {node['importance']:.1f} | Zugriffe: {node['access_count']}"
+        f"{' | AUTO-INJECT' if node.get('auto_inject') else ''}",
         f"Tags:       {', '.join(node['tags']) if node['tags'] else '—'}",
         f"Gültig bis: {str(node['valid_until'])[:10] if node['valid_until'] else '—'}",
         f"Erstellt:   {str(node['created_at'])[:10]} | Geändert: {str(node['updated_at'])[:10]}",
@@ -912,6 +943,8 @@ def memory_upsert(
     tags: str = "",
     importance: float = 0.5,
     valid_until: str = "",
+    auto_inject: bool = False,
+    origin: str = "curated",
 ) -> str:
     """Erstellt oder aktualisiert einen Memory-Node.
 
@@ -920,6 +953,11 @@ def memory_upsert(
     tags:        kommagetrennte Tags, optional
     importance:  0.0–1.0 Wichtigkeitsscore (default 0.5)
     valid_until: ISO-Datum bis wann die Info gültig ist, z.B. '2026-07-15' (optional)
+    auto_inject: wenn True, wird dieses Memory beim Laden des zugehörigen Projekts
+                 automatisch in den Kontext injiziert (siehe memory_project_context).
+    origin:      'curated' (Default — bewusst gespeichert, Standard-Suche) oder
+                 'extracted' (automatisch aus Transkript geerntet, nur auf Anfrage).
+                 Für extrahierte Memories besser memory_save_extracted() nutzen.
     """
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
     valid_until_val = valid_until.strip() if valid_until else None
@@ -932,17 +970,52 @@ def memory_upsert(
         if existing:
             conn.execute(
                 "UPDATE memory_nodes SET title=%s, body=%s, type=%s, tags=%s, "
-                "importance=%s, valid_until=%s, updated_at=now() WHERE path=%s",
-                (title, body, type, tag_list, importance, valid_until_val, path),
+                "importance=%s, valid_until=%s, auto_inject=%s, origin=%s, updated_at=now() WHERE path=%s",
+                (title, body, type, tag_list, importance, valid_until_val, auto_inject, origin, path),
             )
             return f"Memory '{path}' aktualisiert."
         else:
             conn.execute(
-                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val),
+                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, auto_inject, origin),
             )
             return f"Memory '{path}' erstellt."
+
+
+@mcp.tool()
+def memory_save_extracted(path: str, title: str, body: str, type: str = "note",
+                          tags: str = "", importance: float = 0.3) -> str:
+    """Speichert ein automatisch aus einem Chat-Transkript extrahiertes Memory (origin='extracted').
+
+    Diese Memories landen in der ZWEITEN Stufe: sie werden standardmäßig NICHT
+    in memory_context/memory_tree/memory_search geladen, weil sie zahlreich und
+    roh sind. Sie sind nur über memory_search(query, include_extracted=True)
+    auffindbar. Gedacht für eine Extraktions-Pipeline (z.B. SessionEnd-Hook),
+    nicht für bewusst kuratiertes Wissen — dafür memory_upsert() verwenden.
+
+    Standard-importance ist bewusst niedrig (0.3), da unkuratiert.
+    """
+    return memory_upsert(path=path, title=title, body=body, type=type, tags=tags,
+                         importance=importance, origin="extracted")
+
+
+@mcp.tool()
+def memory_promote(path: str, importance: float = 0.7) -> str:
+    """Befördert ein auto-extrahiertes Memory zu einem kuratierten (origin='curated').
+
+    Nutze dies, wenn du beim Durchsuchen der extrahierten Memories eines findest,
+    das dauerhaft wertvoll ist und künftig standardmäßig verfügbar sein soll.
+    """
+    with get_db() as conn:
+        result = conn.execute(
+            "UPDATE memory_nodes SET origin='curated', importance=%s, updated_at=now() "
+            "WHERE path=%s RETURNING origin",
+            (importance, path),
+        ).fetchone()
+        if not result:
+            return f"Node '{path}' nicht gefunden."
+    return f"'{path}' zu kuratiertem Memory befördert (importance {importance:.1f})."
 
 
 @mcp.tool()
@@ -964,16 +1037,31 @@ def memory_delete(path: str) -> str:
 
 
 @mcp.tool()
-def memory_search(query: str) -> str:
-    """Sucht im Memory-Tree via PostgreSQL Full-Text-Search (fällt auf ILIKE zurück)."""
+def memory_search(query: str, include_extracted: bool = False) -> str:
+    """Sucht im Memory-Tree via PostgreSQL Full-Text-Search (fällt auf ILIKE zurück).
+
+    ZWEI-STUFEN-MODELL — wichtig:
+      • Standard (include_extracted=False): durchsucht NUR die kuratierten Memories,
+        die Claude bewusst gespeichert hat. Hochwertig, kompakt, günstig.
+      • include_extracted=True: durchsucht ZUSÄTZLICH die automatisch aus Chat-
+        Transkripten extrahierten Memories. Diese sind zahlreich, roh und
+        kostspieliger im Kontext — nur bewusst einschalten, z.B. wenn die
+        kuratierte Suche nichts Brauchbares liefert oder du gezielt nach einem
+        Detail aus einem früheren Gespräch suchst.
+
+    Die Standardsuche zeigt am Ende an, wie viele Treffer es zusätzlich in den
+    auto-extrahierten Memories gäbe, damit du entscheiden kannst, ob sich das
+    teurere Durchsuchen lohnt.
+    """
+    origin_clause = "" if include_extracted else "AND origin = 'curated'"
     with get_db() as conn:
         fts_results = conn.execute(
-            """SELECT path, title, type,
+            f"""SELECT path, title, type, origin,
                       ts_headline('german', coalesce(body,''), plainto_tsquery('german', %s),
                                   'MaxWords=25,MinWords=10,StartSel=«,StopSel=»') AS snippet
                FROM memory_nodes
                WHERE to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,''))
-                     @@ plainto_tsquery('german', %s)
+                     @@ plainto_tsquery('german', %s) {origin_clause}
                ORDER BY ts_rank(
                    to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')),
                    plainto_tsquery('german', %s)
@@ -985,93 +1073,132 @@ def memory_search(query: str) -> str:
             results, mode = fts_results, "FTS"
         else:
             results = conn.execute(
-                """SELECT path, title, type, substr(coalesce(body,''), 1, 200) AS snippet
-                   FROM memory_nodes WHERE title ILIKE %s OR body ILIKE %s LIMIT 20""",
+                f"""SELECT path, title, type, origin, substr(coalesce(body,''), 1, 200) AS snippet
+                   FROM memory_nodes WHERE (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 20""",
                 (f"%{query}%", f"%{query}%"),
             ).fetchall()
             mode = "LIKE"
 
-    if not results:
-        return f"Keine Memory-Ergebnisse für '{query}'."
+        # Count extra hits in the extracted tier (only relevant in default mode)
+        extracted_hits = 0
+        if not include_extracted:
+            extracted_hits = conn.execute(
+                """SELECT COUNT(*) AS c FROM memory_nodes
+                   WHERE origin = 'extracted'
+                     AND (to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,''))
+                          @@ plainto_tsquery('german', %s)
+                          OR title ILIKE %s OR body ILIKE %s)""",
+                (query, f"%{query}%", f"%{query}%"),
+            ).fetchone()["c"]
 
-    lines = [f"Memory-Suchergebnisse [{mode}] für '{query}':"]
+    scope = "alle Tiers" if include_extracted else "kuratiert"
+    if not results and not extracted_hits:
+        return f"Keine Memory-Ergebnisse für '{query}' ({scope})."
+
+    lines = [f"Memory-Suchergebnisse [{mode}, {scope}] für '{query}':"]
     for r in results:
-        lines.append(f"\n[{r['type']}] {r['path']} — {r['title']}")
+        tag = "" if r.get("origin", "curated") == "curated" else " ⟨auto-extrahiert⟩"
+        lines.append(f"\n[{r['type']}] {r['path']} — {r['title']}{tag}")
         if r.get("snippet"):
             lines.append(f"  {r['snippet']}")
+    if extracted_hits:
+        lines.append(
+            f"\n— Hinweis: {extracted_hits} weitere Treffer in auto-extrahierten Memories "
+            f"(kostspieliger). Mit memory_search(query, include_extracted=True) durchsuchbar."
+        )
     return "\n".join(lines)
+
+
+_SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
+              "valid_until, auto_inject, origin, created_at, updated_at")
+_SYNC_INSERT = """INSERT INTO memory_nodes
+       (path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, created_at, updated_at)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+       ON CONFLICT (path) DO UPDATE SET
+           type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
+           tags=EXCLUDED.tags, importance=EXCLUDED.importance,
+           valid_until=EXCLUDED.valid_until, auto_inject=EXCLUDED.auto_inject,
+           origin=EXCLUDED.origin, updated_at=EXCLUDED.updated_at"""
+
+
+def _sync_row(n: dict) -> tuple:
+    return (n["path"], n["slug"], n["type"], n["title"], n["body"], n["tags"],
+            n["importance"], n["valid_until"], n["auto_inject"], n["origin"],
+            n["created_at"], n["updated_at"])
 
 
 @mcp.tool()
 def memory_sync() -> str:
-    """Bidirektionaler Sync des Memory-Trees mit der Remote-Postgres-Instanz (DIARY_REMOTE_URL).
+    """Bidirektionaler Sync des Memory-Trees mit der Remote-Postgres-Instanz.
 
-    Last-write-wins: der Node mit dem neueren updated_at gewinnt.
-    Voraussetzung: DIARY_REMOTE_URL muss gesetzt sein, z.B.:
-      export DIARY_REMOTE_URL='postgresql://user:pass@dorn-host/diary_mcp'
+    Last-write-wins: der Node mit dem neueren updated_at gewinnt. Öffnet bei Bedarf
+    selbstständig einen ephemeren SSH-Tunnel (wenn DIARY_REMOTE_SSH_HOST gesetzt ist)
+    und baut ihn nach dem Sync wieder ab.
+
+    Voraussetzung: DIARY_REMOTE_URL (DB-Endpunkt wie er auf dem Remote-Host sichtbar ist)
+    und optional DIARY_REMOTE_SSH_HOST (SSH-Alias, z.B. 'dorn').
     """
-    remote_url = get_remote_url()
-    if not remote_url:
+    if not get_remote_url():
         return (
             "DIARY_REMOTE_URL ist nicht gesetzt.\n"
-            "Beispiel: export DIARY_REMOTE_URL='postgresql://user:pass@dorn-host/diary_mcp'"
+            "Beispiel: export DIARY_REMOTE_URL='postgresql://claude:pw@127.0.0.1:54320/diary_mcp'\n"
+            "Für SSH-Tunnel zusätzlich: export DIARY_REMOTE_SSH_HOST='dorn'"
         )
+
+    def depth(path: str) -> int:
+        return path.count("/")
 
     try:
         with get_db() as local_conn:
             local_nodes = local_conn.execute(
-                "SELECT id::text, path, slug, type, title, body, tags, created_at, updated_at "
-                "FROM memory_nodes ORDER BY path"
+                f"SELECT {_SYNC_COLS} FROM memory_nodes ORDER BY path"
             ).fetchall()
-
-        with get_remote_db() as remote_conn:
-            _ensure_remote_schema(remote_conn)
-            remote_nodes = remote_conn.execute(
-                "SELECT id::text, path, slug, type, title, body, tags, created_at, updated_at "
-                "FROM memory_nodes ORDER BY path"
-            ).fetchall()
-
         local_by_path = {n["path"]: n for n in local_nodes}
-        remote_by_path = {n["path"]: n for n in remote_nodes}
 
-        def depth(path: str) -> int:
-            return path.count("/")
+        with remote_db_url() as rurl:
+            remote_conn = psycopg.connect(rurl, row_factory=dict_row)
+            try:
+                _ensure_remote_schema(remote_conn)
+                remote_nodes = remote_conn.execute(
+                    f"SELECT {_SYNC_COLS} FROM memory_nodes ORDER BY path"
+                ).fetchall()
+                remote_by_path = {n["path"]: n for n in remote_nodes}
 
-        pushed = 0
-        with get_remote_db() as remote_conn:
-            for path in sorted(local_by_path, key=depth):
-                local_n = local_by_path[path]
-                remote_n = remote_by_path.get(path)
-                if not remote_n or local_n["updated_at"] > remote_n["updated_at"]:
-                    remote_conn.execute(
-                        """INSERT INTO memory_nodes (path, slug, type, title, body, tags, created_at, updated_at)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT (path) DO UPDATE SET
-                               title=EXCLUDED.title, body=EXCLUDED.body,
-                               tags=EXCLUDED.tags, updated_at=EXCLUDED.updated_at""",
-                        (local_n["path"], local_n["slug"], local_n["type"], local_n["title"],
-                         local_n["body"], local_n["tags"], local_n["created_at"], local_n["updated_at"]),
-                    )
-                    pushed += 1
+                # Push local → remote (parents before children)
+                pushed = 0
+                for path in sorted(local_by_path, key=depth):
+                    local_n = local_by_path[path]
+                    remote_n = remote_by_path.get(path)
+                    if not remote_n or local_n["updated_at"] > remote_n["updated_at"]:
+                        remote_conn.execute(_SYNC_INSERT, _sync_row(local_n))
+                        pushed += 1
+                remote_conn.commit()
+            finally:
+                remote_conn.close()
 
+        # Pull remote → local (parents before children)
         pulled = 0
         with get_db() as local_conn:
             for path in sorted(remote_by_path, key=depth):
                 remote_n = remote_by_path[path]
                 local_n = local_by_path.get(path)
                 if not local_n or remote_n["updated_at"] > local_n["updated_at"]:
-                    local_conn.execute(
-                        """INSERT INTO memory_nodes (path, slug, type, title, body, tags, created_at, updated_at)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT (path) DO UPDATE SET
-                               title=EXCLUDED.title, body=EXCLUDED.body,
-                               tags=EXCLUDED.tags, updated_at=EXCLUDED.updated_at""",
-                        (remote_n["path"], remote_n["slug"], remote_n["type"], remote_n["title"],
-                         remote_n["body"], remote_n["tags"], remote_n["created_at"], remote_n["updated_at"]),
-                    )
+                    local_conn.execute(_SYNC_INSERT, _sync_row(remote_n))
                     pulled += 1
 
-        return f"Sync abgeschlossen. Lokal→Remote: {pushed} gepusht. Remote→Lokal: {pulled} gepullt."
+        # Re-link parent_id on both sides after path-based upserts
+        with get_db() as local_conn:
+            local_conn.execute(_BACKFILL_PARENT_SQL)
+        with remote_db_url() as rurl:
+            rc = psycopg.connect(rurl)
+            try:
+                rc.execute(_BACKFILL_PARENT_SQL)
+                rc.commit()
+            finally:
+                rc.close()
+
+        tunnel_note = f" (via SSH-Tunnel {get_remote_ssh_host()})" if get_remote_ssh_host() else ""
+        return f"Sync abgeschlossen{tunnel_note}. Lokal→Remote: {pushed} gepusht. Remote→Lokal: {pulled} gepullt."
     except Exception as exc:
         return f"Sync fehlgeschlagen: {exc}"
 
@@ -1204,8 +1331,67 @@ def memory_set_importance(path: str, importance: float) -> str:
     return f"Wichtigkeit von '{path}' auf {importance:.2f} gesetzt."
 
 
+@mcp.tool()
+def memory_set_auto_inject(path: str, enabled: bool = True) -> str:
+    """Markiert ein Memory als Auto-Inject (oder hebt die Markierung auf).
+
+    Auto-Inject-Memories unter /projects/<slug>/... werden beim Laden des Projekts
+    automatisch in Claudes Kontext geladen (via memory_project_context bzw. SessionStart-Hook).
+    """
+    with get_db() as conn:
+        result = conn.execute(
+            "UPDATE memory_nodes SET auto_inject = %s, updated_at = now() WHERE path = %s RETURNING path",
+            (enabled, path),
+        ).fetchone()
+        if not result:
+            return f"Node '{path}' nicht gefunden."
+    state = "aktiviert" if enabled else "deaktiviert"
+    return f"Auto-Inject für '{path}' {state}."
+
+
+@mcp.tool()
+def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> str:
+    """Liefert den Memory-Kontext für ein Projekt — gedacht zum automatischen Injizieren beim Projektstart.
+
+    project_slug:     z.B. 'eduvault4' (ohne /projects/-Präfix) — wird auf /projects/<slug>/... gematcht.
+    only_auto_inject: wenn True (default), nur als auto_inject markierte Memories; sonst alle.
+
+    Gibt die vollständigen Inhalte zurück, sodass Claude sie direkt verwenden kann.
+    Globale /user- und /feedback-Auto-Inject-Memories werden immer mitgeliefert.
+    """
+    base = f"/projects/{project_slug.strip('/')}"
+    with get_db() as conn:
+        if only_auto_inject:
+            rows = conn.execute(
+                "SELECT path, type, title, body, importance FROM memory_nodes "
+                "WHERE auto_inject AND (path = %s OR path LIKE %s "
+                "  OR ((path LIKE '/user/%%' OR path LIKE '/feedback/%%'))) "
+                "ORDER BY (path LIKE %s) DESC, importance DESC, path",
+                (base, f"{base}/%", f"{base}%"),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT path, type, title, body, importance FROM memory_nodes "
+                "WHERE (path = %s OR path LIKE %s) AND type != 'category' "
+                "ORDER BY importance DESC, path",
+                (base, f"{base}/%"),
+            ).fetchall()
+
+    if not rows:
+        scope = "Auto-Inject-" if only_auto_inject else ""
+        return f"Keine {scope}Memories für Projekt '{project_slug}' gefunden."
+
+    lines = [f"=== Auto-Inject Memory-Kontext: {project_slug} ===",
+             f"({len(rows)} Memories automatisch geladen)\n"]
+    for r in rows:
+        lines.append(f"--- [{r['type']}] {r['path']} — {r['title']} (Wichtigkeit {r['importance']:.1f}) ---")
+        lines.append(r["body"] or "(kein Inhalt)")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _ensure_remote_schema(conn) -> None:
-    """Creates the memory_nodes table on the remote if it doesn't exist."""
+    """Creates / upgrades the memory_nodes table on the remote if needed."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS memory_nodes (
             id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1216,10 +1402,21 @@ def _ensure_remote_schema(conn) -> None:
             title     TEXT NOT NULL,
             body      TEXT,
             tags      TEXT[] DEFAULT '{}',
+            importance   REAL DEFAULT 0.5,
+            access_count INTEGER DEFAULT 0,
+            accessed_at  TIMESTAMPTZ,
+            valid_until  TIMESTAMPTZ,
+            auto_inject  BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now()
         )
     """)
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS importance REAL DEFAULT 0.5")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'")
+    # Remove the legacy updated_at trigger if present — it corrupts last-write-wins sync.
+    conn.execute("DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes")
 
 
 def main() -> None:

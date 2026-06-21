@@ -1,6 +1,6 @@
 [project]
 name = "diary-mcp"
-version = "0.2.0"
+version = "0.3.1"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"

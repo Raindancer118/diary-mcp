@@ -37,17 +37,19 @@ def _serial(row) -> dict[str, Any]:
 
 
 @app.get("/api/tree")
-def api_tree(path: str = "/"):
+def api_tree(path: str = "/", include_extracted: bool = False):
+    cols = ("path, slug, type, title, importance, access_count, updated_at, "
+            "valid_until, auto_inject, origin")
+    origin_clause = "" if include_extracted else "AND origin = 'curated'"
     with get_db() as conn:
         if path == "/":
             rows = conn.execute(
-                "SELECT path, slug, type, title, importance, access_count, updated_at, valid_until "
-                "FROM memory_nodes ORDER BY path"
+                f"SELECT {cols} FROM memory_nodes WHERE TRUE {origin_clause} ORDER BY path"
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT path, slug, type, title, importance, access_count, updated_at, valid_until "
-                "FROM memory_nodes WHERE path = %s OR path LIKE %s ORDER BY path",
+                f"SELECT {cols} FROM memory_nodes "
+                f"WHERE (path = %s OR path LIKE %s) {origin_clause} ORDER BY path",
                 (path, f"{path}/%"),
             ).fetchall()
     return [_serial(r) for r in rows]
@@ -80,17 +82,18 @@ def api_node(path: str):
 
 
 @app.get("/api/search")
-def api_search(q: str = ""):
+def api_search(q: str = "", include_extracted: bool = False):
     if not q.strip():
         return []
+    origin_clause = "" if include_extracted else "AND origin = 'curated'"
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT path, title, type, importance, "
+            "SELECT path, title, type, importance, origin, "
             "ts_headline('german', coalesce(body,''), plainto_tsquery('german', %s), "
             "'MaxWords=20,MinWords=8,StartSel=«,StopSel=»') AS snippet "
             "FROM memory_nodes "
             "WHERE to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')) "
-            "@@ plainto_tsquery('german', %s) "
+            f"@@ plainto_tsquery('german', %s) {origin_clause} "
             "ORDER BY ts_rank("
             "to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')), "
             "plainto_tsquery('german', %s)) DESC LIMIT 30",
@@ -98,9 +101,9 @@ def api_search(q: str = ""):
         ).fetchall()
         if not rows:
             rows = conn.execute(
-                "SELECT path, title, type, importance, "
+                "SELECT path, title, type, importance, origin, "
                 "substr(coalesce(body,''), 1, 200) AS snippet "
-                "FROM memory_nodes WHERE title ILIKE %s OR body ILIKE %s LIMIT 30",
+                f"FROM memory_nodes WHERE (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 30",
                 (f"%{q}%", f"%{q}%"),
             ).fetchall()
     return [_serial(r) for r in rows]
@@ -408,6 +411,8 @@ _HTML = r"""<!doctype html>
   }
   .meta-chip.type { border-color: var(--teal-dim); color: var(--teal); }
   .meta-chip.expired { border-color: var(--red); color: var(--red); }
+  .meta-chip.extracted { border-color: var(--muted); color: var(--muted); font-style: italic; }
+  .meta-chip.inject { border-color: var(--accent-dim); color: var(--accent); }
 
   .importance-bar {
     display: flex;
@@ -746,6 +751,8 @@ function showNode(node) {
   const expired = node.valid_until && new Date(node.valid_until) < new Date();
   strip.innerHTML = `
     <span class="meta-chip type">${node.type}</span>
+    ${node.origin === 'extracted' ? `<span class="meta-chip extracted">auto-extrahiert</span>` : ''}
+    ${node.auto_inject ? `<span class="meta-chip inject">auto-inject</span>` : ''}
     ${expired ? `<span class="meta-chip expired">⚠ abgelaufen</span>` : ''}
     ${node.tags && node.tags.length ? `<span class="meta-chip">${node.tags.join(', ')}</span>` : ''}
     <div class="importance-bar">${[1,2,3,4,5].map(i =>
