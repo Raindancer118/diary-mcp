@@ -34,13 +34,13 @@ def _remote_conn():
 
 
 def _upsert(path, title="Title", body="Body", importance=0.5,
-            origin="curated", valid_until="", tags="", auto_inject=False):
+            origin="curated", valid_until="", tags=""):
     """Call memory_upsert and return the result string."""
     import diary_server
     return diary_server.memory_upsert(
         path=path, title=title, body=body,
         importance=importance, origin=origin,
-        valid_until=valid_until, tags=tags, auto_inject=auto_inject,
+        valid_until=valid_until, tags=tags,
     )
 
 
@@ -460,6 +460,75 @@ class TestSync:
         # The result should show 0 pushed and 0 pulled
         assert "0 gepusht" in result2 or ("gepusht" in result2 and "0 gepullt" in result2)
 
+    def test_clean_sync_reports_no_conflict(self):
+        """A normal sync (no concurrent edits) must NOT report any conflict."""
+        self._reset_remote()
+        _upsert("/user/clean-sync", title="Clean", body="no conflict here")
+        import diary_server
+        r1 = diary_server.memory_sync()  # establishes last_sync
+        assert "Konflikt" not in r1
+        # Edit only one side, sync again — last-write-wins, but no conflict.
+        _upsert("/user/clean-sync", title="Clean", body="edited locally only")
+        r2 = diary_server.memory_sync()
+        assert "Konflikt" not in r2
+
+    def test_concurrent_edit_reports_conflict(self):
+        """Same path edited differently on BOTH sides between syncs => 1 reported conflict,
+        and last-write-wins still converges both DBs to the newer edit."""
+        self._reset_remote()
+        path = "/user/conflict-node"
+        _upsert(path, title="Conflict", body="base body")
+        import diary_server
+
+        # First sync establishes last_sync on both sides and propagates the base row.
+        r1 = diary_server.memory_sync()
+        assert "fehlgeschlagen" not in r1.lower()
+        assert "Konflikt" not in r1
+
+        # --- edit the SAME path differently on each side, AFTER last_sync ---
+        # Remote edit first (older updated_at).
+        remote_url = os.environ.get("DIARY_REMOTE_URL")
+        rconn = psycopg.connect(remote_url, row_factory=dict_row)
+        try:
+            rconn.execute(
+                "UPDATE memory_nodes SET body = %s, updated_at = now() WHERE path = %s",
+                ("REMOTE edit", path),
+            )
+            rconn.commit()
+        finally:
+            rconn.close()
+
+        # Ensure the local edit has a strictly newer updated_at so local wins.
+        time.sleep(0.05)
+        lconn = _local_conn()
+        try:
+            lconn.execute(
+                "UPDATE memory_nodes SET body = %s, updated_at = now() WHERE path = %s",
+                ("LOCAL edit", path),
+            )
+            lconn.commit()
+        finally:
+            lconn.close()
+
+        # Second sync: must detect exactly one conflict (local newer => local wins).
+        r2 = diary_server.memory_sync()
+        assert "fehlgeschlagen" not in r2.lower()
+        assert "1 Konflikt" in r2, r2
+        assert path in r2
+        assert "local gewann" in r2, r2
+
+        # Last-write-wins converged: both sides hold the LOCAL edit.
+        local_body = _get_node(path)["body"]
+        assert local_body == "LOCAL edit"
+        rconn = psycopg.connect(remote_url, row_factory=dict_row)
+        try:
+            remote_body = rconn.execute(
+                "SELECT body FROM memory_nodes WHERE path = %s", (path,)
+            ).fetchone()["body"]
+        finally:
+            rconn.close()
+        assert remote_body == "LOCAL edit"
+
 
 # ===========================================================================
 # 9. Extracted lifecycle
@@ -557,3 +626,139 @@ class TestProjectConfig:
         import diary_server
         result = diary_server.memory_get_project_config("nonexistent-xyz-proj")
         assert "noch keinen" in result or "nicht gefunden" in result.lower()
+
+
+# ===========================================================================
+# 11. Project dir aliases + slug resolver
+# ===========================================================================
+
+class TestProjectDirAliases:
+    """Tests for memory_set_project_dir, memory_unset_project_dir and the slug resolver."""
+
+    def test_set_project_dir_creates_node_and_stores_dir(self):
+        import diary_server
+        result = diary_server.memory_set_project_dir("alias-proj", "/srv/projects/alias-proj")
+        assert "alias-proj" in result
+        node = _get_node("/projects/alias-proj")
+        assert node is not None and node["deleted_at"] is None
+        cfg = node["config"] or {}
+        assert "/srv/projects/alias-proj" in (cfg.get("dirs") or [])
+
+    def test_set_project_dir_is_idempotent(self):
+        import diary_server
+        diary_server.memory_set_project_dir("idem-proj", "/srv/idem")
+        result2 = diary_server.memory_set_project_dir("idem-proj", "/srv/idem")
+        # Second call: already registered message
+        assert "bereits" in result2 or "hinzugefügt" in result2
+        node = _get_node("/projects/idem-proj")
+        dirs = (node["config"] or {}).get("dirs") or []
+        assert dirs.count("/srv/idem") == 1
+
+    def test_set_project_dir_multiple_dirs(self):
+        import diary_server
+        diary_server.memory_set_project_dir("multi-dir-proj", "/srv/a")
+        diary_server.memory_set_project_dir("multi-dir-proj", "/srv/b")
+        node = _get_node("/projects/multi-dir-proj")
+        dirs = (node["config"] or {}).get("dirs") or []
+        assert "/srv/a" in dirs
+        assert "/srv/b" in dirs
+
+    def test_set_project_dir_absolute_path_required(self):
+        import diary_server
+        result = diary_server.memory_set_project_dir("fail-proj", "relative/path")
+        assert "absolut" in result.lower() or "fehler" in result.lower()
+
+    def test_unset_project_dir_removes_entry(self):
+        import diary_server
+        diary_server.memory_set_project_dir("unset-proj", "/srv/remove-me")
+        result = diary_server.memory_unset_project_dir("unset-proj", "/srv/remove-me")
+        assert "entfernt" in result
+        node = _get_node("/projects/unset-proj")
+        dirs = (node["config"] or {}).get("dirs") or []
+        assert "/srv/remove-me" not in dirs
+
+    def test_unset_nonexistent_dir_reports_not_registered(self):
+        import diary_server
+        diary_server.memory_set_project_dir("unset2-proj", "/srv/keep")
+        result = diary_server.memory_unset_project_dir("unset2-proj", "/srv/ghost")
+        assert "nicht" in result.lower()
+
+    def test_get_project_config_shows_dirs(self):
+        import diary_server
+        diary_server.memory_set_project_dir("config-dirs-proj", "/srv/shown")
+        got = diary_server.memory_get_project_config("config-dirs-proj")
+        assert "/srv/shown" in got
+
+    def test_set_project_dir_preserves_auto_extract(self):
+        """Adding a dir must not clobber existing config keys like auto_extract."""
+        import diary_server
+        diary_server.memory_set_project_config("preserve-proj", auto_extract=True)
+        diary_server.memory_set_project_dir("preserve-proj", "/srv/preserve")
+        got = diary_server.memory_get_project_config("preserve-proj")
+        assert "true" in got.lower()
+        assert "/srv/preserve" in got
+
+
+class TestSlugResolver:
+    """Tests for the scripts/_slug_resolve.py resolver."""
+
+    def _resolver(self):
+        import importlib, sys
+        from pathlib import Path
+        scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import _slug_resolve
+        importlib.reload(_slug_resolve)
+        return _slug_resolve.slug_from_cwd
+
+    def test_exact_match(self):
+        import diary_server
+        diary_server.memory_set_project_dir("exact-resolve", "/exact/path/myproject")
+        resolver = self._resolver()
+        assert resolver("/exact/path/myproject") == "exact-resolve"
+
+    def test_subdirectory_prefix_match(self):
+        import diary_server
+        diary_server.memory_set_project_dir("prefix-resolve", "/prefix/proj")
+        resolver = self._resolver()
+        # A subdir should resolve to the same project
+        assert resolver("/prefix/proj/src/deep/nested") == "prefix-resolve"
+
+    def test_longer_prefix_wins(self):
+        """When two projects have prefix-matching dirs, the longer (more specific) one wins."""
+        import diary_server
+        diary_server.memory_set_project_dir("outer-resolve", "/nested/outer")
+        diary_server.memory_set_project_dir("inner-resolve", "/nested/outer/inner")
+        resolver = self._resolver()
+        assert resolver("/nested/outer/inner/src") == "inner-resolve"
+
+    def test_exact_match_beats_prefix(self):
+        """Exact match takes priority even if another project has a longer prefix."""
+        import diary_server
+        diary_server.memory_set_project_dir("exact-beats", "/some/dir")
+        diary_server.memory_set_project_dir("prefix-beats", "/some/dir/sub")
+        resolver = self._resolver()
+        assert resolver("/some/dir") == "exact-beats"
+
+    def test_fallback_to_basename(self):
+        """An unknown directory falls back to basename slugification."""
+        resolver = self._resolver()
+        result = resolver("/home/user/My Cool Project")
+        assert result == "my-cool-project"
+
+    def test_trailing_slash_stripped(self):
+        import diary_server
+        diary_server.memory_set_project_dir("trailing-resolve", "/trailing/dir")
+        resolver = self._resolver()
+        assert resolver("/trailing/dir/") == "trailing-resolve"
+
+    def test_no_dirs_key_falls_back(self):
+        """A project node without config.dirs should not interfere with fallback."""
+        import diary_server
+        # Create a project node with no dirs
+        diary_server.memory_set_project_config("nodirs-proj", auto_extract=False)
+        resolver = self._resolver()
+        # cwd does not match anything; fallback should be basename of this unknown path
+        result = resolver("/completely/unknown/path/nodirs-proj-other")
+        assert result == "nodirs-proj-other"

@@ -16,15 +16,13 @@ Register in ~/.claude/settings.json under hooks.SessionEnd.
 """
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
-
-def _slug_from_cwd(cwd: str) -> str:
-    base = os.path.basename(cwd.rstrip("/"))
-    return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "misc"
+# Allow importing the shared helper when this script is run standalone.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _slug_resolve import slug_from_cwd  # noqa: E402
 
 
 def _project_auto_extract(slug: str) -> bool:
@@ -52,7 +50,7 @@ def main() -> None:
     if not transcript or not os.path.exists(transcript):
         return
     cwd = payload.get("cwd") or os.getcwd()
-    slug = _slug_from_cwd(cwd)
+    slug = slug_from_cwd(cwd)
 
     enabled = os.environ.get("DIARY_AUTO_EXTRACT") == "1" or _project_auto_extract(slug)
     if not enabled:

@@ -123,6 +123,10 @@ def clean_memory_nodes(test_databases):
     # Clear memory_nodes; cascade wipes memory_links
     with diary_db.get_db() as conn:
         conn.execute("DELETE FROM memory_nodes")
+        # Reset local-only sync bookkeeping so each test starts from a clean
+        # "never synced" state (otherwise a prior test's last_sync would leak
+        # and trip false conflict detection).
+        conn.execute("DELETE FROM diary_meta")
 
     # Re-seed categories (init_db seeds them, but we deleted everything)
     diary_db.init_db()

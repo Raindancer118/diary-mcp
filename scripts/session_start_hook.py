@@ -3,13 +3,13 @@
 Claude Code SessionStart hook — context injection from the diary-mcp memory tree.
 
 Behaviour depends on the hook's `source` (startup | resume | clear | compact):
-  • source == "compact"  → injects memories flagged `reinject_on_compact`
+  • source == "compact"  → injects memories with 'compact' in pin_triggers
     (critical info that must survive a context compaction).
-  • any other source     → injects memories flagged `auto_inject`
+  • any other source     → injects memories with 'start' in pin_triggers
     (the project's most important facts, loaded at session start).
 
-In both cases ONLY explicitly-flagged memories are injected — never arbitrary
-ones — scoped to the project derived from cwd, plus globally-flagged /user and
+In both cases ONLY explicitly-pinned memories are injected — never arbitrary
+ones — scoped to the project derived from cwd, plus globally-pinned /user and
 /feedback memories.
 
 Deliberately lean: direct Postgres query, no MCP/model import, fails silent.
@@ -25,13 +25,12 @@ Register in ~/.claude/settings.json:
 """
 import json
 import os
-import re
 import sys
+from pathlib import Path
 
-
-def _slug_from_cwd(cwd: str) -> str:
-    base = os.path.basename(cwd.rstrip("/"))
-    return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+# Allow importing the shared helper when this script is run standalone.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _slug_resolve import slug_from_cwd  # noqa: E402
 
 
 def _database_url() -> str:
@@ -46,15 +45,15 @@ def main() -> None:
 
     source = payload.get("source") or "startup"
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    slug = _slug_from_cwd(cwd)
+    slug = slug_from_cwd(cwd)
     if not slug:
         return
 
-    # Compaction → reinject_on_compact memories; otherwise → auto_inject memories.
+    # Compaction → 'compact' pin; otherwise → 'start' pin.
     if source == "compact":
-        flag, heading = "reinject_on_compact", "Nach Kompaktierung neu geladene Memories"
+        trigger, heading = "compact", "Nach Kompaktierung neu geladene Memories"
     else:
-        flag, heading = "auto_inject", "Auto-Inject Memories"
+        trigger, heading = "start", "Gepinnte Memories (Session-Start)"
 
     try:
         import psycopg
@@ -66,12 +65,12 @@ def main() -> None:
     try:
         with psycopg.connect(_database_url(), row_factory=dict_row, connect_timeout=3) as conn:
             rows = conn.execute(
-                f"SELECT path, type, title, body FROM memory_nodes "
-                f"WHERE {flag} AND origin = 'curated' AND ("
-                f"  path = %s OR path LIKE %s "
-                f"  OR path LIKE '/user/%%' OR path LIKE '/feedback/%%') "
-                f"ORDER BY (path LIKE %s) DESC, importance DESC, path",
-                (base, f"{base}/%", f"{base}%"),
+                "SELECT path, type, title, body FROM memory_nodes "
+                "WHERE %s = ANY(pin_triggers) AND origin = 'curated' AND deleted_at IS NULL AND ("
+                "  path = %s OR path LIKE %s "
+                "  OR path LIKE '/user/%%' OR path LIKE '/feedback/%%') "
+                "ORDER BY (path LIKE %s) DESC, importance DESC, path",
+                (trigger, base, f"{base}/%", f"{base}%"),
             ).fetchall()
     except Exception:
         return

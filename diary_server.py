@@ -927,12 +927,13 @@ def memory_get(path: str) -> str:
         if node.get("valid_until") and node["valid_until"].astimezone() < _now_aware:
             expired_note = f"\n⚠️  ABGELAUFEN seit {str(node['valid_until'])[:10]}"
 
+    triggers = node.get("pin_triggers") or []
+    pin_str = f" | PIN: {', '.join(triggers)}" if triggers else ""
     lines = [
         f"=== Memory: {node['title']} ==={expired_note}",
         f"Pfad:       {node['path']}",
         f"Typ:        {node['type']}",
-        f"Wichtigkeit: {node['importance']:.1f} | Zugriffe: {node['access_count']}"
-        f"{' | AUTO-INJECT' if node.get('auto_inject') else ''}",
+        f"Wichtigkeit: {node['importance']:.1f} | Zugriffe: {node['access_count']}{pin_str}",
         f"Tags:       {', '.join(node['tags']) if node['tags'] else '—'}",
         f"Gültig bis: {str(node['valid_until'])[:10] if node['valid_until'] else '—'}",
         f"Erstellt:   {str(node['created_at'])[:10]} | Geändert: {str(node['updated_at'])[:10]}",
@@ -978,7 +979,6 @@ def memory_upsert(
     tags: str = "",
     importance: float = 0.5,
     valid_until: str = "",
-    auto_inject: bool = False,
     origin: str = "curated",
 ) -> str:
     """Erstellt oder aktualisiert einen Memory-Node.
@@ -988,11 +988,12 @@ def memory_upsert(
     tags:        kommagetrennte Tags, optional
     importance:  0.0–1.0 Wichtigkeitsscore (default 0.5)
     valid_until: ISO-Datum bis wann die Info gültig ist, z.B. '2026-07-15' (optional)
-    auto_inject: wenn True, wird dieses Memory beim Laden des zugehörigen Projekts
-                 automatisch in den Kontext injiziert (siehe memory_project_context).
     origin:      'curated' (Default — bewusst gespeichert, Standard-Suche) oder
                  'extracted' (automatisch aus Transkript geerntet, nur auf Anfrage).
                  Für extrahierte Memories besser memory_save_extracted() nutzen.
+
+    Hinweis: Das Pinning (automatisches Injizieren beim Session-Start oder nach
+    Kompaktierung) wird separat über memory_pin() / memory_unpin() gesteuert.
     """
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
     valid_until_val = valid_until.strip() if valid_until else None
@@ -1007,17 +1008,17 @@ def memory_upsert(
             # Upserting a tombstoned path revives it (deleted_at=NULL).
             conn.execute(
                 "UPDATE memory_nodes SET title=%s, body=%s, type=%s, tags=%s, "
-                "importance=%s, valid_until=%s, auto_inject=%s, origin=%s, embedding=%s, "
+                "importance=%s, valid_until=%s, origin=%s, embedding=%s, "
                 "deleted_at=NULL, updated_at=now() WHERE path=%s",
-                (title, body, type, tag_list, importance, valid_until_val, auto_inject, origin, embedding, path),
+                (title, body, type, tag_list, importance, valid_until_val, origin, embedding, path),
             )
             _refresh_vector(conn, path, embedding)
             return f"Memory '{path}' aktualisiert."
         else:
             conn.execute(
-                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, auto_inject, origin, embedding) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, auto_inject, origin, embedding),
+                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, origin, embedding) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, origin, embedding),
             )
             _refresh_vector(conn, path, embedding)
             return f"Memory '{path}' erstellt."
@@ -1559,17 +1560,16 @@ def memory_reembed_all(only_missing: bool = True) -> str:
 
 
 _SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
-              "valid_until, auto_inject, reinject_on_compact, origin, embedding, config, "
+              "valid_until, pin_triggers, origin, embedding, config, "
               "deleted_at, created_at, updated_at")
 _SYNC_INSERT = """INSERT INTO memory_nodes
-       (path, slug, type, title, body, tags, importance, valid_until, auto_inject,
-        reinject_on_compact, origin, embedding, config, deleted_at, created_at, updated_at)
-       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+       (path, slug, type, title, body, tags, importance, valid_until, pin_triggers,
+        origin, embedding, config, deleted_at, created_at, updated_at)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
        ON CONFLICT (path) DO UPDATE SET
            type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
            tags=EXCLUDED.tags, importance=EXCLUDED.importance,
-           valid_until=EXCLUDED.valid_until, auto_inject=EXCLUDED.auto_inject,
-           reinject_on_compact=EXCLUDED.reinject_on_compact,
+           valid_until=EXCLUDED.valid_until, pin_triggers=EXCLUDED.pin_triggers,
            origin=EXCLUDED.origin, embedding=EXCLUDED.embedding,
            config=EXCLUDED.config, deleted_at=EXCLUDED.deleted_at,
            updated_at=EXCLUDED.updated_at"""
@@ -1577,10 +1577,92 @@ _SYNC_INSERT = """INSERT INTO memory_nodes
 
 def _sync_row(n: dict) -> tuple:
     return (n["path"], n["slug"], n["type"], n["title"], n["body"], n["tags"],
-            n["importance"], n["valid_until"], n["auto_inject"], n["reinject_on_compact"],
+            n["importance"], n["valid_until"], n["pin_triggers"] or [],
             n["origin"], n["embedding"],
             json.dumps(n["config"]) if n.get("config") is not None else "{}",
             n["deleted_at"], n["created_at"], n["updated_at"])
+
+
+def _last_sync_key() -> str:
+    """diary_meta key under which the last successful sync timestamp is stored.
+
+    Scoped to the configured remote URL so different remotes track independently.
+    """
+    return f"last_sync:{get_remote_url() or ''}"
+
+
+def _read_last_sync(conn) -> "datetime | None":
+    """Return the stored last-sync timestamp for the current remote, or None (first run)."""
+    row = conn.execute(
+        "SELECT value FROM diary_meta WHERE key = %s", (_last_sync_key(),)
+    ).fetchone()
+    if not row or not row["value"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["value"])
+    except (ValueError, TypeError):
+        return None
+
+
+def _write_last_sync(conn, ts: datetime) -> None:
+    """Persist the last successful sync timestamp for the current remote."""
+    conn.execute(
+        """INSERT INTO diary_meta (key, value, updated_at)
+           VALUES (%s, %s, now())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
+        (_last_sync_key(), ts.isoformat()),
+    )
+
+
+def _content_differs(a: dict, b: dict) -> bool:
+    """True if two nodes diverge in any user-meaningful field (not just timestamps)."""
+    fields = ("title", "body", "tags", "pin_triggers", "deleted_at")
+    for f in fields:
+        av, bv = a.get(f), b.get(f)
+        # Normalise array-ish fields so [] and None compare equal.
+        if f in ("tags", "pin_triggers"):
+            av = list(av or [])
+            bv = list(bv or [])
+        if av != bv:
+            return True
+    return False
+
+
+def _detect_conflicts(local_by_path: dict, remote_by_path: dict,
+                      last_sync: "datetime | None") -> list[dict]:
+    """Find paths edited on BOTH sides since the last sync with diverging content.
+
+    Returns a list of {path, winner} dicts (winner = 'local'/'remote', the side whose
+    updated_at is newer and therefore wins under last-write-wins). Empty on first run
+    (last_sync is None) or when nothing diverged.
+    """
+    if last_sync is None:
+        return []
+    conflicts = []
+    for path, local_n in local_by_path.items():
+        remote_n = remote_by_path.get(path)
+        if remote_n is None:
+            continue
+        l_upd, r_upd = local_n["updated_at"], remote_n["updated_at"]
+        # Both sides must have changed since the last successful sync.
+        if l_upd > last_sync and r_upd > last_sync and _content_differs(local_n, remote_n):
+            winner = "local" if l_upd >= r_upd else "remote"
+            conflicts.append({"path": path, "winner": winner})
+    return conflicts
+
+
+def _format_conflicts(conflicts: list[dict], limit: int = 8) -> str:
+    """Render the conflict summary line for memory_sync's return string."""
+    if not conflicts:
+        return ""
+    parts = []
+    for c in conflicts[:limit]:
+        parts.append(f"{c['path']} ({c['winner']} gewann)")
+    more = len(conflicts) - limit
+    if more > 0:
+        parts.append(f"… +{more} weitere")
+    return (f" ⚠ {len(conflicts)} Konflikt(e) (beidseitig geändert, "
+            f"neuere Version gewann): " + ", ".join(parts))
 
 
 @mcp.tool()
@@ -1606,6 +1688,11 @@ def memory_sync() -> str:
 
     try:
         with get_db() as local_conn:
+            # Capture the DB clock BEFORE reading rows: any edit that lands after this
+            # point is treated as post-sync and will be caught by the next run's conflict
+            # check. Using the DB clock keeps it consistent with updated_at (TIMESTAMPTZ).
+            sync_started_at = local_conn.execute("SELECT now() AS ts").fetchone()["ts"]
+            last_sync = _read_last_sync(local_conn)
             local_nodes = local_conn.execute(
                 f"SELECT {_SYNC_COLS} FROM memory_nodes ORDER BY path"
             ).fetchall()
@@ -1619,6 +1706,11 @@ def memory_sync() -> str:
                     f"SELECT {_SYNC_COLS} FROM memory_nodes ORDER BY path"
                 ).fetchall()
                 remote_by_path = {n["path"]: n for n in remote_nodes}
+
+                # Detect concurrent edits BEFORE applying last-write-wins: a path
+                # present on both sides, changed on both since the last sync, with
+                # genuinely diverging content. Resolution stays last-write-wins below.
+                conflicts = _detect_conflicts(local_by_path, remote_by_path, last_sync)
 
                 # Push local → remote (parents before children)
                 pushed = 0
@@ -1662,8 +1754,21 @@ def memory_sync() -> str:
             finally:
                 rc.close()
 
+        # Sync succeeded: persist the new last_sync timestamp for this remote so the
+        # next run can detect concurrent edits relative to this point.
+        with get_db() as local_conn:
+            _write_last_sync(local_conn, sync_started_at)
+
+        if conflicts:
+            _log.warning(
+                "memory_sync: %d concurrent-edit conflict(s) resolved last-write-wins: %s",
+                len(conflicts),
+                ", ".join(f"{c['path']}({c['winner']})" for c in conflicts),
+            )
+
         tunnel_note = f" (via SSH-Tunnel {get_remote_ssh_host()})" if get_remote_ssh_host() else ""
-        return f"Sync abgeschlossen{tunnel_note}. Lokal→Remote: {pushed} gepusht. Remote→Lokal: {pulled} gepullt."
+        return (f"Sync abgeschlossen{tunnel_note}. Lokal→Remote: {pushed} gepusht. "
+                f"Remote→Lokal: {pulled} gepullt." + _format_conflicts(conflicts))
     except Exception as exc:
         return f"Sync fehlgeschlagen: {exc}"
 
@@ -1804,62 +1909,72 @@ def memory_set_importance(path: str, importance: float) -> str:
 
 
 @mcp.tool()
-def memory_set_auto_inject(path: str, enabled: bool = True) -> str:
-    """Markiert ein Memory als Auto-Inject (oder hebt die Markierung auf).
+def memory_pin(path: str, on_start: bool = True, on_compact: bool = False) -> str:
+    """Pinnt ein Memory für automatisches Injizieren — sparsam einsetzen, da jeder Pin Kontext kostet!
 
-    Auto-Inject-Memories unter /projects/<slug>/... werden beim Laden des Projekts
-    automatisch in Claudes Kontext geladen (via memory_project_context bzw. SessionStart-Hook).
+    on_start:    Wenn True, wird das Memory beim Session-Start automatisch in Claudes
+                 Kontext geladen (setzt 'start' in pin_triggers). Gut für dauerhaft
+                 wichtige Projekt-Fakten, die Claude immer kennen muss.
+    on_compact:  Wenn True, wird das Memory nach einer Kontext-Kompaktierung erneut
+                 injiziert (setzt 'compact' in pin_triggers). Gut für Infos, die eine
+                 Kompaktierung „überleben" müssen. Noch kostspieliger als on_start —
+                 nur für absolut kritische Nodes.
+
+    Gibt die resultierende pin_triggers-Liste zurück.
     """
+    triggers: list[str] = []
+    if on_start:
+        triggers.append("start")
+    if on_compact:
+        triggers.append("compact")
+
     with get_db() as conn:
         result = conn.execute(
-            "UPDATE memory_nodes SET auto_inject = %s, updated_at = now() "
+            "UPDATE memory_nodes SET pin_triggers = %s, updated_at = now() "
             "WHERE path = %s AND deleted_at IS NULL RETURNING path",
-            (enabled, path),
+            (triggers, path),
         ).fetchone()
         if not result:
             return f"Node '{path}' nicht gefunden."
-    state = "aktiviert" if enabled else "deaktiviert"
-    return f"Auto-Inject für '{path}' {state}."
+    trigger_str = ", ".join(triggers) if triggers else "(keine)"
+    return f"Pin für '{path}' gesetzt: [{trigger_str}]."
 
 
 @mcp.tool()
-def memory_set_reinject_on_compact(path: str, enabled: bool = True) -> str:
-    """Markiert ein Memory, damit es nach einer Kontext-Kompaktierung neu injiziert wird.
+def memory_unpin(path: str) -> str:
+    """Entfernt alle Pin-Trigger eines Memory-Nodes (kein automatisches Injizieren mehr).
 
-    Für Setups/Modelle, die häufig kompaktieren: so markierte Memories werden vom
-    SessionStart-Hook (source='compact') automatisch wieder in den Kontext geladen,
-    damit kritische Infos eine Kompaktierung „überleben". Unabhängig von auto_inject
-    (das nur beim normalen Session-Start greift). Ebenfalls sparsam einsetzen —
-    jede Kompaktierung lädt diese Memories erneut.
+    Setzt pin_triggers auf ein leeres Array. Das Memory bleibt erhalten und
+    ist weiterhin über Suche auffindbar — es wird nur nicht mehr automatisch
+    in den Kontext geladen.
     """
     with get_db() as conn:
         result = conn.execute(
-            "UPDATE memory_nodes SET reinject_on_compact = %s, updated_at = now() "
+            "UPDATE memory_nodes SET pin_triggers = '{}', updated_at = now() "
             "WHERE path = %s AND deleted_at IS NULL RETURNING path",
-            (enabled, path),
+            (path,),
         ).fetchone()
         if not result:
             return f"Node '{path}' nicht gefunden."
-    state = "aktiviert" if enabled else "deaktiviert"
-    return f"Reinject-on-Compact für '{path}' {state}."
+    return f"Pin für '{path}' entfernt (pin_triggers leer)."
 
 
 @mcp.tool()
-def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> str:
+def memory_project_context(project_slug: str, only_pinned: bool = True) -> str:
     """Liefert den Memory-Kontext für ein Projekt — gedacht zum automatischen Injizieren beim Projektstart.
 
-    project_slug:     z.B. 'eduvault4' (ohne /projects/-Präfix) — wird auf /projects/<slug>/... gematcht.
-    only_auto_inject: wenn True (default), nur als auto_inject markierte Memories; sonst alle.
+    project_slug: z.B. 'eduvault4' (ohne /projects/-Präfix) — wird auf /projects/<slug>/... gematcht.
+    only_pinned:  wenn True (default), nur Memories mit 'start' in pin_triggers; sonst alle.
 
     Gibt die vollständigen Inhalte zurück, sodass Claude sie direkt verwenden kann.
-    Globale /user- und /feedback-Auto-Inject-Memories werden immer mitgeliefert.
+    Globale /user- und /feedback-Memories mit 'start' in pin_triggers werden immer mitgeliefert.
     """
     base = f"/projects/{project_slug.strip('/')}"
     with get_db() as conn:
-        if only_auto_inject:
+        if only_pinned:
             rows = conn.execute(
                 "SELECT path, type, title, body, importance FROM memory_nodes "
-                "WHERE auto_inject AND deleted_at IS NULL AND (path = %s OR path LIKE %s "
+                "WHERE 'start' = ANY(pin_triggers) AND deleted_at IS NULL AND (path = %s OR path LIKE %s "
                 "  OR ((path LIKE '/user/%%' OR path LIKE '/feedback/%%'))) "
                 "ORDER BY (path LIKE %s) DESC, importance DESC, path",
                 (base, f"{base}/%", f"{base}%"),
@@ -1873,10 +1988,10 @@ def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> 
             ).fetchall()
 
     if not rows:
-        scope = "Auto-Inject-" if only_auto_inject else ""
+        scope = "gepinnten " if only_pinned else ""
         return f"Keine {scope}Memories für Projekt '{project_slug}' gefunden."
 
-    lines = [f"=== Auto-Inject Memory-Kontext: {project_slug} ===",
+    lines = [f"=== Gepinnte Memory-Kontext: {project_slug} ===",
              f"({len(rows)} Memories automatisch geladen)\n"]
     for r in rows:
         lines.append(f"--- [{r['type']}] {r['path']} — {r['title']} (Wichtigkeit {r['importance']:.1f}) ---")
@@ -1921,7 +2036,11 @@ def memory_set_project_config(project_slug: str, auto_extract: bool = None) -> s
 
 @mcp.tool()
 def memory_get_project_config(project_slug: str) -> str:
-    """Zeigt die projektspezifischen Einstellungen des /projects/<slug>-Nodes."""
+    """Zeigt die projektspezifischen Einstellungen des /projects/<slug>-Nodes.
+
+    Enthält u.a. 'auto_extract' (bool) und 'dirs' (Liste absoluter Pfade),
+    die per memory_set_project_dir gepflegt werden.
+    """
     path = f"/projects/{project_slug.strip('/')}"
     with get_db() as conn:
         row = conn.execute(
@@ -1931,6 +2050,67 @@ def memory_get_project_config(project_slug: str) -> str:
         return f"Projekt '{project_slug}' hat noch keinen Node/Config."
     cfg = row["config"] or {}
     return f"Config für '{project_slug}': {json.dumps(cfg, ensure_ascii=False)}"
+
+
+@mcp.tool()
+def memory_set_project_dir(project_slug: str, dir_path: str) -> str:
+    """Verknüpft ein absolutes Verzeichnis mit einem Projekt (config.dirs).
+
+    Damit erkennen die Session-Hooks den Projektkontext anhand des cwd — auch
+    wenn der Ordnername vom Slug abweicht oder das Projekt in einem Unterordner
+    geöffnet wird. Mehrfaches Hinzufügen desselben Pfads ist idempotent.
+
+    project_slug: z.B. 'diary-mcp' (ohne /projects/-Präfix)
+    dir_path:     absoluter Pfad, z.B. '/home/tom/Projekte/SE Projects/diary-mcp'
+
+    Der /projects/<slug>-Node wird automatisch angelegt, falls er noch nicht
+    existiert.
+    """
+    dir_path = dir_path.rstrip("/")
+    if not dir_path.startswith("/"):
+        return "Fehler: dir_path muss ein absoluter Pfad sein (beginnt mit '/')."
+    with get_db() as conn:
+        path = _ensure_project_node(conn, project_slug)
+        row = conn.execute("SELECT config FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+        cfg = dict(row["config"] or {}) if row else {}
+        dirs: list[str] = cfg.get("dirs") or []
+        if dir_path not in dirs:
+            dirs.append(dir_path)
+            cfg["dirs"] = dirs
+            conn.execute(
+                "UPDATE memory_nodes SET config = %s, updated_at = now() WHERE path = %s",
+                (json.dumps(cfg), path),
+            )
+            return f"Verzeichnis '{dir_path}' zu Projekt '{project_slug}' hinzugefügt. dirs: {dirs}"
+    return f"Verzeichnis '{dir_path}' war bereits in Projekt '{project_slug}' eingetragen. dirs: {dirs}"
+
+
+@mcp.tool()
+def memory_unset_project_dir(project_slug: str, dir_path: str) -> str:
+    """Entfernt ein Verzeichnis aus der config.dirs-Liste eines Projekts.
+
+    project_slug: z.B. 'diary-mcp'
+    dir_path:     absoluter Pfad, der entfernt werden soll
+    """
+    dir_path = dir_path.rstrip("/")
+    path = f"/projects/{project_slug.strip('/')}"
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT config FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (path,)
+        ).fetchone()
+        if not row:
+            return f"Projekt '{project_slug}' hat noch keinen Node/Config."
+        cfg = dict(row["config"] or {})
+        dirs: list[str] = cfg.get("dirs") or []
+        if dir_path not in dirs:
+            return f"Verzeichnis '{dir_path}' war nicht in Projekt '{project_slug}' eingetragen."
+        dirs.remove(dir_path)
+        cfg["dirs"] = dirs
+        conn.execute(
+            "UPDATE memory_nodes SET config = %s, updated_at = now() WHERE path = %s",
+            (json.dumps(cfg), path),
+        )
+    return f"Verzeichnis '{dir_path}' aus Projekt '{project_slug}' entfernt. dirs: {dirs}"
 
 
 def _ensure_remote_schema(conn) -> None:
@@ -1949,19 +2129,40 @@ def _ensure_remote_schema(conn) -> None:
             access_count INTEGER DEFAULT 0,
             accessed_at  TIMESTAMPTZ,
             valid_until  TIMESTAMPTZ,
-            auto_inject  BOOLEAN DEFAULT FALSE,
+            pin_triggers TEXT[] DEFAULT '{}',
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now()
         )
     """)
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS importance REAL DEFAULT 0.5")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ")
-    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE")
-    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS reinject_on_compact BOOLEAN DEFAULT FALSE")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS pin_triggers TEXT[] DEFAULT '{}'")
+    # Migration: backfill pin_triggers from old boolean columns if they still exist, then drop them.
+    conn.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'memory_nodes' AND column_name = 'auto_inject'
+            ) THEN
+                UPDATE memory_nodes SET pin_triggers = (
+                    CASE
+                        WHEN auto_inject AND reinject_on_compact THEN ARRAY['start','compact']
+                        WHEN auto_inject THEN ARRAY['start']
+                        WHEN reinject_on_compact THEN ARRAY['compact']
+                        ELSE '{}'::TEXT[]
+                    END
+                );
+                ALTER TABLE memory_nodes DROP COLUMN IF EXISTS auto_inject;
+                ALTER TABLE memory_nodes DROP COLUMN IF EXISTS reinject_on_compact;
+            END IF;
+        END
+        $$
+    """)
     # Remove the legacy updated_at trigger if present — it corrupts last-write-wins sync.
     conn.execute("DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes")
     # If the remote has pgvector, give it the indexed vector column + HNSW too, so

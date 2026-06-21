@@ -259,6 +259,32 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS memory_nodes_deleted_idx ON memory_nodes(deleted_at) WHERE deleted_at IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS memory_nodes_autoinject_idx ON memory_nodes(auto_inject) WHERE auto_inject",
     "CREATE INDEX IF NOT EXISTS memory_nodes_origin_idx ON memory_nodes(origin)",
+    # pin_triggers: ersetzt auto_inject + reinject_on_compact durch ein einzelnes Array-Konzept.
+    # Erlaubte Werte: 'start' (= session start, war auto_inject) und 'compact' (= nach
+    # Kompaktierung, war reinject_on_compact). Leer-Array = nicht gepinnt.
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS pin_triggers TEXT[] DEFAULT '{}'",
+    "CREATE INDEX IF NOT EXISTS memory_nodes_pin_idx ON memory_nodes USING GIN(pin_triggers) WHERE pin_triggers <> '{}'",
+    # Migration: pin_triggers aus alten Spalten befüllen + alte Spalten entfernen (idempotent).
+    # Prüft via information_schema, ob auto_inject noch existiert; wenn ja, backfill + DROP.
+    """DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'memory_nodes' AND column_name = 'auto_inject'
+        ) THEN
+            UPDATE memory_nodes SET pin_triggers = (
+                CASE
+                    WHEN auto_inject AND reinject_on_compact THEN ARRAY['start','compact']
+                    WHEN auto_inject THEN ARRAY['start']
+                    WHEN reinject_on_compact THEN ARRAY['compact']
+                    ELSE '{}'::TEXT[]
+                END
+            );
+            ALTER TABLE memory_nodes DROP COLUMN IF EXISTS auto_inject;
+            ALTER TABLE memory_nodes DROP COLUMN IF EXISTS reinject_on_compact;
+        END IF;
+    END
+    $$""",
     # Knowledge-graph: associative links between memory nodes
     # rel_type: related | supports | contradicts | requires | derived_from
     """CREATE TABLE IF NOT EXISTS memory_links (
@@ -276,6 +302,15 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS memory_nodes_valid_idx   ON memory_nodes(valid_until) WHERE valid_until IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS memory_links_from_idx    ON memory_links(from_id)",
     "CREATE INDEX IF NOT EXISTS memory_links_to_idx      ON memory_links(to_id)",
+    # Local-only bookkeeping: small key/value store. Used by memory_sync to remember
+    # the last successful sync timestamp PER configured remote URL
+    # (key 'last_sync:<DIARY_REMOTE_URL>'), so concurrent-edit conflicts can be detected.
+    # NOT part of the memory_nodes sync column set — never synced.
+    """CREATE TABLE IF NOT EXISTS diary_meta (
+        key        TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at TIMESTAMPTZ DEFAULT now()
+    )""",
     """CREATE INDEX IF NOT EXISTS memory_nodes_fts_idx ON memory_nodes
         USING GIN(to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')))""",
     # NOTE: no updated_at trigger — it would fire on the parent_id backfill below and

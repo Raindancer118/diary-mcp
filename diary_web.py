@@ -39,7 +39,7 @@ def _serial(row) -> dict[str, Any]:
 @app.get("/api/tree")
 def api_tree(path: str = "/", include_extracted: bool = False):
     cols = ("path, slug, type, title, importance, access_count, updated_at, "
-            "valid_until, auto_inject, origin")
+            "valid_until, pin_triggers, origin")
     origin_clause = "" if include_extracted else "AND origin = 'curated'"
     with get_db() as conn:
         if path == "/":
@@ -416,7 +416,7 @@ _HTML = r"""<!doctype html>
   .meta-chip.type { border-color: var(--teal-dim); color: var(--teal); }
   .meta-chip.expired { border-color: var(--red); color: var(--red); }
   .meta-chip.extracted { border-color: var(--muted); color: var(--muted); font-style: italic; }
-  .meta-chip.inject { border-color: var(--accent-dim); color: var(--accent); }
+  .meta-chip.pin { border-color: var(--accent-dim); color: var(--accent); }
 
   .importance-bar {
     display: flex;
@@ -756,7 +756,7 @@ function showNode(node) {
   strip.innerHTML = `
     <span class="meta-chip type">${node.type}</span>
     ${node.origin === 'extracted' ? `<span class="meta-chip extracted">auto-extrahiert</span>` : ''}
-    ${node.auto_inject ? `<span class="meta-chip inject">auto-inject</span>` : ''}
+    ${node.pin_triggers && node.pin_triggers.length ? `<span class="meta-chip pin">pin: ${node.pin_triggers.join(', ')}</span>` : ''}
     ${expired ? `<span class="meta-chip expired">⚠ abgelaufen</span>` : ''}
     ${node.tags && node.tags.length ? `<span class="meta-chip">${node.tags.join(', ')}</span>` : ''}
     <div class="importance-bar">${[1,2,3,4,5].map(i =>
