@@ -182,6 +182,14 @@ _SCHEMA = [
     """CREATE OR REPLACE TRIGGER memory_nodes_updated_at
        BEFORE UPDATE ON memory_nodes
        FOR EACH ROW EXECUTE FUNCTION update_updated_at()""",
+    # Backfill parent_id from path for any unlinked nodes (idempotent self-heal).
+    # The parent path is the node path with its last "/segment" stripped; true roots
+    # (e.g. /user) map to '' which matches nothing, so they correctly stay NULL.
+    """UPDATE memory_nodes child SET parent_id = parent.id
+       FROM memory_nodes parent
+       WHERE child.parent_id IS NULL
+         AND parent.path = regexp_replace(child.path, '/[^/]+$', '')
+         AND regexp_replace(child.path, '/[^/]+$', '') <> ''""",
 ]
 
 _SEED_CATEGORIES = [

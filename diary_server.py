@@ -1154,9 +1154,9 @@ def memory_health() -> str:
             issues.append(f"[LEERE KATEGORIE] {o['path']} — {o['title']}")
 
         empty_nodes = conn.execute(
-            "SELECT path, title FROM memory_nodes WHERE type != 'category' "
-            "AND (body IS NULL OR body = '') "
-            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = id)"
+            "SELECT n.path, n.title FROM memory_nodes n WHERE n.type != 'category' "
+            "AND (n.body IS NULL OR n.body = '') "
+            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = n.id)"
         ).fetchall()
         for n in empty_nodes:
             issues.append(f"[KEIN INHALT] {n['path']} — {n['title']}")

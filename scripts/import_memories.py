@@ -87,17 +87,22 @@ def memory_path(dir_name: str, node_type: str, name: str) -> str:
         return f"/projects/{slug}/{name}"
 
 
-def ensure_parent(conn, path: str) -> None:
+def ensure_parent(conn, path: str) -> int | None:
+    """Create all ancestor category nodes (with parent_id links) and return the immediate parent id."""
     parts = path.strip("/").split("/")
+    parent_id: int | None = None
     for depth in range(1, len(parts)):
         parent_path = "/" + "/".join(parts[:depth])
         slug = parts[depth - 1]
-        conn.execute(
-            """INSERT INTO memory_nodes (path, slug, type, title)
-               VALUES (%s, %s, 'category', %s)
-               ON CONFLICT (path) DO NOTHING""",
-            (parent_path, slug, slug.replace("-", " ").title()),
-        )
+        row = conn.execute(
+            """INSERT INTO memory_nodes (parent_id, path, slug, type, title)
+               VALUES (%s, %s, %s, 'category', %s)
+               ON CONFLICT (path) DO UPDATE SET parent_id = COALESCE(memory_nodes.parent_id, EXCLUDED.parent_id)
+               RETURNING id""",
+            (parent_id, parent_path, slug, slug.replace("-", " ").title()),
+        ).fetchone()
+        parent_id = row["id"]
+    return parent_id
 
 
 def import_file(conn, path: Path, dir_name: str, dry_run: bool, verbose: bool) -> str | None:
@@ -129,17 +134,18 @@ def import_file(conn, path: Path, dir_name: str, dry_run: bool, verbose: bool) -
         print(f"  [DRY RUN] {path.name} → {mem_path}")
         return None
 
-    ensure_parent(conn, mem_path)
+    parent_id = ensure_parent(conn, mem_path)
     slug = mem_path.strip("/").split("/")[-1]
     conn.execute(
-        """INSERT INTO memory_nodes (path, slug, type, title, body, importance)
-           VALUES (%s, %s, %s, %s, %s, %s)
+        """INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, importance)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (path) DO UPDATE SET
+               parent_id = EXCLUDED.parent_id,
                title = EXCLUDED.title,
                body = EXCLUDED.body,
                importance = EXCLUDED.importance,
                updated_at = now()""",
-        (mem_path, slug, node_type, title, body, importance),
+        (parent_id, mem_path, slug, node_type, title, body, importance),
     )
     if verbose:
         print(f"  ✓ {path.name} → {mem_path}")

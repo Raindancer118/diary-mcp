@@ -123,9 +123,9 @@ def api_health():
             issues.append({"kind": "empty_category", "path": o["path"], "title": o["title"],
                            "detail": "Kategorie ohne Kinder"})
         for n in conn.execute(
-            "SELECT path, title FROM memory_nodes WHERE type != 'category' "
-            "AND (body IS NULL OR body = '') "
-            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = id)"
+            "SELECT n.path, n.title FROM memory_nodes n WHERE n.type != 'category' "
+            "AND (n.body IS NULL OR n.body = '') "
+            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = n.id)"
         ).fetchall():
             issues.append({"kind": "empty_node", "path": n["path"], "title": n["title"],
                            "detail": "Kein Inhalt"})
