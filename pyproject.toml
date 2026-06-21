@@ -1,6 +1,6 @@
 [project]
 name = "diary-mcp"
-version = "0.4.4"
+version = "0.5.0"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,5 +16,15 @@ dependencies = [
 diary-mcp      = "diary_server:main"
 diary-web      = "diary_web:main"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+]
+
 [tool.setuptools]
 py-modules = ["diary_server", "diary_db", "diary_config", "diary_logger", "diary_http_receiver", "diary_web", "diary_embed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 300

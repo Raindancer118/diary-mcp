@@ -252,6 +252,11 @@ _SCHEMA = [
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]",
     # Per-node settings (e.g. per-project {"auto_extract": true}). JSONB for extensibility.
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'",
+    # Soft-delete tombstone: NULL = live, non-NULL = deleted. A tombstone is a synced
+    # row with deleted_at set, so last-write-wins propagates deletions instead of
+    # resurrecting them on the next sync. Excluded from every read path.
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE INDEX IF NOT EXISTS memory_nodes_deleted_idx ON memory_nodes(deleted_at) WHERE deleted_at IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS memory_nodes_autoinject_idx ON memory_nodes(auto_inject) WHERE auto_inject",
     "CREATE INDEX IF NOT EXISTS memory_nodes_origin_idx ON memory_nodes(origin)",
     # Knowledge-graph: associative links between memory nodes

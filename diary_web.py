@@ -44,12 +44,12 @@ def api_tree(path: str = "/", include_extracted: bool = False):
     with get_db() as conn:
         if path == "/":
             rows = conn.execute(
-                f"SELECT {cols} FROM memory_nodes WHERE TRUE {origin_clause} ORDER BY path"
+                f"SELECT {cols} FROM memory_nodes WHERE deleted_at IS NULL {origin_clause} ORDER BY path"
             ).fetchall()
         else:
             rows = conn.execute(
                 f"SELECT {cols} FROM memory_nodes "
-                f"WHERE (path = %s OR path LIKE %s) {origin_clause} ORDER BY path",
+                f"WHERE (path = %s OR path LIKE %s) AND deleted_at IS NULL {origin_clause} ORDER BY path",
                 (path, f"{path}/%"),
             ).fetchall()
     return [_serial(r) for r in rows]
@@ -58,7 +58,9 @@ def api_tree(path: str = "/", include_extracted: bool = False):
 @app.get("/api/node")
 def api_node(path: str):
     with get_db() as conn:
-        node = conn.execute("SELECT * FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+        node = conn.execute(
+            "SELECT * FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (path,)
+        ).fetchone()
         if not node:
             raise HTTPException(404, f"Node not found: {path}")
         links_out = conn.execute(
@@ -92,7 +94,8 @@ def api_search(q: str = "", include_extracted: bool = False):
             "ts_headline('german', coalesce(body,''), plainto_tsquery('german', %s), "
             "'MaxWords=20,MinWords=8,StartSel=«,StopSel=»') AS snippet "
             "FROM memory_nodes "
-            "WHERE to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')) "
+            "WHERE deleted_at IS NULL "
+            "AND to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')) "
             f"@@ plainto_tsquery('german', %s) {origin_clause} "
             "ORDER BY ts_rank("
             "to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')), "
@@ -103,7 +106,8 @@ def api_search(q: str = "", include_extracted: bool = False):
             rows = conn.execute(
                 "SELECT path, title, type, importance, origin, "
                 "substr(coalesce(body,''), 1, 200) AS snippet "
-                f"FROM memory_nodes WHERE (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 30",
+                f"FROM memory_nodes WHERE deleted_at IS NULL "
+                f"AND (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 30",
                 (f"%{q}%", f"%{q}%"),
             ).fetchall()
     return [_serial(r) for r in rows]
@@ -115,20 +119,20 @@ def api_health():
     with get_db() as conn:
         for e in conn.execute(
             "SELECT path, title, valid_until FROM memory_nodes "
-            "WHERE valid_until IS NOT NULL AND valid_until < now()"
+            "WHERE deleted_at IS NULL AND valid_until IS NOT NULL AND valid_until < now()"
         ).fetchall():
             issues.append({"kind": "expired", "path": e["path"], "title": e["title"],
                            "detail": f"Abgelaufen {str(e['valid_until'])[:10]}"})
         for o in conn.execute(
-            "SELECT m.path, m.title FROM memory_nodes m WHERE m.type = 'category' "
-            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = m.id)"
+            "SELECT m.path, m.title FROM memory_nodes m WHERE m.type = 'category' AND m.deleted_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = m.id AND c.deleted_at IS NULL)"
         ).fetchall():
             issues.append({"kind": "empty_category", "path": o["path"], "title": o["title"],
                            "detail": "Kategorie ohne Kinder"})
         for n in conn.execute(
-            "SELECT n.path, n.title FROM memory_nodes n WHERE n.type != 'category' "
+            "SELECT n.path, n.title FROM memory_nodes n WHERE n.type != 'category' AND n.deleted_at IS NULL "
             "AND (n.body IS NULL OR n.body = '') "
-            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = n.id)"
+            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = n.id AND c.deleted_at IS NULL)"
         ).fetchall():
             issues.append({"kind": "empty_node", "path": n["path"], "title": n["title"],
                            "detail": "Kein Inhalt"})
@@ -136,10 +140,10 @@ def api_health():
             "SELECT COUNT(*) AS total, "
             "SUM(CASE WHEN body IS NOT NULL AND body != '' THEN 1 ELSE 0 END) AS with_content, "
             "ROUND(AVG(importance)::numeric, 2) AS avg_importance "
-            "FROM memory_nodes"
+            "FROM memory_nodes WHERE deleted_at IS NULL"
         ).fetchone()
         by_type = conn.execute(
-            "SELECT type, COUNT(*) AS c FROM memory_nodes GROUP BY type ORDER BY c DESC"
+            "SELECT type, COUNT(*) AS c FROM memory_nodes WHERE deleted_at IS NULL GROUP BY type ORDER BY c DESC"
         ).fetchall()
     return {"issues": issues, "stats": dict(stats) if stats else {}, "by_type": [dict(r) for r in by_type]}
 

@@ -121,14 +121,13 @@ def main() -> None:
         _log(f"import failed: {exc}")
         return
 
-    date = datetime.now().strftime("%Y-%m-%d")
     saved = 0
     for text in turns:
         body = text[:MAX_BODY]
-        # Content hash in the path → re-running on the same transcript upserts
-        # rather than duplicating.
+        # Path is content-hash-based (no date) so the same user turn captured on
+        # multiple days upserts the same node instead of creating duplicates.
         h = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
-        path = f"/projects/{slug}/auto/{date}-{h}-{_slugify(_title_of(text))}"
+        path = f"/projects/{slug}/auto/{h}-{_slugify(_title_of(text))}"
         try:
             memory_save_extracted(path=path, title=_title_of(text), body=body, type="note")
             saved += 1

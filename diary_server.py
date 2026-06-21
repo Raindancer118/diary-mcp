@@ -30,6 +30,9 @@ _log = logging.getLogger(__name__)
 mcp = FastMCP("Diary")
 init_db()
 
+# Extracted memories auto-expire after this many days unless promoted to curated.
+EXTRACTED_TTL_DAYS = 90
+
 
 def _now() -> str:
     return datetime.now().strftime(load_config()["date_format"])
@@ -795,16 +798,19 @@ def _ensure_memory_parent(conn, path: str):
         return None
 
     parent_path = "/" + "/".join(parts[:-1])
-    row = conn.execute("SELECT id FROM memory_nodes WHERE path = %s", (parent_path,)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (parent_path,)
+    ).fetchone()
     if row:
         return row["id"]
 
     grandparent_id = _ensure_memory_parent(conn, parent_path)
     parent_slug = parts[-2]
+    # Revive a tombstoned parent path if one exists (ON CONFLICT), clearing deleted_at.
     row = conn.execute(
         """INSERT INTO memory_nodes (parent_id, path, slug, type, title)
            VALUES (%s, %s, %s, 'category', %s)
-           ON CONFLICT (path) DO UPDATE SET updated_at = now()
+           ON CONFLICT (path) DO UPDATE SET updated_at = now(), deleted_at = NULL
            RETURNING id""",
         (grandparent_id, parent_path, parent_slug, parent_slug.capitalize()),
     ).fetchone()
@@ -817,17 +823,18 @@ def memory_context() -> str:
     with get_db() as conn:
         nodes = conn.execute(
             "SELECT path, type, title, updated_at FROM memory_nodes "
-            "WHERE origin = 'curated' ORDER BY path"
+            "WHERE origin = 'curated' AND deleted_at IS NULL ORDER BY path"
         ).fetchall()
         recent_cutoff = datetime.now() - timedelta(days=14)
         recent = conn.execute(
             "SELECT path, title, body, updated_at FROM memory_nodes "
-            "WHERE origin = 'curated' AND body IS NOT NULL AND body != '' AND updated_at > %s "
+            "WHERE origin = 'curated' AND deleted_at IS NULL "
+            "AND body IS NOT NULL AND body != '' AND updated_at > %s "
             "ORDER BY updated_at DESC",
             (recent_cutoff,),
         ).fetchall()
         extracted_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM memory_nodes WHERE origin = 'extracted'"
+            "SELECT COUNT(*) AS c FROM memory_nodes WHERE origin = 'extracted' AND deleted_at IS NULL"
         ).fetchone()["c"]
 
     lines = ["=== Claude Memory Context ===\n", "MEMORY TREE:"]
@@ -868,12 +875,12 @@ def memory_tree(path: str = "/", include_extracted: bool = False) -> str:
         if path == "/":
             nodes = conn.execute(
                 f"SELECT path, type, title, updated_at FROM memory_nodes "
-                f"WHERE TRUE {origin_clause} ORDER BY path"
+                f"WHERE deleted_at IS NULL {origin_clause} ORDER BY path"
             ).fetchall()
         else:
             nodes = conn.execute(
                 f"SELECT path, type, title, updated_at FROM memory_nodes "
-                f"WHERE (path = %s OR path LIKE %s) {origin_clause} ORDER BY path",
+                f"WHERE (path = %s OR path LIKE %s) AND deleted_at IS NULL {origin_clause} ORDER BY path",
                 (path, f"{path}/%"),
             ).fetchall()
 
@@ -893,7 +900,9 @@ def memory_tree(path: str = "/", include_extracted: bool = False) -> str:
 def memory_get(path: str) -> str:
     """Gibt den vollen Inhalt eines Memory-Nodes zurück und trackt den Zugriff."""
     with get_db() as conn:
-        node = conn.execute("SELECT * FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+        node = conn.execute(
+            "SELECT * FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (path,)
+        ).fetchone()
         if not node:
             return f"Kein Memory-Node unter '{path}' gefunden."
 
@@ -914,7 +923,8 @@ def memory_get(path: str) -> str:
 
         # Warn if expired
         expired_note = ""
-        if node.get("valid_until") and node["valid_until"] < datetime.now():
+        _now_aware = datetime.now().astimezone()
+        if node.get("valid_until") and node["valid_until"].astimezone() < _now_aware:
             expired_note = f"\n⚠️  ABGELAUFEN seit {str(node['valid_until'])[:10]}"
 
     lines = [
@@ -994,10 +1004,11 @@ def memory_upsert(
 
         existing = conn.execute("SELECT id FROM memory_nodes WHERE path = %s", (path,)).fetchone()
         if existing:
+            # Upserting a tombstoned path revives it (deleted_at=NULL).
             conn.execute(
                 "UPDATE memory_nodes SET title=%s, body=%s, type=%s, tags=%s, "
                 "importance=%s, valid_until=%s, auto_inject=%s, origin=%s, embedding=%s, "
-                "updated_at=now() WHERE path=%s",
+                "deleted_at=NULL, updated_at=now() WHERE path=%s",
                 (title, body, type, tag_list, importance, valid_until_val, auto_inject, origin, embedding, path),
             )
             _refresh_vector(conn, path, embedding)
@@ -1024,9 +1035,14 @@ def memory_save_extracted(path: str, title: str, body: str, type: str = "note",
     nicht für bewusst kuratiertes Wissen — dafür memory_upsert() verwenden.
 
     Standard-importance ist bewusst niedrig (0.3), da unkuratiert.
+
+    Extrahierte Memories erhalten automatisch ein Ablaufdatum von EXTRACTED_TTL_DAYS
+    (aktuell 90 Tage), damit sie nicht unbegrenzt wachsen. Wird ein Memory via
+    memory_promote() zu curated befördert, wird valid_until gelöscht.
     """
+    ttl = (datetime.now() + timedelta(days=EXTRACTED_TTL_DAYS)).strftime("%Y-%m-%d")
     return memory_upsert(path=path, title=title, body=body, type=type, tags=tags,
-                         importance=importance, origin="extracted")
+                         importance=importance, valid_until=ttl, origin="extracted")
 
 
 @mcp.tool()
@@ -1035,39 +1051,243 @@ def memory_promote(path: str, importance: float = 0.7) -> str:
 
     Nutze dies, wenn du beim Durchsuchen der extrahierten Memories eines findest,
     das dauerhaft wertvoll ist und künftig standardmäßig verfügbar sein soll.
+
+    Setzt origin='curated', erhöht importance und löscht valid_until, damit das
+    Memory dauerhaft verfügbar bleibt (kein automatisches Ablaufen mehr).
     """
     with get_db() as conn:
         result = conn.execute(
-            "UPDATE memory_nodes SET origin='curated', importance=%s, updated_at=now() "
-            "WHERE path=%s RETURNING origin",
+            "UPDATE memory_nodes SET origin='curated', importance=%s, valid_until=NULL, updated_at=now() "
+            "WHERE path=%s AND deleted_at IS NULL RETURNING origin",
             (importance, path),
         ).fetchone()
         if not result:
             return f"Node '{path}' nicht gefunden."
-    return f"'{path}' zu kuratiertem Memory befördert (importance {importance:.1f})."
+    return f"'{path}' zu kuratiertem Memory befördert (importance {importance:.1f}, valid_until gelöscht)."
+
+
+@mcp.tool()
+def memory_prune_extracted(expired_only: bool = True, keep_per_project: int = 0) -> str:
+    """Bereinigt extrahierte Memories (origin='extracted') durch Soft-Delete (Tombstone).
+
+    expired_only=True (Default): tombstonet nur Memories, deren valid_until abgelaufen ist.
+    expired_only=False: tombstonet ALLE extracted Memories (z.B. für einen Kalt-Reset).
+
+    keep_per_project>0: Behält die N neuesten extracted Memories pro /projects/<slug>
+    und tombstonet den Rest (wird zusätzlich zu expired_only ausgeführt). Nützlich,
+    um die Tier-2-Größe pro Projekt zu begrenzen, ohne alle zu löschen.
+    HINWEIS: Wenn keep_per_project>0 und expired_only=False, werden zunächst die N
+    neuesten behalten und der Rest tombstonet — nicht alles.
+
+    Gibt einen Bericht zurück, wie viele Memories tombstonet wurden.
+    """
+    tombstoned_expired = 0
+    tombstoned_overflow = 0
+
+    with get_db() as conn:
+        # --- 1. Per-project overflow (keep_per_project newest) ---
+        # Runs BEFORE the bulk tombstone so the keep list is still alive.
+        if keep_per_project > 0:
+            # Find all distinct project slugs that have extracted memories
+            slug_rows = conn.execute(
+                """SELECT DISTINCT regexp_replace(path, '^/projects/([^/]+)/.*$', '\\1') AS slug
+                   FROM memory_nodes
+                   WHERE origin = 'extracted' AND deleted_at IS NULL
+                     AND path ~ '^/projects/[^/]+/.*$'"""
+            ).fetchall()
+
+            for row in slug_rows:
+                slug = row["slug"]
+                base = f"/projects/{slug}/"
+                # Keep the N most recently created; tombstone the rest
+                keep_rows = conn.execute(
+                    "SELECT id FROM memory_nodes "
+                    "WHERE origin = 'extracted' AND deleted_at IS NULL "
+                    "AND path LIKE %s ORDER BY created_at DESC LIMIT %s",
+                    (f"{base}%", keep_per_project),
+                ).fetchall()
+                keep_ids = [r["id"] for r in keep_rows]
+
+                if keep_ids:
+                    placeholders = ",".join(["%s"] * len(keep_ids))
+                    result = conn.execute(
+                        f"UPDATE memory_nodes SET deleted_at = now(), updated_at = now() "
+                        f"WHERE origin = 'extracted' AND deleted_at IS NULL "
+                        f"AND path LIKE %s AND id NOT IN ({placeholders})",
+                        [f"{base}%"] + keep_ids,
+                    )
+                    tombstoned_overflow += result.rowcount
+                else:
+                    result = conn.execute(
+                        "UPDATE memory_nodes SET deleted_at = now(), updated_at = now() "
+                        "WHERE origin = 'extracted' AND deleted_at IS NULL AND path LIKE %s",
+                        (f"{base}%",),
+                    )
+                    tombstoned_overflow += result.rowcount
+
+        # --- 2. Expired / bulk tombstone (runs after overflow so counts are separate) ---
+        if expired_only:
+            result = conn.execute(
+                "UPDATE memory_nodes SET deleted_at = now(), updated_at = now() "
+                "WHERE origin = 'extracted' AND deleted_at IS NULL "
+                "AND valid_until IS NOT NULL AND valid_until < now()"
+            )
+            tombstoned_expired = result.rowcount
+        else:
+            result = conn.execute(
+                "UPDATE memory_nodes SET deleted_at = now(), updated_at = now() "
+                "WHERE origin = 'extracted' AND deleted_at IS NULL"
+            )
+            tombstoned_expired = result.rowcount
+
+    parts = []
+    if expired_only:
+        parts.append(f"{tombstoned_expired} abgelaufene extracted Memories tombstonet")
+    else:
+        parts.append(f"{tombstoned_expired} extracted Memories tombstonet (alle)")
+    if keep_per_project > 0:
+        parts.append(f"{tombstoned_overflow} Overflow-Memories per keep_per_project={keep_per_project} tombstonet")
+    total = tombstoned_expired + tombstoned_overflow
+    parts.append(f"Gesamt: {total} Tombstones gesetzt")
+    return " | ".join(parts) + "."
 
 
 @mcp.tool()
 def memory_delete(path: str) -> str:
-    """Löscht einen Memory-Node und alle seine Kinder (Unterknoten)."""
+    """Löscht einen Memory-Node und alle seine Kinder (Unterknoten).
+
+    Soft-Delete: setzt deleted_at (Tombstone) statt hart zu löschen. So wird die
+    Löschung beim Sync per last-write-wins zur Remote propagiert, statt beim
+    nächsten Sync wieder „aufzuerstehen". Tombstones werden aus allen Lese-Pfaden
+    ausgeblendet und können später via memory_purge_tombstones endgültig entfernt werden.
+    """
     with get_db() as conn:
         count_row = conn.execute(
-            "SELECT COUNT(*) AS c FROM memory_nodes WHERE path = %s OR path LIKE %s",
+            "SELECT COUNT(*) AS c FROM memory_nodes "
+            "WHERE (path = %s OR path LIKE %s) AND deleted_at IS NULL",
             (path, f"{path}/%"),
         ).fetchone()
         count = count_row["c"]
         if count == 0:
             return f"Kein Node unter '{path}' gefunden."
         conn.execute(
-            "DELETE FROM memory_nodes WHERE path = %s OR path LIKE %s",
+            "UPDATE memory_nodes SET deleted_at = now(), updated_at = now() "
+            "WHERE (path = %s OR path LIKE %s) AND deleted_at IS NULL",
             (path, f"{path}/%"),
         )
-    return f"{count} Memory-Node(s) unter '{path}' gelöscht."
+    return f"{count} Memory-Node(s) unter '{path}' gelöscht (Tombstone)."
 
 
 @mcp.tool()
-def memory_search(query: str, include_extracted: bool = False) -> str:
-    """Sucht im Memory-Tree via PostgreSQL Full-Text-Search (fällt auf ILIKE zurück).
+def memory_purge_tombstones(older_than_days: int = 30) -> str:
+    """Entfernt endgültig (HARD-DELETE) alle Tombstones, deren Löschung älter als N Tage ist.
+
+    Tombstones (deleted_at gesetzt) bleiben eine Weile bestehen, damit die Löschung
+    per Sync zur Remote propagiert. Diese Funktion räumt sie auf BEIDEN Seiten auf
+    (lokal + Remote, falls erreichbar), damit sie nicht ewig wachsen. Nur Tombstones
+    mit deleted_at < now() - older_than_days werden hart gelöscht — frische Tombstones
+    bleiben erhalten, bis beide Seiten synchronisiert sind.
+
+    older_than_days: Mindestalter eines Tombstones in Tagen (Default 30).
+    """
+    if older_than_days < 0:
+        return "Fehler: older_than_days darf nicht negativ sein."
+
+    purge_sql = (
+        "DELETE FROM memory_nodes "
+        "WHERE deleted_at IS NOT NULL AND deleted_at < now() - %s::interval"
+    )
+    interval = f"{int(older_than_days)} days"
+
+    with get_db() as conn:
+        local = conn.execute(purge_sql, (interval,)).rowcount
+
+    remote_note = ""
+    if get_remote_url():
+        try:
+            with remote_db_url() as rurl:
+                rc = psycopg.connect(rurl, row_factory=dict_row)
+                try:
+                    remote = rc.execute(purge_sql, (interval,)).rowcount
+                    rc.commit()
+                finally:
+                    rc.close()
+            tunnel = f" (via SSH-Tunnel {get_remote_ssh_host()})" if get_remote_ssh_host() else ""
+            remote_note = f" Remote{tunnel}: {remote} entfernt."
+        except Exception as exc:  # noqa: BLE001
+            remote_note = f" Remote-Purge fehlgeschlagen: {exc}"
+    else:
+        remote_note = " (keine Remote konfiguriert — nur lokal)"
+
+    return f"Tombstone-Purge (>{older_than_days}d): Lokal {local} entfernt.{remote_note}"
+
+
+def _apply_ranking(rows: list[dict], sim_key: str = "sim") -> list[dict]:
+    """Blendet Importance und Recency als Tiebreaker in den Similarity-Score ein.
+
+    Formel:
+        final_score = similarity * (0.5 + 0.5 * importance)
+                      + 1e-6 * recency_days_ago_inv
+
+    Erklärung:
+      • Similarity (FTS-rank oder Cosine) wird mit einem Faktor (0.5–1.0) skaliert,
+        der linear von importance abhängt. importance=0 → Faktor 0.5 (halbiert nur),
+        importance=1 → Faktor 1.0 (unveränderter Score). Similarity dominiert stets.
+      • Recency-Term: 1/(1+days_since_update) — winzig (1e-6 * max ~1), dient nur
+        als stabiler Tiebreaker bei gleichen final_scores, nicht als Rangsignal.
+    """
+    now = datetime.now()
+    result = []
+    for r in rows:
+        sim = float(r.get(sim_key, 0.0))
+        importance = float(r.get("importance", 0.5) or 0.5)
+        updated_at = r.get("updated_at")
+        if updated_at:
+            try:
+                if isinstance(updated_at, str):
+                    updated_at = datetime.fromisoformat(updated_at)
+                days_ago = max(0.0, (now - updated_at.replace(tzinfo=None)).total_seconds() / 86400)
+            except Exception:
+                days_ago = 365.0
+        else:
+            days_ago = 365.0
+        recency = 1.0 / (1.0 + days_ago)
+        final = sim * (0.5 + 0.5 * importance) + 1e-6 * recency
+        result.append({**r, "final_score": final})
+    result.sort(key=lambda x: x["final_score"], reverse=True)
+    return result
+
+
+def _rrf_fuse(
+    fts_paths: list[str],
+    vec_paths: list[str],
+    k: int = 60,
+) -> list[str]:
+    """Reciprocal Rank Fusion der FTS- und Vektor-Ranglisten.
+
+    Formel: RRF_score(d) = 1/(k + rank_fts(d)) + 1/(k + rank_vec(d))
+    k=60 (Standard nach Cormack et al. 2009). Fehlende Einträge zählen als
+    rank = len(Liste)+1 (schlechtester möglicher Rang).
+    """
+    fts_rank = {p: i + 1 for i, p in enumerate(fts_paths)}
+    vec_rank = {p: i + 1 for i, p in enumerate(vec_paths)}
+    all_paths = set(fts_paths) | set(vec_paths)
+    fts_missing = len(fts_paths) + 1
+    vec_missing = len(vec_paths) + 1
+    scores = {
+        p: 1.0 / (k + fts_rank.get(p, fts_missing)) + 1.0 / (k + vec_rank.get(p, vec_missing))
+        for p in all_paths
+    }
+    return sorted(all_paths, key=lambda p: scores[p], reverse=True)
+
+
+@mcp.tool()
+def memory_search(
+    query: str,
+    include_extracted: bool = False,
+    include_expired: bool = False,
+) -> str:
+    """Hybride Suche im Memory-Tree: FTS + semantische Suche, fusioniert via RRF.
 
     ZWEI-STUFEN-MODELL — wichtig:
       • Standard (include_extracted=False): durchsucht NUR die kuratierten Memories,
@@ -1078,42 +1298,120 @@ def memory_search(query: str, include_extracted: bool = False) -> str:
         kuratierte Suche nichts Brauchbares liefert oder du gezielt nach einem
         Detail aus einem früheren Gespräch suchst.
 
+    HYBRID-SEARCH: Kombiniert lexikalische FTS-Suche (PostgreSQL tsvector) mit
+    semantischer Vektorsuche (Embeddings). Wenn das Embedding-Modell nicht
+    verfügbar ist, wird automatisch auf FTS-only zurückgefallen.
+    Fusion: Reciprocal Rank Fusion (RRF, k=60).
+
+    RANKING: final_score = similarity * (0.5 + 0.5 * importance)
+                           + 1e-6 * recency_tiebreaker
+    Recency-Term = 1/(1+days_since_update) — winziger Tiebreaker, dominiert nie.
+
+    ABLAUFENDE MEMORIES: include_expired=False (Standard) — Memories mit
+    vergangenem valid_until werden ausgeblendet. include_expired=True zeigt sie.
+
     Die Standardsuche zeigt am Ende an, wie viele Treffer es zusätzlich in den
     auto-extrahierten Memories gäbe, damit du entscheiden kannst, ob sich das
     teurere Durchsuchen lohnt.
     """
     origin_clause = "" if include_extracted else "AND origin = 'curated'"
+    expiry_clause = "" if include_expired else "AND (valid_until IS NULL OR valid_until >= now())"
+
     with get_db() as conn:
-        fts_results = conn.execute(
-            f"""SELECT path, title, type, origin,
+        # --- FTS leg ---
+        fts_rows = conn.execute(
+            f"""SELECT path, title, type, origin, importance, updated_at,
+                      ts_rank(
+                          to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')),
+                          plainto_tsquery('german', %s)
+                      ) AS sim,
                       ts_headline('german', coalesce(body,''), plainto_tsquery('german', %s),
                                   'MaxWords=25,MinWords=10,StartSel=«,StopSel=»') AS snippet
                FROM memory_nodes
-               WHERE to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,''))
+               WHERE deleted_at IS NULL {expiry_clause}
+                 AND to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,''))
                      @@ plainto_tsquery('german', %s) {origin_clause}
-               ORDER BY ts_rank(
-                   to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,'')),
-                   plainto_tsquery('german', %s)
-               ) DESC LIMIT 20""",
+               ORDER BY sim DESC LIMIT 30""",
             (query, query, query),
         ).fetchall()
 
-        if fts_results:
-            results, mode = fts_results, "FTS"
+        # --- Semantic leg (RRF requires paths only for fusion) ---
+        vec_rows: list[dict] = []
+        qvec = diary_embed.embed(query)
+        if qvec is not None and _pgvector_ready(conn):
+            qlit = "[" + ",".join(repr(float(x)) for x in qvec) + "]"
+            vec_rows = conn.execute(
+                f"""SELECT path, title, type, origin, importance, updated_at,
+                           1 - (embedding_v <=> %s::vector) AS sim,
+                           substr(coalesce(body,''), 1, 200) AS snippet
+                    FROM memory_nodes
+                    WHERE embedding_v IS NOT NULL AND deleted_at IS NULL {expiry_clause}
+                    {origin_clause}
+                    ORDER BY embedding_v <=> %s::vector LIMIT 30""",
+                (qlit, qlit),
+            ).fetchall()
+        elif qvec is not None:
+            # numpy fallback
+            candidates = conn.execute(
+                f"""SELECT path, title, type, origin, importance, updated_at, embedding,
+                           substr(coalesce(body,''), 1, 200) AS snippet
+                    FROM memory_nodes
+                    WHERE embedding IS NOT NULL AND deleted_at IS NULL {expiry_clause}
+                    {origin_clause}"""
+            ).fetchall()
+            scored = []
+            for c in candidates:
+                s = diary_embed.cosine(qvec, c["embedding"])
+                scored.append({**c, "sim": s})
+            scored.sort(key=lambda r: r["sim"], reverse=True)
+            vec_rows = scored[:30]
+
+        # --- RRF fusion ---
+        fts_by_path = {r["path"]: r for r in fts_rows}
+        vec_by_path = {r["path"]: r for r in vec_rows}
+
+        if fts_rows and vec_rows:
+            fused_paths = _rrf_fuse(
+                [r["path"] for r in fts_rows],
+                [r["path"] for r in vec_rows],
+            )
+            # Merge metadata: prefer FTS row (has snippet from ts_headline), fall back to vec
+            all_meta = {**vec_by_path, **fts_by_path}
+            merged = [all_meta[p] for p in fused_paths if p in all_meta]
+            # Assign a synthetic similarity as 1/(rank+1) for the ranking formula
+            for i, row in enumerate(merged):
+                if "sim" not in row or row.get("sim") is None:
+                    row = dict(row)
+                    merged[i] = {**row, "sim": 1.0 / (i + 1)}
+            mode = "Hybrid/RRF"
+            results = merged[:20]
+        elif fts_rows:
+            mode = "FTS"
+            results = fts_rows[:20]
+        elif vec_rows:
+            mode = "Semantisch"
+            results = vec_rows[:20]
         else:
+            # ILIKE fallback (no FTS match, no embeddings)
             results = conn.execute(
-                f"""SELECT path, title, type, origin, substr(coalesce(body,''), 1, 200) AS snippet
-                   FROM memory_nodes WHERE (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 20""",
+                f"""SELECT path, title, type, origin, importance, updated_at,
+                           0.1 AS sim,
+                           substr(coalesce(body,''), 1, 200) AS snippet
+                   FROM memory_nodes WHERE deleted_at IS NULL {expiry_clause}
+                     AND (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 20""",
                 (f"%{query}%", f"%{query}%"),
             ).fetchall()
             mode = "LIKE"
+
+        # Apply importance + recency ranking
+        results = _apply_ranking(results, sim_key="sim")
 
         # Count extra hits in the extracted tier (only relevant in default mode)
         extracted_hits = 0
         if not include_extracted:
             extracted_hits = conn.execute(
-                """SELECT COUNT(*) AS c FROM memory_nodes
-                   WHERE origin = 'extracted'
+                f"""SELECT COUNT(*) AS c FROM memory_nodes
+                   WHERE origin = 'extracted' AND deleted_at IS NULL {expiry_clause}
                      AND (to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,''))
                           @@ plainto_tsquery('german', %s)
                           OR title ILIKE %s OR body ILIKE %s)""",
@@ -1121,13 +1419,15 @@ def memory_search(query: str, include_extracted: bool = False) -> str:
             ).fetchone()["c"]
 
     scope = "alle Tiers" if include_extracted else "kuratiert"
+    expired_note = "" if include_expired else ", ohne abgelaufene"
     if not results and not extracted_hits:
-        return f"Keine Memory-Ergebnisse für '{query}' ({scope})."
+        return f"Keine Memory-Ergebnisse für '{query}' ({scope}{expired_note})."
 
-    lines = [f"Memory-Suchergebnisse [{mode}, {scope}] für '{query}':"]
+    lines = [f"Memory-Suchergebnisse [{mode}, {scope}{expired_note}] für '{query}':"]
     for r in results:
         tag = "" if r.get("origin", "curated") == "curated" else " ⟨auto-extrahiert⟩"
-        lines.append(f"\n[{r['type']}] {r['path']} — {r['title']}{tag}")
+        score_str = f"  Score {r['final_score']:.4f}"
+        lines.append(f"\n[{r['type']}] {r['path']} — {r['title']}{tag}{score_str}")
         if r.get("snippet"):
             lines.append(f"  {r['snippet']}")
     if extracted_hits:
@@ -1139,7 +1439,12 @@ def memory_search(query: str, include_extracted: bool = False) -> str:
 
 
 @mcp.tool()
-def memory_search_semantic(query: str, top_k: int = 8, include_extracted: bool = False) -> str:
+def memory_search_semantic(
+    query: str,
+    top_k: int = 8,
+    include_extracted: bool = False,
+    include_expired: bool = False,
+) -> str:
     """Semantische Suche im Memory-Tree über Embeddings (sprachübergreifend).
 
     Im Gegensatz zu memory_search (lexikalisch, Stichwort-basiert) findet diese
@@ -1150,6 +1455,13 @@ def memory_search_semantic(query: str, top_k: int = 8, include_extracted: bool =
     Bei vielen Memories nutzt sie automatisch den pgvector-HNSW-Index (schnell);
     sonst einen numpy-Fallback. include_extracted=True bezieht die auto-extrahierten
     Memories mit ein (kostspieliger).
+
+    RANKING: final_score = cosine_similarity * (0.5 + 0.5 * importance)
+                           + 1e-6 * recency_tiebreaker
+    Recency-Term = 1/(1+days_since_update) — winziger Tiebreaker, dominiert nie.
+
+    ABLAUFENDE MEMORIES: include_expired=False (Standard) — Memories mit
+    vergangenem valid_until werden ausgeblendet. include_expired=True zeigt sie.
     """
     qvec = diary_embed.embed(query)
     if qvec is None:
@@ -1158,39 +1470,50 @@ def memory_search_semantic(query: str, top_k: int = 8, include_extracted: bool =
 
     qlit = "[" + ",".join(repr(float(x)) for x in qvec) + "]"  # pgvector text format
     origin_clause = "" if include_extracted else "AND origin = 'curated'"
+    expiry_clause = "" if include_expired else "AND (valid_until IS NULL OR valid_until >= now())"
+    # Fetch more candidates so ranking can re-sort before limiting to top_k
+    fetch_k = max(top_k * 3, 30)
     with get_db() as conn:
         if _pgvector_ready(conn):
             rows = conn.execute(
-                f"""SELECT path, title, type, origin,
-                           1 - (embedding_v <=> %s::vector) AS score,
+                f"""SELECT path, title, type, origin, importance, updated_at,
+                           1 - (embedding_v <=> %s::vector) AS sim,
                            substr(coalesce(body,''), 1, 160) AS snippet
                     FROM memory_nodes
-                    WHERE embedding_v IS NOT NULL {origin_clause}
+                    WHERE embedding_v IS NOT NULL AND deleted_at IS NULL {expiry_clause} {origin_clause}
                     ORDER BY embedding_v <=> %s::vector LIMIT %s""",
-                (qlit, qlit, top_k),
+                (qlit, qlit, fetch_k),
             ).fetchall()
             backend = "pgvector/HNSW"
         else:
             candidates = conn.execute(
-                f"SELECT path, title, type, origin, embedding, "
-                f"substr(coalesce(body,''),1,160) AS snippet "
-                f"FROM memory_nodes WHERE embedding IS NOT NULL {origin_clause}"
+                f"""SELECT path, title, type, origin, importance, updated_at, embedding,
+                           substr(coalesce(body,''),1,160) AS snippet
+                    FROM memory_nodes
+                    WHERE embedding IS NOT NULL AND deleted_at IS NULL {expiry_clause} {origin_clause}"""
             ).fetchall()
             scored = []
             for c in candidates:
                 s = diary_embed.cosine(qvec, c["embedding"])
-                scored.append({**c, "score": s})
-            scored.sort(key=lambda r: r["score"], reverse=True)
-            rows = scored[:top_k]
+                scored.append({**c, "sim": s})
+            scored.sort(key=lambda r: r["sim"], reverse=True)
+            rows = scored[:fetch_k]
             backend = "numpy"
 
     if not rows:
-        return f"Keine semantischen Treffer für '{query}'. (Tipp: memory_reembed_all falls Embeddings fehlen.)"
+        expired_note = "" if include_expired else " (ohne abgelaufene)"
+        return (f"Keine semantischen Treffer für '{query}'{expired_note}. "
+                f"(Tipp: memory_reembed_all falls Embeddings fehlen.)")
 
-    lines = [f"Semantische Suche [{backend}] für '{query}':"]
-    for r in rows:
+    ranked = _apply_ranking(list(rows), sim_key="sim")[:top_k]
+    expired_note = "" if include_expired else ", ohne abgelaufene"
+    lines = [f"Semantische Suche [{backend}{expired_note}] für '{query}':"]
+    for r in ranked:
         tag = "" if r.get("origin", "curated") == "curated" else " ⟨auto-extrahiert⟩"
-        lines.append(f"\n[{r['type']}] {r['path']} — {r['title']}{tag}  (Score {r['score']:.2f})")
+        lines.append(
+            f"\n[{r['type']}] {r['path']} — {r['title']}{tag}"
+            f"  (sim {r.get('sim', 0):.3f}, final {r['final_score']:.4f})"
+        )
         if r.get("snippet"):
             lines.append(f"  {r['snippet']}")
     return "\n".join(lines)
@@ -1208,7 +1531,7 @@ def memory_reembed_all(only_missing: bool = True) -> str:
         return "Embedding-Modell nicht verfügbar — fastembed/Modell konnte nicht geladen werden."
 
     with get_db() as conn:
-        cond = "WHERE embedding IS NULL" if only_missing else ""
+        cond = "WHERE deleted_at IS NULL AND embedding IS NULL" if only_missing else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT path, title, body FROM memory_nodes {cond}"
         ).fetchall()
@@ -1237,18 +1560,19 @@ def memory_reembed_all(only_missing: bool = True) -> str:
 
 _SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
               "valid_until, auto_inject, reinject_on_compact, origin, embedding, config, "
-              "created_at, updated_at")
+              "deleted_at, created_at, updated_at")
 _SYNC_INSERT = """INSERT INTO memory_nodes
        (path, slug, type, title, body, tags, importance, valid_until, auto_inject,
-        reinject_on_compact, origin, embedding, config, created_at, updated_at)
-       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        reinject_on_compact, origin, embedding, config, deleted_at, created_at, updated_at)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
        ON CONFLICT (path) DO UPDATE SET
            type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
            tags=EXCLUDED.tags, importance=EXCLUDED.importance,
            valid_until=EXCLUDED.valid_until, auto_inject=EXCLUDED.auto_inject,
            reinject_on_compact=EXCLUDED.reinject_on_compact,
            origin=EXCLUDED.origin, embedding=EXCLUDED.embedding,
-           config=EXCLUDED.config, updated_at=EXCLUDED.updated_at"""
+           config=EXCLUDED.config, deleted_at=EXCLUDED.deleted_at,
+           updated_at=EXCLUDED.updated_at"""
 
 
 def _sync_row(n: dict) -> tuple:
@@ -1256,7 +1580,7 @@ def _sync_row(n: dict) -> tuple:
             n["importance"], n["valid_until"], n["auto_inject"], n["reinject_on_compact"],
             n["origin"], n["embedding"],
             json.dumps(n["config"]) if n.get("config") is not None else "{}",
-            n["created_at"], n["updated_at"])
+            n["deleted_at"], n["created_at"], n["updated_at"])
 
 
 @mcp.tool()
@@ -1354,8 +1678,12 @@ def memory_link(from_path: str, to_path: str, rel_type: str = "related", note: s
     if rel_type not in valid_types:
         return f"Ungültiger rel_type '{rel_type}'. Erlaubt: {', '.join(sorted(valid_types))}"
     with get_db() as conn:
-        from_node = conn.execute("SELECT id FROM memory_nodes WHERE path = %s", (from_path,)).fetchone()
-        to_node = conn.execute("SELECT id FROM memory_nodes WHERE path = %s", (to_path,)).fetchone()
+        from_node = conn.execute(
+            "SELECT id FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (from_path,)
+        ).fetchone()
+        to_node = conn.execute(
+            "SELECT id FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (to_path,)
+        ).fetchone()
         if not from_node:
             return f"Quell-Node '{from_path}' nicht gefunden."
         if not to_node:
@@ -1374,7 +1702,9 @@ def memory_link(from_path: str, to_path: str, rel_type: str = "related", note: s
 def memory_get_links(path: str) -> str:
     """Gibt alle eingehenden und ausgehenden Verknüpfungen eines Memory-Nodes zurück."""
     with get_db() as conn:
-        node = conn.execute("SELECT id, title FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+        node = conn.execute(
+            "SELECT id, title FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (path,)
+        ).fetchone()
         if not node:
             return f"Node '{path}' nicht gefunden."
         links_out = conn.execute(
@@ -1409,22 +1739,22 @@ def memory_health() -> str:
     with get_db() as conn:
         expired = conn.execute(
             "SELECT path, title, valid_until FROM memory_nodes "
-            "WHERE valid_until IS NOT NULL AND valid_until < now()"
+            "WHERE deleted_at IS NULL AND valid_until IS NOT NULL AND valid_until < now()"
         ).fetchall()
         for e in expired:
             issues.append(f"[ABGELAUFEN] {e['path']} — {e['title']} (seit {str(e['valid_until'])[:10]})")
 
         orphan_cats = conn.execute(
-            "SELECT m.path, m.title FROM memory_nodes m WHERE m.type = 'category' "
-            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = m.id)"
+            "SELECT m.path, m.title FROM memory_nodes m WHERE m.type = 'category' AND m.deleted_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = m.id AND c.deleted_at IS NULL)"
         ).fetchall()
         for o in orphan_cats:
             issues.append(f"[LEERE KATEGORIE] {o['path']} — {o['title']}")
 
         empty_nodes = conn.execute(
-            "SELECT n.path, n.title FROM memory_nodes n WHERE n.type != 'category' "
+            "SELECT n.path, n.title FROM memory_nodes n WHERE n.type != 'category' AND n.deleted_at IS NULL "
             "AND (n.body IS NULL OR n.body = '') "
-            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = n.id)"
+            "AND NOT EXISTS (SELECT 1 FROM memory_nodes c WHERE c.parent_id = n.id AND c.deleted_at IS NULL)"
         ).fetchall()
         for n in empty_nodes:
             issues.append(f"[KEIN INHALT] {n['path']} — {n['title']}")
@@ -1433,7 +1763,7 @@ def memory_health() -> str:
             "SELECT n1.path AS p1, n2.path AS p2 FROM memory_links ml "
             "JOIN memory_nodes n1 ON ml.from_id = n1.id "
             "JOIN memory_nodes n2 ON ml.to_id = n2.id "
-            "WHERE ml.rel_type = 'contradicts'"
+            "WHERE ml.rel_type = 'contradicts' AND n1.deleted_at IS NULL AND n2.deleted_at IS NULL"
         ).fetchall()
         for c in contradictions:
             issues.append(f"[WIDERSPRUCH] {c['p1']} ↔ {c['p2']}")
@@ -1441,7 +1771,7 @@ def memory_health() -> str:
         stats = conn.execute(
             "SELECT COUNT(*) AS total, "
             "SUM(CASE WHEN body IS NOT NULL AND body != '' THEN 1 ELSE 0 END) AS with_content, "
-            "ROUND(AVG(importance)::numeric, 2) AS avg_importance FROM memory_nodes"
+            "ROUND(AVG(importance)::numeric, 2) AS avg_importance FROM memory_nodes WHERE deleted_at IS NULL"
         ).fetchone()
 
     summary = [
@@ -1464,7 +1794,8 @@ def memory_set_importance(path: str, importance: float) -> str:
         return "Fehler: importance muss zwischen 0.0 und 1.0 liegen."
     with get_db() as conn:
         result = conn.execute(
-            "UPDATE memory_nodes SET importance = %s, updated_at = now() WHERE path = %s RETURNING path",
+            "UPDATE memory_nodes SET importance = %s, updated_at = now() "
+            "WHERE path = %s AND deleted_at IS NULL RETURNING path",
             (importance, path),
         ).fetchone()
         if not result:
@@ -1481,7 +1812,8 @@ def memory_set_auto_inject(path: str, enabled: bool = True) -> str:
     """
     with get_db() as conn:
         result = conn.execute(
-            "UPDATE memory_nodes SET auto_inject = %s, updated_at = now() WHERE path = %s RETURNING path",
+            "UPDATE memory_nodes SET auto_inject = %s, updated_at = now() "
+            "WHERE path = %s AND deleted_at IS NULL RETURNING path",
             (enabled, path),
         ).fetchone()
         if not result:
@@ -1503,7 +1835,7 @@ def memory_set_reinject_on_compact(path: str, enabled: bool = True) -> str:
     with get_db() as conn:
         result = conn.execute(
             "UPDATE memory_nodes SET reinject_on_compact = %s, updated_at = now() "
-            "WHERE path = %s RETURNING path",
+            "WHERE path = %s AND deleted_at IS NULL RETURNING path",
             (enabled, path),
         ).fetchone()
         if not result:
@@ -1527,7 +1859,7 @@ def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> 
         if only_auto_inject:
             rows = conn.execute(
                 "SELECT path, type, title, body, importance FROM memory_nodes "
-                "WHERE auto_inject AND (path = %s OR path LIKE %s "
+                "WHERE auto_inject AND deleted_at IS NULL AND (path = %s OR path LIKE %s "
                 "  OR ((path LIKE '/user/%%' OR path LIKE '/feedback/%%'))) "
                 "ORDER BY (path LIKE %s) DESC, importance DESC, path",
                 (base, f"{base}/%", f"{base}%"),
@@ -1535,7 +1867,7 @@ def memory_project_context(project_slug: str, only_auto_inject: bool = True) -> 
         else:
             rows = conn.execute(
                 "SELECT path, type, title, body, importance FROM memory_nodes "
-                "WHERE (path = %s OR path LIKE %s) AND type != 'category' "
+                "WHERE (path = %s OR path LIKE %s) AND type != 'category' AND deleted_at IS NULL "
                 "ORDER BY importance DESC, path",
                 (base, f"{base}/%"),
             ).fetchall()
@@ -1560,7 +1892,7 @@ def _ensure_project_node(conn, slug: str) -> str:
     conn.execute(
         """INSERT INTO memory_nodes (parent_id, path, slug, type, title)
            VALUES (%s, %s, %s, 'category', %s)
-           ON CONFLICT (path) DO NOTHING""",
+           ON CONFLICT (path) DO UPDATE SET deleted_at = NULL, updated_at = now()""",
         (parent_id, path, slug.strip("/"), slug.strip("/").replace("-", " ").title()),
     )
     return path
@@ -1592,7 +1924,9 @@ def memory_get_project_config(project_slug: str) -> str:
     """Zeigt die projektspezifischen Einstellungen des /projects/<slug>-Nodes."""
     path = f"/projects/{project_slug.strip('/')}"
     with get_db() as conn:
-        row = conn.execute("SELECT config FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+        row = conn.execute(
+            "SELECT config FROM memory_nodes WHERE path = %s AND deleted_at IS NULL", (path,)
+        ).fetchone()
     if not row:
         return f"Projekt '{project_slug}' hat noch keinen Node/Config."
     cfg = row["config"] or {}
@@ -1627,6 +1961,7 @@ def _ensure_remote_schema(conn) -> None:
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding REAL[]")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
     # Remove the legacy updated_at trigger if present — it corrupts last-write-wins sync.
     conn.execute("DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes")
     # If the remote has pgvector, give it the indexed vector column + HNSW too, so
