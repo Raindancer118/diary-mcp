@@ -33,6 +33,13 @@ init_db()
 # Extracted memories auto-expire after this many days unless promoted to curated.
 EXTRACTED_TTL_DAYS = 90
 
+# memory_context() session snapshot bounds. The "recently updated" section dumps
+# full bodies; without caps it can exceed the MCP client's token limit when many
+# nodes were touched recently (e.g. right after seeding the DB). Cap node count
+# and per-body length; full content is always available via memory_get(path).
+CONTEXT_RECENT_LIMIT = 15
+CONTEXT_BODY_MAX_CHARS = 1200
+
 
 def _now() -> str:
     return datetime.now().strftime(load_config()["date_format"])
@@ -830,9 +837,12 @@ def memory_context() -> str:
             "SELECT path, title, body, updated_at FROM memory_nodes "
             "WHERE origin = 'curated' AND deleted_at IS NULL "
             "AND body IS NOT NULL AND body != '' AND updated_at > %s "
-            "ORDER BY updated_at DESC",
-            (recent_cutoff,),
+            "ORDER BY updated_at DESC LIMIT %s",
+            (recent_cutoff, CONTEXT_RECENT_LIMIT + 1),
         ).fetchall()
+        # Keep one extra to detect (but not render) overflow.
+        recent_overflow = len(recent) > CONTEXT_RECENT_LIMIT
+        recent = recent[:CONTEXT_RECENT_LIMIT]
         extracted_count = conn.execute(
             "SELECT COUNT(*) AS c FROM memory_nodes WHERE origin = 'extracted' AND deleted_at IS NULL"
         ).fetchone()["c"]
@@ -845,13 +855,27 @@ def memory_context() -> str:
         lines.append(f"{indent}[{node['type']}] {node['path']} — {node['title']} ({updated})")
 
     if recent:
-        lines.append("\n\nRECENTLY UPDATED (last 14 days):")
+        lines.append(
+            f"\n\nRECENTLY UPDATED (last 14 days, {len(recent)} most recent):"
+        )
         for node in recent:
             lines.append(f"\n--- {node['path']} ---")
             lines.append(f"Titel: {node['title']}")
             lines.append(f"Geändert: {str(node['updated_at'])[:10]}")
-            lines.append(node["body"] or "")
+            body = node["body"] or ""
+            if len(body) > CONTEXT_BODY_MAX_CHARS:
+                body = (
+                    body[:CONTEXT_BODY_MAX_CHARS].rstrip()
+                    + f"\n… [gekürzt — vollständig via memory_get(\"{node['path']}\")]"
+                )
+            lines.append(body)
             lines.append("---")
+        if recent_overflow:
+            lines.append(
+                f"\n(+ weitere kürzlich geänderte Nodes nicht gezeigt — nur die "
+                f"{CONTEXT_RECENT_LIMIT} neuesten. Tree oben listet alle; "
+                f"Details via memory_get(path).)"
+            )
 
     if extracted_count:
         lines.append(
