@@ -25,6 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _slug_resolve import slug_from_cwd  # noqa: E402
 
 
+def _log_error(context: str, exc: Exception) -> None:
+    print(f"[diary-mcp session_end_hook] {context}: {exc!r}", file=sys.stderr)
+
+
 def _project_auto_extract(slug: str) -> bool:
     """Lean per-project lookup of config.auto_extract. Fails closed (False)."""
     try:
@@ -36,14 +40,16 @@ def _project_auto_extract(slug: str) -> bool:
                 (f"/projects/{slug}",),
             ).fetchone()
             return bool(row and row[0])
-    except Exception:
+    except Exception as exc:
+        _log_error("auto_extract lookup failed", exc)
         return False
 
 
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
-    except Exception:
+    except Exception as exc:
+        _log_error("failed to parse stdin JSON", exc)
         return
 
     transcript = payload.get("transcript_path")
@@ -64,8 +70,8 @@ def main() -> None:
             stdin=subprocess.DEVNULL, start_new_session=True,
             env={**os.environ, "DIARY_AUTO_EXTRACT": "1"},  # hook already gated; tell child it's authorized
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_error("failed to spawn extract_memories.py", exc)
 
 
 if __name__ == "__main__":
