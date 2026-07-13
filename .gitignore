@@ -16,3 +16,6 @@ wheels/
 
 # Project notes (not for version control)
 Project.md
+
+# codescope/serena local project cache
+.serena/

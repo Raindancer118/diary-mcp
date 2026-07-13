@@ -762,3 +762,283 @@ class TestSlugResolver:
         # cwd does not match anything; fallback should be basename of this unknown path
         result = resolver("/completely/unknown/path/nodirs-proj-other")
         assert result == "nodirs-proj-other"
+
+
+# ===========================================================================
+# 13. Knowledge-graph tools (graphify-inspired): explain, path, stats,
+#     inferred links, query-graph, report
+# ===========================================================================
+
+class TestKnowledgeGraph:
+    def _node_with_vec(self, path, vec, title="T", body="B"):
+        import diary_server
+        with patch("diary_embed.embed", return_value=vec):
+            diary_server.memory_upsert(path=path, title=title, body=body, importance=0.5)
+
+    def test_link_defaults_to_explicit_origin(self):
+        _upsert("/user/kg-a", title="A", body="a")
+        _upsert("/user/kg-b", title="B", body="b")
+        import diary_server
+        diary_server.memory_link("/user/kg-a", "/user/kg-b")
+        conn = _local_conn()
+        try:
+            row = conn.execute(
+                "SELECT ml.link_origin AS origin FROM memory_links ml JOIN memory_nodes n ON ml.from_id = n.id "
+                "WHERE n.path = %s",
+                ("/user/kg-a",),
+            ).fetchone()
+            assert row["origin"] == "explicit"
+        finally:
+            conn.close()
+
+    def test_explain_reports_degree_and_tag(self):
+        _upsert("/user/kg-e1", title="E1", body="e1")
+        _upsert("/user/kg-e2", title="E2", body="e2")
+        import diary_server
+        diary_server.memory_link("/user/kg-e1", "/user/kg-e2", rel_type="supports")
+        result = diary_server.memory_explain("/user/kg-e1")
+        assert "Degree:      1" in result
+        assert "EXPLICIT" in result
+        assert "kg-e2" in result
+
+    def test_explain_not_found(self):
+        import diary_server
+        result = diary_server.memory_explain("/user/does-not-exist-kg")
+        assert "nicht gefunden" in result
+
+    def test_explain_orphan_has_zero_degree(self):
+        _upsert("/user/kg-orphan", title="O", body="o")
+        import diary_server
+        result = diary_server.memory_explain("/user/kg-orphan")
+        assert "Degree:      0" in result
+        assert "Waisen-Node" in result
+
+    def test_path_direct_link(self):
+        _upsert("/user/kg-p1", title="P1", body="p1")
+        _upsert("/user/kg-p2", title="P2", body="p2")
+        import diary_server
+        diary_server.memory_link("/user/kg-p1", "/user/kg-p2", rel_type="requires")
+        result = diary_server.memory_path("/user/kg-p1", "/user/kg-p2")
+        assert "1 Hop" in result
+        assert "requires" in result
+
+    def test_path_multi_hop(self):
+        _upsert("/user/kg-m1", title="M1", body="m1")
+        _upsert("/user/kg-m2", title="M2", body="m2")
+        _upsert("/user/kg-m3", title="M3", body="m3")
+        import diary_server
+        diary_server.memory_link("/user/kg-m1", "/user/kg-m2")
+        diary_server.memory_link("/user/kg-m2", "/user/kg-m3")
+        result = diary_server.memory_path("/user/kg-m1", "/user/kg-m3")
+        assert "2 Hops" in result
+
+    def test_path_no_route_found(self):
+        _upsert("/user/kg-iso1", title="I1", body="i1")
+        _upsert("/user/kg-iso2", title="I2", body="i2")
+        import diary_server
+        result = diary_server.memory_path("/user/kg-iso1", "/user/kg-iso2")
+        assert "Kein Pfad" in result
+
+    def test_path_unknown_node(self):
+        import diary_server
+        result = diary_server.memory_path("/user/nope-a", "/user/nope-b")
+        assert "nicht gefunden" in result
+
+    def test_path_same_node(self):
+        _upsert("/user/kg-same", title="S", body="s")
+        import diary_server
+        result = diary_server.memory_path("/user/kg-same", "/user/kg-same")
+        assert "derselbe Node" in result
+
+    def test_graph_stats_god_node_and_orphan(self):
+        _upsert("/user/kg-hub", title="Hub", body="hub")
+        _upsert("/user/kg-leaf1", title="L1", body="l1")
+        _upsert("/user/kg-leaf2", title="L2", body="l2")
+        _upsert("/user/kg-lonely", title="Lonely", body="lonely")
+        import diary_server
+        diary_server.memory_link("/user/kg-hub", "/user/kg-leaf1")
+        diary_server.memory_link("/user/kg-hub", "/user/kg-leaf2")
+        result = diary_server.memory_graph_stats(top_n=5)
+        assert "kg-hub" in result.split("Waisen")[0]
+        assert "kg-lonely" in result
+
+    def test_infer_links_creates_above_threshold(self):
+        half = 192
+        vec_a = [1.0] * half + [0.0] * half
+        vec_b = [1.0] * half + [0.0] * half
+        vec_c = [0.0] * half + [1.0] * half
+        self._node_with_vec("/user/kg-inf-a", vec_a)
+        self._node_with_vec("/user/kg-inf-b", vec_b)
+        self._node_with_vec("/user/kg-inf-c", vec_c)
+        import diary_server
+        result = diary_server.memory_infer_links(threshold=0.9)
+        assert "kg-inf-a" in result and "kg-inf-b" in result
+        assert "kg-inf-c" not in result
+        conn = _local_conn()
+        try:
+            row = conn.execute(
+                "SELECT ml.link_origin AS origin FROM memory_links ml "
+                "JOIN memory_nodes a ON ml.from_id = a.id JOIN memory_nodes b ON ml.to_id = b.id "
+                "WHERE (a.path = %s AND b.path = %s) OR (a.path = %s AND b.path = %s)",
+                ("/user/kg-inf-a", "/user/kg-inf-b", "/user/kg-inf-b", "/user/kg-inf-a"),
+            ).fetchone()
+            assert row is not None
+            assert row["origin"] == "inferred"
+        finally:
+            conn.close()
+
+    def test_infer_links_skips_existing_pair(self):
+        half = 192
+        vec = [1.0] * half + [0.0] * half
+        self._node_with_vec("/user/kg-skip-a", vec)
+        self._node_with_vec("/user/kg-skip-b", vec)
+        import diary_server
+        diary_server.memory_link("/user/kg-skip-a", "/user/kg-skip-b")
+        result = diary_server.memory_infer_links(threshold=0.9)
+        assert "Keine neuen" in result
+
+    def test_infer_links_respects_threshold(self):
+        half = 192
+        vec_a = [1.0] * half + [0.0] * half
+        vec_b = [0.0] * half + [1.0] * half
+        self._node_with_vec("/user/kg-thr-a", vec_a)
+        self._node_with_vec("/user/kg-thr-b", vec_b)
+        import diary_server
+        result = diary_server.memory_infer_links(threshold=0.9)
+        assert "Keine neuen" in result
+
+    def test_query_graph_expands_neighbors(self):
+        half = 192
+        vec = [1.0] * half + [0.0] * half
+        self._node_with_vec("/user/kg-q1", vec, title="QueryHitTitle", body="query hit body")
+        _upsert("/user/kg-q2", title="Neighbor", body="neighbor body")
+        import diary_server
+        diary_server.memory_link("/user/kg-q1", "/user/kg-q2", rel_type="related")
+        with patch("diary_embed.embed", return_value=vec):
+            result = diary_server.memory_query_graph("query hit body")
+        assert "kg-q1" in result
+        assert "kg-q2" in result
+
+    def test_query_graph_unavailable_embed_falls_back_gracefully(self):
+        import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            result = diary_server.memory_query_graph("whatever")
+        assert "memory_search" in result
+
+    def test_report_contains_sections(self):
+        _upsert("/user/kg-r1", title="R1", body="r1")
+        _upsert("/user/kg-r2", title="R2", body="r2")
+        import diary_server
+        diary_server.memory_link("/user/kg-r1", "/user/kg-r2")
+        result = diary_server.memory_report()
+        assert result.startswith("# Memory Graph Report")
+        assert "Kernkonzepte" in result
+        assert "Cluster" in result
+        assert "Waisen" in result
+
+    def test_report_empty_scope(self):
+        import diary_server
+        result = diary_server.memory_report("/projects/nonexistent-scope-xyz")
+        assert "Keine Nodes" in result
+
+    def test_path_reports_true_direction_when_traversed_backward(self):
+        """memory_link(A, B, 'requires') means A requires B — memory_path(B, A) must
+        still report that direction, not print it as if B requires A."""
+        _upsert("/user/kg-dir-a", title="A", body="a")
+        _upsert("/user/kg-dir-b", title="B", body="b")
+        import diary_server
+        diary_server.memory_link("/user/kg-dir-a", "/user/kg-dir-b", rel_type="requires")
+        forward = diary_server.memory_path("/user/kg-dir-a", "/user/kg-dir-b")
+        backward = diary_server.memory_path("/user/kg-dir-b", "/user/kg-dir-a")
+        # Both directions must render the TRUE stored relationship (A requires B) —
+        # either as "A --requires--> B" or, when traversed back-to-front, as the
+        # equivalent "B <--requires-- A". Neither may ever claim "B requires A".
+        true_rel_forward = "/user/kg-dir-a --requires--> /user/kg-dir-b"
+        true_rel_backward = "/user/kg-dir-b <--requires-- /user/kg-dir-a"
+        false_rel = "/user/kg-dir-b --requires--> /user/kg-dir-a"
+        assert true_rel_forward in forward
+        assert true_rel_forward in backward or true_rel_backward in backward
+        assert false_rel not in forward and false_rel not in backward
+
+    def test_link_promotes_inferred_to_explicit_for_symmetric_type(self):
+        """A memory_infer_links-created 'related' edge, later confirmed via memory_link,
+        must be promoted to origin='explicit' rather than left as a permanent
+        second/duplicate 'inferred' edge."""
+        half = 192
+        vec = [1.0] * half + [0.0] * half
+        import diary_server
+        with patch("diary_embed.embed", return_value=vec):
+            diary_server.memory_upsert(path="/user/kg-promote-a", title="A", body="a", importance=0.5)
+            diary_server.memory_upsert(path="/user/kg-promote-b", title="B", body="b", importance=0.5)
+        diary_server.memory_infer_links(threshold=0.9)
+
+        conn = _local_conn()
+        try:
+            before = conn.execute(
+                "SELECT ml.link_origin FROM memory_links ml "
+                "JOIN memory_nodes a ON ml.from_id = a.id JOIN memory_nodes b ON ml.to_id = b.id "
+                "WHERE (a.path = %s AND b.path = %s) OR (a.path = %s AND b.path = %s)",
+                ("/user/kg-promote-a", "/user/kg-promote-b", "/user/kg-promote-b", "/user/kg-promote-a"),
+            ).fetchone()
+            assert before["link_origin"] == "inferred"
+        finally:
+            conn.close()
+
+        # Confirm the same pair explicitly, possibly in the opposite direction to
+        # however memory_infer_links happened to store it.
+        diary_server.memory_link("/user/kg-promote-a", "/user/kg-promote-b", rel_type="related")
+
+        conn = _local_conn()
+        try:
+            rows = conn.execute(
+                "SELECT ml.link_origin FROM memory_links ml "
+                "JOIN memory_nodes a ON ml.from_id = a.id JOIN memory_nodes b ON ml.to_id = b.id "
+                "WHERE ((a.path = %s AND b.path = %s) OR (a.path = %s AND b.path = %s)) "
+                "AND ml.rel_type = 'related'",
+                ("/user/kg-promote-a", "/user/kg-promote-b", "/user/kg-promote-b", "/user/kg-promote-a"),
+            ).fetchall()
+            assert len(rows) == 1, "must promote the existing edge, not add a duplicate"
+            assert rows[0]["link_origin"] == "explicit"
+        finally:
+            conn.close()
+
+    def test_link_directional_types_stay_direction_specific(self):
+        """Unlike symmetric types, 'requires' A->B and B->A are different facts and
+        must remain two distinct edges."""
+        _upsert("/user/kg-reqdir-a", title="A", body="a")
+        _upsert("/user/kg-reqdir-b", title="B", body="b")
+        import diary_server
+        diary_server.memory_link("/user/kg-reqdir-a", "/user/kg-reqdir-b", rel_type="requires")
+        diary_server.memory_link("/user/kg-reqdir-b", "/user/kg-reqdir-a", rel_type="requires")
+        conn = _local_conn()
+        try:
+            rows = conn.execute(
+                "SELECT from_id, to_id FROM memory_links WHERE rel_type = 'requires'"
+            ).fetchall()
+            assert len(rows) == 2
+        finally:
+            conn.close()
+
+
+# ===========================================================================
+# 14. diary_embed helper guards (normalize/dot) — mirror cosine()'s safety
+# ===========================================================================
+
+class TestEmbedHelpers:
+    def test_dot_returns_zero_for_length_mismatch(self):
+        import diary_embed
+        assert diary_embed.dot([1.0, 2.0], [1.0, 2.0, 3.0]) == 0.0
+
+    def test_dot_returns_zero_for_empty_vectors(self):
+        import diary_embed
+        assert diary_embed.dot([], []) == 0.0
+        assert diary_embed.dot([1.0], []) == 0.0
+
+    def test_normalize_preserves_direction(self):
+        import diary_embed
+        unit = diary_embed.normalize([3.0, 4.0])
+        assert abs(diary_embed.dot(unit, unit) - 1.0) < 1e-9
+
+    def test_normalize_zero_vector_stays_zero(self):
+        import diary_embed
+        assert diary_embed.normalize([0.0, 0.0]) == [0.0, 0.0]

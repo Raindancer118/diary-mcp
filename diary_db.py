@@ -296,6 +296,13 @@ _SCHEMA = [
         created_at TIMESTAMPTZ DEFAULT now(),
         UNIQUE(from_id, to_id, rel_type)
     )""",
+    # link_origin (graphify-inspired confidence tag): 'explicit' = bewusst per memory_link
+    # gesetzt, 'inferred' = automatisch per memory_infer_links aus Embedding-Similarity
+    # abgeleitet. Named distinctly from memory_nodes.origin (curated/extracted — an
+    # unrelated concept) to avoid the two being confused; all reads alias it back to
+    # `origin` in the query, so Python/JS code just sees `row["origin"]` either way.
+    "ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS link_origin TEXT NOT NULL DEFAULT 'explicit'",
+    "CREATE INDEX IF NOT EXISTS memory_links_link_origin_idx ON memory_links(link_origin)",
     "CREATE INDEX IF NOT EXISTS memory_nodes_parent_idx  ON memory_nodes(parent_id)",
     "CREATE INDEX IF NOT EXISTS memory_nodes_type_idx    ON memory_nodes(type)",
     "CREATE INDEX IF NOT EXISTS memory_nodes_path_idx    ON memory_nodes(path text_pattern_ops)",

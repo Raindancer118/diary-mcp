@@ -92,3 +92,27 @@ def cosine(a: list[float], b: list[float]) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+def normalize(vec: list[float]) -> list[float]:
+    """L2-normalize a vector. Used to hoist norm computation out of O(n^2) pairwise
+    similarity loops (e.g. memory_infer_links) — cosine of two unit vectors is a
+    plain dot product, so the sqrt/division work happens once per vector instead
+    of once per pair."""
+    norm = sum(x * x for x in vec) ** 0.5
+    if norm == 0.0:
+        return vec
+    return [x / norm for x in vec]
+
+
+def dot(a: list[float], b: list[float]) -> float:
+    """Dot product of two equal-length vectors (pure Python, no numpy dep).
+
+    Returns 0.0 for empty or length-mismatched inputs — mirrors cosine()'s guard,
+    since a bare zip() would otherwise silently truncate to the shorter vector
+    instead of signaling "these embeddings aren't comparable" (e.g. two nodes
+    embedded under different DIARY_EMBED_MODEL dimensions).
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))

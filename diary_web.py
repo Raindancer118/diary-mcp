@@ -148,6 +148,29 @@ def api_health():
     return {"issues": issues, "stats": dict(stats) if stats else {}, "by_type": [dict(r) for r in by_type]}
 
 
+@app.get("/api/graph")
+def api_graph(scope: str = "", include_extracted: bool = False):
+    """Knowledge-Graph als Node/Edge-Liste für die interaktive Visualisierung (/ graph)."""
+    from diary_server import _fetch_link_graph
+    with get_db() as conn:
+        nodes, links = _fetch_link_graph(conn, scope_path=scope, include_extracted=include_extracted)
+    degree: dict = {nid: 0 for nid in nodes}
+    for l in links:
+        degree[l["from_id"]] = degree.get(l["from_id"], 0) + 1
+        degree[l["to_id"]] = degree.get(l["to_id"], 0) + 1
+    return {
+        "nodes": [
+            {"id": str(nid), "path": n["path"], "title": n["title"], "type": n["type"],
+             "importance": n["importance"], "degree": degree.get(nid, 0)}
+            for nid, n in nodes.items()
+        ],
+        "edges": [
+            {"from": str(l["from_id"]), "to": str(l["to_id"]), "rel_type": l["rel_type"], "origin": l["origin"]}
+            for l in links
+        ],
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(_HTML)
@@ -561,6 +584,47 @@ _HTML = r"""<!doctype html>
   .dot-note      { background: #5a7878; }
   .dot-category  { background: #3a5858; }
 
+  /* ── knowledge graph overlay ── */
+  #graph-overlay {
+    position: fixed;
+    top: 48px; left: 0; right: 0; bottom: 0;
+    background: var(--ground);
+    z-index: 150;
+    display: none;
+    flex-direction: column;
+  }
+  #graph-overlay.open { display: flex; }
+  #graph-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #graph-toolbar label { display: flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+  #graph-title { color: var(--accent); flex: 1; }
+  #graph-canvas { flex: 1; width: 100%; cursor: grab; display: block; }
+  #graph-empty {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: var(--muted); font-size: 13px; display: none;
+  }
+  #graph-legend {
+    position: absolute;
+    bottom: 12px; left: 16px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    max-width: calc(100% - 32px);
+    font-size: 10px;
+    color: var(--muted);
+    pointer-events: none;
+  }
+  .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { transition: none !important; }
   }
@@ -573,6 +637,7 @@ _HTML = r"""<!doctype html>
     <input id="search" type="text" placeholder="Search memories…" autocomplete="off" spellcheck="false">
     <div id="search-results"></div>
   </div>
+  <button class="topbtn" onclick="showGraph()">graph</button>
   <button class="topbtn" onclick="showHealth()">health</button>
   <button class="topbtn" id="sync-btn" onclick="runSync()">sync</button>
 </div>
@@ -622,6 +687,26 @@ _HTML = r"""<!doctype html>
   </div>
 </div>
 
+<div id="graph-overlay">
+  <div id="graph-toolbar">
+    <span id="graph-title">/ knowledge graph</span>
+    <label><input type="checkbox" id="graph-extracted"> include extracted</label>
+    <button class="topbtn" onclick="closeGraph()">close ✕</button>
+  </div>
+  <div style="position:relative;flex:1;overflow:hidden">
+    <canvas id="graph-canvas"></canvas>
+    <div id="graph-empty">Keine Links im Graphen — memory_link() oder memory_infer_links() nutzen.</div>
+    <div id="graph-legend">
+      <span><span class="legend-dot" style="background:#7ab3c5"></span>user</span>
+      <span><span class="legend-dot" style="background:#e8a84c"></span>feedback</span>
+      <span><span class="legend-dot" style="background:#5ab880"></span>project</span>
+      <span><span class="legend-dot" style="background:#9b7ac5"></span>reference</span>
+      <span><span class="legend-dot" style="background:#5a7878"></span>note</span>
+      <span style="margin-left:4px">— explicit&nbsp;&nbsp;┄┄ inferred&nbsp;&nbsp;drag = move, wheel = zoom, click = open</span>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── state ──────────────────────────────────────────────────────────────────
 let allNodes = [];
@@ -642,11 +727,14 @@ async function init() {
     if (e.target.id === 'overlay') closeOverlay();
   });
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeOverlay();
+    if (e.key === 'Escape') { closeOverlay(); closeGraph(); }
     if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
       e.preventDefault();
       document.getElementById('search').focus();
     }
+  });
+  document.getElementById('graph-extracted').addEventListener('change', () => {
+    if (document.getElementById('graph-overlay').classList.contains('open')) showGraph();
   });
 }
 
@@ -978,6 +1066,222 @@ function renderStats(stats, byType) {
       `<div><span style="font-family:var(--font-mono);color:var(--teal)">${t.type}</span> — ${t.c}</div>`
     ).join('')}
   `;
+}
+
+// ── knowledge graph view ─────────────────────────────────────────────────
+const TYPE_COLOR = {
+  user: '#7ab3c5', feedback: '#e8a84c', project: '#5ab880',
+  reference: '#9b7ac5', note: '#5a7878', category: '#3a5858',
+};
+let graphState = null;
+let graphAnimHandle = null;
+let graphBound = false;
+
+async function showGraph() {
+  document.getElementById('graph-overlay').classList.add('open');
+  const includeExtracted = document.getElementById('graph-extracted').checked;
+  const data = await fetch('/api/graph?include_extracted=' + includeExtracted).then(r => r.json());
+  // User may have clicked "close" while the fetch was in flight — don't start a
+  // physics loop for a view that's no longer open (it would run forever, since
+  // closeGraph() already ran and can't cancel an animation frame that didn't exist yet).
+  if (!document.getElementById('graph-overlay').classList.contains('open')) return;
+  initGraph(data);
+}
+
+function closeGraph() {
+  document.getElementById('graph-overlay').classList.remove('open');
+  if (graphAnimHandle) cancelAnimationFrame(graphAnimHandle);
+  graphAnimHandle = null;
+  graphState = null;
+}
+
+function initGraph(data) {
+  const canvas = document.getElementById('graph-canvas');
+  document.getElementById('graph-empty').style.display = data.edges.length ? 'none' : '';
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  canvas.style.width = rect.width + 'px';
+  canvas.style.height = rect.height + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+
+  const idIndex = {};
+  const nodes = data.nodes.map((n, i) => {
+    idIndex[n.id] = i;
+    const angle = (i / Math.max(data.nodes.length, 1)) * Math.PI * 2;
+    const radius = 60 + Math.random() * 120;
+    return {
+      ...n,
+      x: W / 2 + Math.cos(angle) * radius, y: H / 2 + Math.sin(angle) * radius,
+      vx: 0, vy: 0, r: Math.min(18, 5 + Math.sqrt(n.degree || 0) * 2.5),
+    };
+  });
+  const edges = data.edges
+    .map(e => ({ ...e, a: idIndex[e.from], b: idIndex[e.to] }))
+    .filter(e => e.a !== undefined && e.b !== undefined);
+
+  if (graphAnimHandle) cancelAnimationFrame(graphAnimHandle);
+  graphState = { ctx, W, H, nodes, edges, view: { x: 0, y: 0, scale: 1 } };
+  if (!graphBound) { bindGraphInteraction(canvas); graphBound = true; }
+  runGraphSim();
+}
+
+function runGraphSim() {
+  const step = () => {
+    if (!graphState) return;
+    simTick(graphState.nodes, graphState.edges, graphState.W, graphState.H);
+    drawGraph(graphState);
+    graphAnimHandle = requestAnimationFrame(step);
+  };
+  graphAnimHandle = requestAnimationFrame(step);
+}
+
+function simTick(nodes, edges, W, H) {
+  const REPEL = 2200, SPRING = 0.02, SPRING_LEN = 90, CENTER = 0.002, DAMP = 0.82, MAX_SPEED = 40;
+  for (const n of nodes) {
+    n.fx = n.fixed ? 0 : (W / 2 - n.x) * CENTER;
+    n.fy = n.fixed ? 0 : (H / 2 - n.y) * CENTER;
+  }
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const d2 = Math.max(dx * dx + dy * dy, 0.01);
+      const f = REPEL / d2;
+      const d = Math.sqrt(d2);
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      if (!a.fixed) { a.fx += fx; a.fy += fy; }
+      if (!b.fixed) { b.fx -= fx; b.fy -= fy; }
+    }
+  }
+  for (const e of edges) {
+    const a = nodes[e.a], b = nodes[e.b];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+    const f = (d - SPRING_LEN) * SPRING;
+    const fx = (dx / d) * f, fy = (dy / d) * f;
+    if (!a.fixed) { a.fx += fx; a.fy += fy; }
+    if (!b.fixed) { b.fx -= fx; b.fy -= fy; }
+  }
+  for (const n of nodes) {
+    if (n.fixed) { n.vx = 0; n.vy = 0; continue; }
+    n.vx = (n.vx + n.fx) * DAMP;
+    n.vy = (n.vy + n.fy) * DAMP;
+    // Clamp speed — without this, two nodes spawning near-overlapping (initGraph
+    // places them at random radii around the same center) get a huge one-frame
+    // repulsion kick and fling off-canvas instead of settling into the layout.
+    const speed = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
+    if (speed > MAX_SPEED) {
+      n.vx = (n.vx / speed) * MAX_SPEED;
+      n.vy = (n.vy / speed) * MAX_SPEED;
+    }
+    n.x += n.vx;
+    n.y += n.vy;
+  }
+}
+
+function drawGraph(gs) {
+  const { ctx, W, H, nodes, edges, view } = gs;
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(view.x, view.y);
+  ctx.scale(view.scale, view.scale);
+
+  ctx.lineWidth = 1;
+  for (const e of edges) {
+    const a = nodes[e.a], b = nodes[e.b];
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = e.rel_type === 'contradicts' ? 'rgba(192,90,90,.55)' : 'rgba(90,171,184,.35)';
+    ctx.setLineDash(e.origin === 'inferred' ? [3, 3] : []);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  for (const n of nodes) {
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+    ctx.fillStyle = TYPE_COLOR[n.type] || '#5a7878';
+    ctx.fill();
+    if (n.degree === 0) {
+      ctx.strokeStyle = 'rgba(200,220,220,.3)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    if (view.scale > 0.45) {
+      ctx.fillStyle = 'rgba(200,220,220,.8)';
+      ctx.font = '9px monospace';
+      ctx.fillText(n.path.split('/').pop(), n.x + n.r + 3, n.y + 3);
+    }
+  }
+  ctx.restore();
+}
+
+function bindGraphInteraction(canvas) {
+  let dragging = null, panning = false, last = null, moved = false;
+
+  function toWorld(px, py) {
+    const v = graphState.view;
+    return { x: (px - v.x) / v.scale, y: (py - v.y) / v.scale };
+  }
+  function nodeAt(px, py) {
+    const w = toWorld(px, py);
+    const nodes = graphState.nodes;
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i];
+      if ((n.x - w.x) ** 2 + (n.y - w.y) ** 2 <= (n.r + 3) ** 2) return n;
+    }
+    return null;
+  }
+
+  canvas.addEventListener('mousedown', e => {
+    if (!graphState) return;
+    const rect = canvas.getBoundingClientRect();
+    const n = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
+    moved = false;
+    last = { x: e.clientX, y: e.clientY };
+    if (n) { dragging = n; n.fixed = true; } else { panning = true; }
+  });
+  canvas.addEventListener('mousemove', e => {
+    if (!last || !graphState) return;
+    const dx = e.clientX - last.x, dy = e.clientY - last.y;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+    last = { x: e.clientX, y: e.clientY };
+    const v = graphState.view;
+    if (dragging) {
+      dragging.x += dx / v.scale;
+      dragging.y += dy / v.scale;
+    } else if (panning) {
+      v.x += dx;
+      v.y += dy;
+    }
+  });
+  canvas.addEventListener('mouseup', () => {
+    if (dragging) {
+      if (!moved) { closeGraph(); navigateTo(dragging.path); return; }
+      dragging.fixed = false;
+    }
+    dragging = null; panning = false; last = null;
+  });
+  canvas.addEventListener('mouseleave', () => {
+    if (dragging) dragging.fixed = false;
+    dragging = null; panning = false; last = null;
+  });
+  canvas.addEventListener('wheel', e => {
+    if (!graphState) return;
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    const v = graphState.view;
+    const before = toWorld(px, py);
+    v.scale = Math.max(0.2, Math.min(4, v.scale * (e.deltaY < 0 ? 1.1 : 0.9)));
+    v.x = px - before.x * v.scale;
+    v.y = py - before.y * v.scale;
+  }, { passive: false });
 }
 
 init();
