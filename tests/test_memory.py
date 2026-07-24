@@ -1042,3 +1042,379 @@ class TestEmbedHelpers:
     def test_normalize_zero_vector_stays_zero(self):
         import diary_embed
         assert diary_embed.normalize([0.0, 0.0]) == [0.0, 0.0]
+
+
+# ===========================================================================
+# 15. Diary table sync (memory_sync_diary) — projects/milestones/tasks/logs/
+#     reminders/wiki_pages/errors_solutions, matched by name/sync_id since their
+#     SERIAL ids are independent per DB.
+# ===========================================================================
+
+def _reset_diary():
+    """Truncate all diary tables on both local and remote test DBs so diary-sync
+    tests are independent of each other and of tables seeded by other test classes."""
+    for url in (os.environ.get("DIARY_DATABASE_URL"), os.environ.get("DIARY_REMOTE_URL")):
+        conn = psycopg.connect(url, row_factory=dict_row)
+        try:
+            conn.execute(
+                "TRUNCATE projects, milestones, tasks, logs, reminders, "
+                "wiki_pages, errors_solutions RESTART IDENTITY CASCADE"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+class TestSyncDiary:
+    def test_push_pull_converges_with_fk_resolution(self):
+        """Create a project + milestone + task + log + reminder + wiki page +
+        error/solution locally, sync, and verify they all land on the remote with
+        their foreign keys correctly re-resolved (not the raw local integer ids,
+        which are independent per DB)."""
+        _reset_diary()
+        import diary_server
+
+        diary_server.add_project("diary-sync-proj", "in progress")
+        diary_server.add_milestone("diary-sync-proj", "M1")
+        diary_server.add_log_entry("diary-sync-proj", "hello log")
+        diary_server.add_reminder("diary-sync-proj", "2027-01-01", "check in")
+        diary_server.add_wiki_page("diary-sync-proj", "Home", "wiki content")
+        diary_server.add_error_solution("diary-sync-proj", "boom", "fixed it")
+
+        local_conn = _local_conn()
+        try:
+            m = local_conn.execute(
+                "SELECT id FROM milestones WHERE project_id = "
+                "(SELECT id FROM projects WHERE name = %s)",
+                ("diary-sync-proj",),
+            ).fetchone()
+        finally:
+            local_conn.close()
+        diary_server.add_task("diary-sync-proj", m["id"], "T1")
+
+        result = diary_server.memory_sync_diary()
+        assert "fehlgeschlagen" not in result.lower(), result
+
+        rconn = _remote_conn()
+        try:
+            rp = rconn.execute(
+                "SELECT * FROM projects WHERE name = %s", ("diary-sync-proj",)
+            ).fetchone()
+            assert rp is not None
+            assert rp["status"] == "in progress"
+
+            rm = rconn.execute(
+                "SELECT * FROM milestones WHERE project_id = %s", (rp["id"],)
+            ).fetchone()
+            assert rm is not None and rm["title"] == "M1"
+
+            rt = rconn.execute(
+                "SELECT * FROM tasks WHERE milestone_id = %s", (rm["id"],)
+            ).fetchone()
+            assert rt is not None and rt["title"] == "T1"
+
+            rlog = rconn.execute(
+                "SELECT * FROM logs WHERE project_id = %s", (rp["id"],)
+            ).fetchall()
+            assert any(l["entry"] == "hello log" for l in rlog)
+
+            rrem = rconn.execute(
+                "SELECT * FROM reminders WHERE project_id = %s", (rp["id"],)
+            ).fetchone()
+            assert rrem is not None and rrem["note"] == "check in"
+
+            rwiki = rconn.execute(
+                "SELECT * FROM wiki_pages WHERE project_id = %s", (rp["id"],)
+            ).fetchone()
+            assert rwiki is not None and rwiki["title"] == "Home"
+
+            rerr = rconn.execute(
+                "SELECT * FROM errors_solutions WHERE project_id = %s", (rp["id"],)
+            ).fetchone()
+            assert rerr is not None and rerr["error_msg"] == "boom"
+        finally:
+            rconn.close()
+
+    def test_delete_propagates_and_does_not_resurrect(self):
+        """Soft-deleting a milestone (which cascades to its tasks) must propagate
+        as a tombstone on sync, and not be resurrected by a later sync."""
+        _reset_diary()
+        import diary_server
+
+        diary_server.add_project("diary-sync-del", "")
+        diary_server.add_milestone("diary-sync-del", "M-del")
+        local_conn = _local_conn()
+        try:
+            m = local_conn.execute(
+                "SELECT id FROM milestones WHERE project_id = "
+                "(SELECT id FROM projects WHERE name = %s)",
+                ("diary-sync-del",),
+            ).fetchone()
+        finally:
+            local_conn.close()
+        diary_server.add_task("diary-sync-del", m["id"], "T-del")
+
+        diary_server.memory_sync_diary()  # push base state
+
+        diary_server.delete_milestone("diary-sync-del", m["id"])
+        diary_server.memory_sync_diary()  # propagate tombstone
+
+        rconn = _remote_conn()
+        try:
+            rp = rconn.execute(
+                "SELECT id FROM projects WHERE name = %s", ("diary-sync-del",)
+            ).fetchone()
+            rm = rconn.execute(
+                "SELECT deleted_at FROM milestones WHERE project_id = %s", (rp["id"],)
+            ).fetchone()
+            assert rm is not None and rm["deleted_at"] is not None
+            rt = rconn.execute(
+                "SELECT deleted_at FROM tasks WHERE milestone_id IN "
+                "(SELECT id FROM milestones WHERE project_id = %s)", (rp["id"],)
+            ).fetchone()
+            assert rt is not None and rt["deleted_at"] is not None
+        finally:
+            rconn.close()
+
+        # Third sync must not resurrect the local tombstone.
+        diary_server.memory_sync_diary()
+        local_conn = _local_conn()
+        try:
+            lm = local_conn.execute(
+                "SELECT deleted_at FROM milestones WHERE id = %s", (m["id"],)
+            ).fetchone()
+        finally:
+            local_conn.close()
+        assert lm["deleted_at"] is not None
+
+    def test_delete_project_cascade_propagates_children_too(self):
+        """Regression: delete_project() tombstones the project AND its children in
+        the same transaction. Since projects sync before their children, the child
+        push must resolve its (now-tombstoned) parent by name regardless of
+        deleted_at — otherwise the parent lookup silently "fails" and the child's
+        own tombstone never reaches the remote."""
+        _reset_diary()
+        import diary_server
+
+        diary_server.add_project("diary-sync-del-cascade", "")
+        diary_server.add_milestone("diary-sync-del-cascade", "M-cascade")
+        local_conn = _local_conn()
+        try:
+            m = local_conn.execute(
+                "SELECT id FROM milestones WHERE project_id = "
+                "(SELECT id FROM projects WHERE name = %s)",
+                ("diary-sync-del-cascade",),
+            ).fetchone()
+        finally:
+            local_conn.close()
+        diary_server.add_task("diary-sync-del-cascade", m["id"], "T-cascade")
+
+        diary_server.memory_sync_diary()  # push base state
+
+        diary_server.delete_project("diary-sync-del-cascade")
+        result = diary_server.memory_sync_diary()  # propagate all tombstones at once
+        assert "fehlgeschlagen" not in result.lower(), result
+
+        rconn = _remote_conn()
+        try:
+            rp = rconn.execute(
+                "SELECT deleted_at FROM projects WHERE name = %s",
+                ("diary-sync-del-cascade",),
+            ).fetchone()
+            assert rp is not None and rp["deleted_at"] is not None, "project tombstone must propagate"
+
+            rm = rconn.execute(
+                "SELECT m.deleted_at FROM milestones m JOIN projects p ON m.project_id = p.id "
+                "WHERE p.name = %s",
+                ("diary-sync-del-cascade",),
+            ).fetchone()
+            assert rm is not None and rm["deleted_at"] is not None, (
+                "milestone tombstone must propagate even though its parent project "
+                "was tombstoned in the same sync"
+            )
+
+            rt = rconn.execute(
+                "SELECT t.deleted_at FROM tasks t "
+                "JOIN milestones m ON t.milestone_id = m.id JOIN projects p ON m.project_id = p.id "
+                "WHERE p.name = %s",
+                ("diary-sync-del-cascade",),
+            ).fetchone()
+            assert rt is not None and rt["deleted_at"] is not None, "task tombstone must propagate too"
+        finally:
+            rconn.close()
+
+    def test_sync_is_idempotent(self):
+        """A second sync with no changes must push/pull 0 rows for every table."""
+        _reset_diary()
+        import diary_server
+
+        diary_server.add_project("diary-sync-idem", "")
+        diary_server.add_milestone("diary-sync-idem", "M1")
+        diary_server.memory_sync_diary()  # first sync: pushes everything
+
+        result2 = diary_server.memory_sync_diary()
+        assert "fehlgeschlagen" not in result2.lower(), result2
+        assert "Gesamt: 0 gepusht, 0 gepullt" in result2, result2
+
+    def test_pull_direction_also_resolves_fks(self):
+        """A project + milestone created directly on the remote must pull down
+        with a correctly resolved LOCAL milestone -> project link."""
+        _reset_diary()
+        import diary_server
+
+        rconn = _remote_conn()
+        try:
+            rconn.execute(
+                "INSERT INTO projects (name, status) VALUES (%s, %s)",
+                ("diary-sync-pull", "remote-created"),
+            )
+            rp = rconn.execute(
+                "SELECT id FROM projects WHERE name = %s", ("diary-sync-pull",)
+            ).fetchone()
+            rconn.execute(
+                "INSERT INTO milestones (project_id, title) VALUES (%s, %s)",
+                (rp["id"], "Remote Milestone"),
+            )
+            rconn.commit()
+        finally:
+            rconn.close()
+
+        result = diary_server.memory_sync_diary()
+        assert "fehlgeschlagen" not in result.lower(), result
+
+        local_conn = _local_conn()
+        try:
+            lp = local_conn.execute(
+                "SELECT id FROM projects WHERE name = %s", ("diary-sync-pull",)
+            ).fetchone()
+            assert lp is not None
+            lm = local_conn.execute(
+                "SELECT * FROM milestones WHERE project_id = %s", (lp["id"],)
+            ).fetchone()
+            assert lm is not None and lm["title"] == "Remote Milestone"
+        finally:
+            local_conn.close()
+
+
+# ===========================================================================
+# 16. memory_links sync — extension to memory_sync(), matched by
+#     (from_path, to_path, rel_type) since link UUIDs are independent per DB.
+# ===========================================================================
+
+class TestMemoryLinksSync:
+    def test_links_push_pull_converge(self):
+        """A link created locally must sync to the remote, resolved against the
+        remote's own (different) UUIDs for the same paths."""
+        import diary_server
+
+        _upsert("/user/link-a", title="A", body="a")
+        _upsert("/user/link-b", title="B", body="b")
+        diary_server.memory_link("/user/link-a", "/user/link-b", "related", "test note")
+
+        result = diary_server.memory_sync()
+        assert "fehlgeschlagen" not in result.lower(), result
+
+        remote_url = os.environ.get("DIARY_REMOTE_URL")
+        rconn = psycopg.connect(remote_url, row_factory=dict_row)
+        try:
+            row = rconn.execute(
+                "SELECT ml.note, ml.rel_type FROM memory_links ml "
+                "JOIN memory_nodes fn ON ml.from_id = fn.id "
+                "JOIN memory_nodes tn ON ml.to_id = tn.id "
+                "WHERE fn.path = %s AND tn.path = %s",
+                ("/user/link-a", "/user/link-b"),
+            ).fetchone()
+            assert row is not None, "Link should have been pushed to remote"
+            assert row["rel_type"] == "related"
+            assert row["note"] == "test note"
+        finally:
+            rconn.close()
+
+    def test_links_sync_is_idempotent(self):
+        """A second sync with no link changes must report 0 pushed/pulled links."""
+        import diary_server
+
+        _upsert("/user/link-idem-a", title="A", body="a")
+        _upsert("/user/link-idem-b", title="B", body="b")
+        diary_server.memory_link("/user/link-idem-a", "/user/link-idem-b", "related")
+        diary_server.memory_sync()  # first sync: pushes the link
+
+        result2 = diary_server.memory_sync()
+        assert "Links: 0 gepusht, 0 gepullt" in result2, result2
+
+
+# ===========================================================================
+# 17. Keyword-trigger auto-injection (v0.9.0) — deterministic, no embeddings/LLM.
+#     memory_set_keywords() sets trigger_keywords; memory_check_triggers()
+#     matches a text against them with strict word-boundary regex.
+# ===========================================================================
+
+class TestKeywordTriggers:
+    def test_set_keywords_returns_confirmation(self):
+        import diary_server
+
+        _upsert("/user/kw-set", title="T", body="B")
+        result = diary_server.memory_set_keywords("/user/kw-set", "npm plus admin, foo-bar")
+        assert "npm plus admin" in result
+        assert "foo-bar" in result
+
+    def test_set_keywords_missing_node_reports_not_found(self):
+        import diary_server
+
+        result = diary_server.memory_set_keywords("/user/does-not-exist-kw", "x")
+        assert "nicht gefunden" in result
+
+    def test_empty_keywords_clears_them(self):
+        import diary_server
+
+        _upsert("/user/kw-clear", title="T", body="B")
+        diary_server.memory_set_keywords("/user/kw-clear", "something")
+        result = diary_server.memory_set_keywords("/user/kw-clear", "")
+        assert "entfernt" in result
+        node = _get_node("/user/kw-clear")
+        assert node["trigger_keywords"] == []
+
+    def test_check_triggers_exact_phrase_match(self):
+        import diary_server
+
+        _upsert("/user/kw-match", title="NPM Plus Admin Doku", body="So funktioniert es.")
+        diary_server.memory_set_keywords("/user/kw-match", "npm plus admin")
+
+        result = diary_server.memory_check_triggers("Wie richte ich NPM Plus Admin ein?")
+        assert "/user/kw-match" in result
+        assert "So funktioniert es." in result
+
+    def test_check_triggers_is_case_insensitive(self):
+        import diary_server
+
+        _upsert("/user/kw-case", title="Case Test", body="Inhalt")
+        diary_server.memory_set_keywords("/user/kw-case", "DeployTarget")
+
+        result = diary_server.memory_check_triggers("bitte den deploytarget pruefen")
+        assert "/user/kw-case" in result
+
+    def test_check_triggers_no_match_returns_empty(self):
+        import diary_server
+
+        _upsert("/user/kw-nomatch", title="No Match", body="Inhalt")
+        diary_server.memory_set_keywords("/user/kw-nomatch", "very-specific-term")
+
+        result = diary_server.memory_check_triggers("Ein voellig unrelated Satz.")
+        assert result == ""
+
+    def test_check_triggers_rejects_substring_false_positive(self):
+        """'npm plus admin' as a keyword must not match inside a longer run of
+        similar-looking words — only the exact contiguous phrase counts."""
+        import diary_server
+
+        _upsert("/user/kw-substr", title="Substr Test", body="Inhalt")
+        diary_server.memory_set_keywords("/user/kw-substr", "npm plus admin")
+
+        result = diary_server.memory_check_triggers("adminpanel npm pluswert admin")
+        assert result == ""
+
+    def test_check_triggers_no_keywords_set_anywhere_returns_empty(self):
+        import diary_server
+
+        result = diary_server.memory_check_triggers("irgendein Text ohne Bezug")
+        assert result == ""

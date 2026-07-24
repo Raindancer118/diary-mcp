@@ -15,14 +15,27 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 EMBED_DIM = 384
 
+# fastembed defaults to caching the ~470MB ONNX model under
+# tempfile.gettempdir()/fastembed_cache when FASTEMBED_CACHE_PATH is unset. On
+# systems where /tmp is tmpfs (wiped every reboot — the default on this CachyOS
+# box), that means the model gets silently re-downloaded from HuggingFace on the
+# first embed() call of every fresh boot: a multi-second-to-minutes stall on the
+# hot path of memory_search/memory_upsert. Point it at a persistent XDG-style
+# cache dir instead, unless the user already configured one explicitly.
+_DEFAULT_CACHE_DIR = Path.home() / ".cache" / "fastembed"
+os.environ.setdefault("FASTEMBED_CACHE_PATH", str(_DEFAULT_CACHE_DIR))
+
 _model = None
 _unavailable = False
+_load_lock = threading.Lock()
 
 
 def model_name() -> str:
@@ -40,15 +53,22 @@ def _get_model():
         return _model
     if _unavailable:
         return None
-    try:
-        from fastembed import TextEmbedding  # heavy import — defer to first use
-        _model = TextEmbedding(model_name())
-        _log.info("Loaded embedding model %s", model_name())
-        return _model
-    except Exception as exc:  # noqa: BLE001 — any failure → graceful fallback
-        _log.warning("Embedding model unavailable (%s); semantic search disabled", exc)
-        _unavailable = True
-        return None
+    with _load_lock:
+        # Re-check inside the lock: another thread (e.g. the startup warmup
+        # thread) may have finished loading while we were waiting for it.
+        if _model is not None:
+            return _model
+        if _unavailable:
+            return None
+        try:
+            from fastembed import TextEmbedding  # heavy import — defer to first use
+            _model = TextEmbedding(model_name())
+            _log.info("Loaded embedding model %s", model_name())
+            return _model
+        except Exception as exc:  # noqa: BLE001 — any failure → graceful fallback
+            _log.warning("Embedding model unavailable (%s); semantic search disabled", exc)
+            _unavailable = True
+            return None
 
 
 def embed(text: str) -> list[float] | None:

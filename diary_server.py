@@ -1,6 +1,8 @@
 import json
 import logging
+import re
 import subprocess
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -29,6 +31,13 @@ from diary_embed import EMBED_DIM
 _log = logging.getLogger(__name__)
 mcp = FastMCP("Diary")
 init_db()
+
+# Loading the embedding model (heavy import + ONNX session init) takes seconds
+# and would otherwise happen synchronously inside whichever tool call embeds
+# first (memory_search always embeds the query). Warm it in the background so
+# it's typically ready before the user's first real request lands; _get_model's
+# lock makes this race-safe against a real request that beats the warmup.
+threading.Thread(target=diary_embed.is_available, daemon=True, name="embed-warmup").start()
 
 # Extracted memories auto-expire after this many days unless promoted to curated.
 EXTRACTED_TTL_DAYS = 90
@@ -122,7 +131,10 @@ def update_project_config(project_name: str, config_json_string: str) -> str:
         pid = get_project_id(conn, project_name)
         if not pid:
             return "Projekt nicht gefunden."
-        conn.execute("UPDATE projects SET config = %s WHERE id = %s", (config_json_string, pid))
+        conn.execute(
+            "UPDATE projects SET config = %s, updated_at = now() WHERE id = %s",
+            (config_json_string, pid),
+        )
     return "Projekt-Config erfolgreich aktualisiert."
 
 
@@ -213,26 +225,31 @@ def search_global(query: str) -> str:
 
     with get_db() as conn:
         cond, params = like_clause(["name", "status"])
-        for row in conn.execute(f"SELECT name FROM projects WHERE {cond}", params).fetchall():
+        for row in conn.execute(
+            f"SELECT name FROM projects WHERE deleted_at IS NULL AND ({cond})", params
+        ).fetchall():
             results.append(f"- [Projekt] {row['name']}")
 
         cond, params = like_clause(["entry", "worker"])
         for row in conn.execute(
-            f"SELECT p.name, l.entry, l.worker FROM logs l JOIN projects p ON l.project_id = p.id WHERE {cond}",
+            "SELECT p.name, l.entry, l.worker FROM logs l JOIN projects p ON l.project_id = p.id "
+            f"WHERE l.deleted_at IS NULL AND p.deleted_at IS NULL AND ({cond})",
             params,
         ).fetchall():
             results.append(f"- [Log in '{row['name']}' / {row['worker']}] {row['entry'][:80]}...")
 
         cond, params = like_clause(["error_msg", "solution_msg"])
         for row in conn.execute(
-            f"SELECT p.name, e.error_msg FROM errors_solutions e JOIN projects p ON e.project_id = p.id WHERE {cond}",
+            "SELECT p.name, e.error_msg FROM errors_solutions e JOIN projects p ON e.project_id = p.id "
+            f"WHERE e.deleted_at IS NULL AND p.deleted_at IS NULL AND ({cond})",
             params,
         ).fetchall():
             results.append(f"- [Error/Solution in '{row['name']}'] {row['error_msg'][:80]}...")
 
         cond, params = like_clause(["title", "content"])
         for row in conn.execute(
-            f"SELECT p.name, w.title FROM wiki_pages w JOIN projects p ON w.project_id = p.id WHERE {cond}",
+            "SELECT p.name, w.title FROM wiki_pages w JOIN projects p ON w.project_id = p.id "
+            f"WHERE w.deleted_at IS NULL AND p.deleted_at IS NULL AND ({cond})",
             params,
         ).fetchall():
             results.append(f"- [Wiki in '{row['name']}'] Seite: {row['title']}")
@@ -241,7 +258,7 @@ def search_global(query: str) -> str:
         for row in conn.execute(
             "SELECT p.name, m.title AS m_title, t.title AS t_title "
             "FROM tasks t JOIN milestones m ON t.milestone_id = m.id JOIN projects p ON m.project_id = p.id "
-            f"WHERE {cond}",
+            f"WHERE t.deleted_at IS NULL AND m.deleted_at IS NULL AND p.deleted_at IS NULL AND ({cond})",
             params,
         ).fetchall():
             results.append(f"- [Aufgabe in '{row['name']}' -> '{row['m_title']}'] {row['t_title']}")
@@ -257,7 +274,7 @@ def filter_logs(project_name: str, level: str = None, worker: str = None, limit:
         if not pid:
             return "Projekt nicht gefunden."
 
-        sql = "SELECT * FROM logs WHERE project_id = %s"
+        sql = "SELECT * FROM logs WHERE project_id = %s AND deleted_at IS NULL"
         params: list = [pid]
         if level:
             sql += " AND level = %s"
@@ -291,9 +308,9 @@ def get_projects(include_archived: bool = None) -> str:
         include_archived = cfg.get("show_archived_by_default", False)
 
     with get_db() as conn:
-        sql = "SELECT id, name, archived, updated_at FROM projects"
+        sql = "SELECT id, name, archived, updated_at FROM projects WHERE deleted_at IS NULL"
         if not include_archived:
-            sql += " WHERE archived = FALSE"
+            sql += " AND archived = FALSE"
         projects = conn.execute(sql).fetchall()
 
         if not projects:
@@ -302,7 +319,7 @@ def get_projects(include_archived: bool = None) -> str:
         result = ["Aktuelle Projekte im Diary:"]
         for p in projects:
             milestones = conn.execute(
-                "SELECT completed FROM milestones WHERE project_id = %s", (p["id"],)
+                "SELECT completed FROM milestones WHERE project_id = %s AND deleted_at IS NULL", (p["id"],)
             ).fetchall()
             comp = 0.0
             if milestones:
@@ -310,7 +327,8 @@ def get_projects(include_archived: bool = None) -> str:
                 comp = round((comp_count / len(milestones)) * 100, 1)
 
             reminders = conn.execute(
-                "SELECT target_date, completed FROM reminders WHERE project_id = %s", (p["id"],)
+                "SELECT target_date, completed FROM reminders WHERE project_id = %s AND deleted_at IS NULL",
+                (p["id"],),
             ).fetchall()
             due_count = sum(
                 1 for r in reminders if not r["completed"] and _is_reminder_due(r["target_date"])
@@ -331,14 +349,18 @@ def get_project(project_name: str) -> str:
     limit = cfg.get("default_log_limit", 20)
 
     with get_db() as conn:
-        p = conn.execute("SELECT * FROM projects WHERE name = %s", (project_name,)).fetchone()
+        p = conn.execute(
+            "SELECT * FROM projects WHERE name = %s AND deleted_at IS NULL", (project_name,)
+        ).fetchone()
         if not p:
             return f"Projekt '{project_name}' nicht gefunden."
 
         pid = p["id"]
         apply_log_retention(conn, pid)
 
-        milestones = conn.execute("SELECT * FROM milestones WHERE project_id = %s", (pid,)).fetchall()
+        milestones = conn.execute(
+            "SELECT * FROM milestones WHERE project_id = %s AND deleted_at IS NULL", (pid,)
+        ).fetchall()
         comp = 0.0
         if milestones:
             comp_count = sum(1 for m in milestones if m["completed"])
@@ -351,12 +373,14 @@ def get_project(project_name: str) -> str:
         res.append(f"\nAktueller Status/Fokus:\n{p['status']}\n")
 
         err_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM errors_solutions WHERE project_id = %s", (pid,)
+            "SELECT COUNT(*) AS c FROM errors_solutions WHERE project_id = %s AND deleted_at IS NULL", (pid,)
         ).fetchone()["c"]
         if err_count > 0:
             res.append(f"Bekannte Fehler & Lösungen: {err_count} (Nutze get_errors_solutions zum Abrufen)\n")
 
-        reminders = conn.execute("SELECT * FROM reminders WHERE project_id = %s", (pid,)).fetchall()
+        reminders = conn.execute(
+            "SELECT * FROM reminders WHERE project_id = %s AND deleted_at IS NULL", (pid,)
+        ).fetchall()
         if reminders:
             res.append("Wiedervorlagen:")
             for r in reminders:
@@ -371,13 +395,17 @@ def get_project(project_name: str) -> str:
             mark = "[x]" if m["completed"] else "[ ]"
             comp_date = f" (am {m['completed_at']})" if m["completed"] and m["completed_at"] else ""
             res.append(f"  M{m['id']}: {mark} {m['title']}{comp_date}")
-            for t in conn.execute("SELECT * FROM tasks WHERE milestone_id = %s", (m["id"],)).fetchall():
+            for t in conn.execute(
+                "SELECT * FROM tasks WHERE milestone_id = %s AND deleted_at IS NULL", (m["id"],)
+            ).fetchall():
                 t_mark = "[x]" if t["completed"] else "[ ]"
                 res.append(f"      T{t['id']}: {t_mark} {t['title']}")
 
         res.append(f"\nLetzte Log-Einträge (Max {limit}):")
         logs = conn.execute(
-            "SELECT * FROM logs WHERE project_id = %s ORDER BY timestamp DESC LIMIT %s", (pid, limit)
+            "SELECT * FROM logs WHERE project_id = %s AND deleted_at IS NULL "
+            "ORDER BY timestamp DESC LIMIT %s",
+            (pid, limit),
         ).fetchall()
         if not logs:
             res.append("  (Keine)")
@@ -396,11 +424,24 @@ def add_project(project_name: str, initial_status: str = "") -> str:
     with get_db() as conn:
         if get_project_id(conn, project_name):
             return "Projekt existiert bereits."
-        row = conn.execute(
-            "INSERT INTO projects (name, status) VALUES (%s, %s) RETURNING id",
-            (project_name, initial_status),
+        # A tombstoned project keeps its row (name stays UNIQUE) — revive it instead
+        # of inserting, same rule as memory_upsert reviving a deleted memory_nodes path.
+        tombstoned = conn.execute(
+            "SELECT id FROM projects WHERE name = %s AND deleted_at IS NOT NULL", (project_name,)
         ).fetchone()
-        pid = row["id"]
+        if tombstoned:
+            pid = tombstoned["id"]
+            conn.execute(
+                "UPDATE projects SET status = %s, archived = FALSE, deleted_at = NULL, "
+                "updated_at = now() WHERE id = %s",
+                (initial_status, pid),
+            )
+        else:
+            row = conn.execute(
+                "INSERT INTO projects (name, status) VALUES (%s, %s) RETURNING id",
+                (project_name, initial_status),
+            ).fetchone()
+            pid = row["id"]
         conn.execute(
             "INSERT INTO logs (project_id, timestamp, author, entry, level, worker) VALUES (%s, %s, %s, %s, %s, %s)",
             (pid, now, author, "Projekt erstellt.", "INFO", "System"),
@@ -410,11 +451,44 @@ def add_project(project_name: str, initial_status: str = "") -> str:
 
 @mcp.tool()
 def delete_project(project_name: str) -> str:
+    """Löscht ein Projekt (Tombstone) inkl. aller Kind-Datensätze (Milestones, Tasks,
+    Logs, Reminders, Wiki-Seiten, Errors/Solutions), damit die Löschung per
+    memory_sync_diary() zur Remote propagiert statt sie durch DB-CASCADE zu verlieren."""
     with get_db() as conn:
         pid = get_project_id(conn, project_name)
         if not pid:
             return "Nicht gefunden."
-        conn.execute("DELETE FROM projects WHERE id = %s", (pid,))
+        conn.execute(
+            "UPDATE tasks SET deleted_at = now(), updated_at = now() WHERE deleted_at IS NULL AND milestone_id IN "
+            "(SELECT id FROM milestones WHERE project_id = %s)",
+            (pid,),
+        )
+        conn.execute(
+            "UPDATE milestones SET deleted_at = now(), updated_at = now() "
+            "WHERE project_id = %s AND deleted_at IS NULL",
+            (pid,),
+        )
+        conn.execute(
+            "UPDATE logs SET deleted_at = now(), updated_at = now() "
+            "WHERE project_id = %s AND deleted_at IS NULL",
+            (pid,),
+        )
+        conn.execute(
+            "UPDATE reminders SET deleted_at = now(), updated_at = now() "
+            "WHERE project_id = %s AND deleted_at IS NULL",
+            (pid,),
+        )
+        conn.execute(
+            "UPDATE wiki_pages SET deleted_at = now(), updated_at = now() "
+            "WHERE project_id = %s AND deleted_at IS NULL",
+            (pid,),
+        )
+        conn.execute(
+            "UPDATE errors_solutions SET deleted_at = now(), updated_at = now() "
+            "WHERE project_id = %s AND deleted_at IS NULL",
+            (pid,),
+        )
+        conn.execute("UPDATE projects SET deleted_at = now(), updated_at = now() WHERE id = %s", (pid,))
     return "Projekt gelöscht."
 
 
@@ -463,14 +537,18 @@ def add_log_entry(project_name: str, log_text: str, level: str = "INFO", worker:
 @mcp.tool()
 def edit_log_entry(log_id: int, new_text: str) -> str:
     with get_db() as conn:
-        conn.execute("UPDATE logs SET entry = %s WHERE id = %s", (new_text, log_id))
+        conn.execute(
+            "UPDATE logs SET entry = %s, updated_at = now() WHERE id = %s", (new_text, log_id)
+        )
     return f"Log L{log_id} aktualisiert."
 
 
 @mcp.tool()
 def delete_log_entry(log_id: int) -> str:
     with get_db() as conn:
-        conn.execute("DELETE FROM logs WHERE id = %s", (log_id,))
+        conn.execute(
+            "UPDATE logs SET deleted_at = now(), updated_at = now() WHERE id = %s", (log_id,)
+        )
     return f"Log L{log_id} gelöscht."
 
 
@@ -505,7 +583,7 @@ def get_errors_solutions(project_name: str) -> str:
             return "Projekt nicht gefunden."
         rows = conn.execute(
             "SELECT id, error_msg, solution_msg, created_at FROM errors_solutions "
-            "WHERE project_id = %s ORDER BY created_at DESC",
+            "WHERE project_id = %s AND deleted_at IS NULL ORDER BY created_at DESC",
             (pid,),
         ).fetchall()
 
@@ -545,7 +623,8 @@ def toggle_milestone(project_name: str, milestone_id: int, completed: bool) -> s
             return "Projekt nicht gefunden."
         comp_at = _now() if completed else None
         conn.execute(
-            "UPDATE milestones SET completed = %s, completed_at = %s WHERE id = %s AND project_id = %s",
+            "UPDATE milestones SET completed = %s, completed_at = %s, updated_at = now() "
+            "WHERE id = %s AND project_id = %s",
             (completed, comp_at, milestone_id, pid),
         )
         conn.execute("UPDATE projects SET updated_at = now() WHERE id = %s", (pid,))
@@ -559,7 +638,7 @@ def edit_milestone(project_name: str, milestone_id: int, new_title: str) -> str:
         if not pid:
             return "Projekt nicht gefunden."
         conn.execute(
-            "UPDATE milestones SET title = %s WHERE id = %s AND project_id = %s",
+            "UPDATE milestones SET title = %s, updated_at = now() WHERE id = %s AND project_id = %s",
             (new_title, milestone_id, pid),
         )
     return "Umbenannt."
@@ -567,11 +646,21 @@ def edit_milestone(project_name: str, milestone_id: int, new_title: str) -> str:
 
 @mcp.tool()
 def delete_milestone(project_name: str, milestone_id: int) -> str:
+    """Löscht einen Meilenstein (Tombstone) inkl. seiner Tasks."""
     with get_db() as conn:
         pid = get_project_id(conn, project_name)
         if not pid:
             return "Projekt nicht gefunden."
-        conn.execute("DELETE FROM milestones WHERE id = %s AND project_id = %s", (milestone_id, pid))
+        conn.execute(
+            "UPDATE tasks SET deleted_at = now(), updated_at = now() "
+            "WHERE milestone_id = %s AND deleted_at IS NULL",
+            (milestone_id,),
+        )
+        conn.execute(
+            "UPDATE milestones SET deleted_at = now(), updated_at = now() "
+            "WHERE id = %s AND project_id = %s",
+            (milestone_id, pid),
+        )
     return "Gelöscht."
 
 
@@ -584,7 +673,8 @@ def get_active_tasks(project_name: str) -> str:
         tasks = conn.execute(
             "SELECT m.title AS m_title, t.id, t.title FROM tasks t "
             "JOIN milestones m ON t.milestone_id = m.id "
-            "WHERE m.project_id = %s AND t.completed = FALSE ORDER BY m.id",
+            "WHERE m.project_id = %s AND t.completed = FALSE "
+            "AND t.deleted_at IS NULL AND m.deleted_at IS NULL ORDER BY m.id",
             (pid,),
         ).fetchall()
 
@@ -617,7 +707,7 @@ def add_task(project_name: str, milestone_id: int, title: str) -> str:
 def toggle_task(project_name: str, milestone_id: int, task_id: int, completed: bool) -> str:
     with get_db() as conn:
         conn.execute(
-            "UPDATE tasks SET completed = %s WHERE id = %s AND milestone_id = %s",
+            "UPDATE tasks SET completed = %s, updated_at = now() WHERE id = %s AND milestone_id = %s",
             (completed, task_id, milestone_id),
         )
     return "Task aktualisiert."
@@ -627,7 +717,7 @@ def toggle_task(project_name: str, milestone_id: int, task_id: int, completed: b
 def edit_task(project_name: str, milestone_id: int, task_id: int, new_title: str) -> str:
     with get_db() as conn:
         conn.execute(
-            "UPDATE tasks SET title = %s WHERE id = %s AND milestone_id = %s",
+            "UPDATE tasks SET title = %s, updated_at = now() WHERE id = %s AND milestone_id = %s",
             (new_title, task_id, milestone_id),
         )
     return "Task umbenannt."
@@ -636,7 +726,11 @@ def edit_task(project_name: str, milestone_id: int, task_id: int, new_title: str
 @mcp.tool()
 def delete_task(project_name: str, milestone_id: int, task_id: int) -> str:
     with get_db() as conn:
-        conn.execute("DELETE FROM tasks WHERE id = %s AND milestone_id = %s", (task_id, milestone_id))
+        conn.execute(
+            "UPDATE tasks SET deleted_at = now(), updated_at = now() "
+            "WHERE id = %s AND milestone_id = %s",
+            (task_id, milestone_id),
+        )
     return "Task gelöscht."
 
 
@@ -661,7 +755,7 @@ def add_reminder(project_name: str, target_date: str, note: str) -> str:
 def edit_reminder(reminder_id: int, new_date: str, new_note: str) -> str:
     with get_db() as conn:
         conn.execute(
-            "UPDATE reminders SET target_date = %s, note = %s WHERE id = %s",
+            "UPDATE reminders SET target_date = %s, note = %s, updated_at = now() WHERE id = %s",
             (new_date, new_note, reminder_id),
         )
     return f"Reminder R{reminder_id} erfolgreich bearbeitet."
@@ -684,21 +778,29 @@ def snooze_reminder(reminder_id: int, add_days: int) -> str:
                 new_date = dt.strftime(fmt)
         except ValueError:
             return f"Konnte das Datum '{date_str}' nicht parsen."
-        conn.execute("UPDATE reminders SET target_date = %s WHERE id = %s", (new_date, reminder_id))
+        conn.execute(
+            "UPDATE reminders SET target_date = %s, updated_at = now() WHERE id = %s",
+            (new_date, reminder_id),
+        )
     return f"Reminder R{reminder_id} um {add_days} Tage auf {new_date} aufgeschoben ('snooze')."
 
 
 @mcp.tool()
 def toggle_reminder(reminder_id: int, completed: bool) -> str:
     with get_db() as conn:
-        conn.execute("UPDATE reminders SET completed = %s WHERE id = %s", (completed, reminder_id))
+        conn.execute(
+            "UPDATE reminders SET completed = %s, updated_at = now() WHERE id = %s",
+            (completed, reminder_id),
+        )
     return "Reminder aktualisiert."
 
 
 @mcp.tool()
 def delete_reminder(reminder_id: int) -> str:
     with get_db() as conn:
-        conn.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+        conn.execute(
+            "UPDATE reminders SET deleted_at = now(), updated_at = now() WHERE id = %s", (reminder_id,)
+        )
     return "Reminder gelöscht."
 
 
@@ -726,7 +828,8 @@ def edit_wiki_page(project_name: str, page_id: int, new_content: str) -> str:
         if not pid:
             return "Projekt nicht gefunden."
         conn.execute(
-            "UPDATE wiki_pages SET content = %s, updated_at = now() WHERE id = %s AND project_id = %s",
+            "UPDATE wiki_pages SET content = %s, updated_at = now() "
+            "WHERE id = %s AND project_id = %s AND deleted_at IS NULL",
             (new_content, page_id, pid),
         )
     return "Wiki-Seite aktualisiert."
@@ -739,7 +842,8 @@ def get_wiki_pages(project_name: str) -> str:
         if not pid:
             return "Projekt nicht gefunden."
         pages = conn.execute(
-            "SELECT id, title, updated_at FROM wiki_pages WHERE project_id = %s", (pid,)
+            "SELECT id, title, updated_at FROM wiki_pages WHERE project_id = %s AND deleted_at IS NULL",
+            (pid,),
         ).fetchall()
 
     if not pages:
@@ -757,7 +861,8 @@ def get_wiki_page(project_name: str, page_id: int) -> str:
         if not pid:
             return "Projekt nicht gefunden."
         page = conn.execute(
-            "SELECT title, content, updated_at FROM wiki_pages WHERE id = %s AND project_id = %s",
+            "SELECT title, content, updated_at FROM wiki_pages "
+            "WHERE id = %s AND project_id = %s AND deleted_at IS NULL",
             (page_id, pid),
         ).fetchone()
 
@@ -781,7 +886,7 @@ def search_wiki(project_name: str, search_query: str) -> str:
         params: list = [pid] + [val for w in words for val in (f"%{w}%", f"%{w}%")]
         sql = (
             "SELECT id, title, substr(content, 1, 100) AS snippet FROM wiki_pages "
-            f"WHERE project_id = %s AND {' AND '.join(conditions)}"
+            f"WHERE project_id = %s AND deleted_at IS NULL AND {' AND '.join(conditions)}"
         )
         pages = conn.execute(sql, params).fetchall()
 
@@ -1341,6 +1446,14 @@ def memory_search(
     """
     origin_clause = "" if include_extracted else "AND origin = 'curated'"
     expiry_clause = "" if include_expired else "AND (valid_until IS NULL OR valid_until >= now())"
+    # Embed BEFORE opening the DB connection: this can block for a long time on
+    # first use (heavy import + ONNX load, or a stalled model download), and
+    # doing it while a transaction is open would hold locks on memory_nodes for
+    # that whole time — starving any concurrent DDL (e.g. another process's
+    # init_db() migration) until it finishes. Verified live: a memory_search
+    # call stuck on embed() left a 46-minute "idle in transaction" backend that
+    # blocked a fresh diary-mcp process's ALTER TABLE indefinitely.
+    qvec = diary_embed.embed(query)
 
     with get_db() as conn:
         # --- FTS leg ---
@@ -1362,7 +1475,6 @@ def memory_search(
 
         # --- Semantic leg (RRF requires paths only for fusion) ---
         vec_rows: list[dict] = []
-        qvec = diary_embed.embed(query)
         if qvec is not None and _pgvector_ready(conn):
             qlit = "[" + ",".join(repr(float(x)) for x in qvec) + "]"
             vec_rows = conn.execute(
@@ -1555,17 +1667,22 @@ def memory_reembed_all(only_missing: bool = True) -> str:
     if not diary_embed.is_available():
         return "Embedding-Modell nicht verfügbar — fastembed/Modell konnte nicht geladen werden."
 
+    cond = "WHERE deleted_at IS NULL AND embedding IS NULL" if only_missing else "WHERE deleted_at IS NULL"
     with get_db() as conn:
-        cond = "WHERE deleted_at IS NULL AND embedding IS NULL" if only_missing else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT path, title, body FROM memory_nodes {cond}"
         ).fetchall()
-        if not rows:
-            return "Nichts zu embedden — alle Memories haben bereits Embeddings."
+    if not rows:
+        return "Nichts zu embedden — alle Memories haben bereits Embeddings."
 
-        texts = [f"{r['title']}\n{r['body'] or ''}" for r in rows]
-        vecs = diary_embed.embed_many(texts)
+    # Batch-embed with no transaction open — this can take a while for many
+    # nodes, and doing it inside a `with get_db()` block would hold locks on
+    # memory_nodes for the whole run (see memory_search's fix for why that's
+    # dangerous: it can block other processes' schema migrations indefinitely).
+    texts = [f"{r['title']}\n{r['body'] or ''}" for r in rows]
+    vecs = diary_embed.embed_many(texts)
 
+    with get_db() as conn:
         done = 0
         pgv = _pgvector_ready(conn)
         for r, v in zip(rows, vecs):
@@ -1689,6 +1806,45 @@ def _format_conflicts(conflicts: list[dict], limit: int = 8) -> str:
             f"neuere Version gewann): " + ", ".join(parts))
 
 
+# --- memory_links sync -------------------------------------------------------
+# from_id/to_id are local UUIDs, independent per DB (memory_nodes itself is matched
+# by path, not id — see _SYNC_INSERT above), so links can't be merged via ON CONFLICT
+# on their own UNIQUE(from_id, to_id, rel_type). Instead they're matched via the
+# (from_path, to_path, rel_type) triple, resolved through memory_nodes.path on each
+# side. Requires memory_nodes to already be synced (this runs after node push/pull).
+_LINKS_SELECT = """SELECT ml.rel_type, ml.note, ml.link_origin, ml.updated_at,
+       fn.path AS from_path, tn.path AS to_path
+       FROM memory_links ml
+       JOIN memory_nodes fn ON ml.from_id = fn.id
+       JOIN memory_nodes tn ON ml.to_id = tn.id"""
+
+_LINKS_UPSERT = """INSERT INTO memory_links (from_id, to_id, rel_type, note, link_origin, updated_at)
+       VALUES (%s, %s, %s, %s, %s, %s)
+       ON CONFLICT (from_id, to_id, rel_type) DO UPDATE SET
+           note = EXCLUDED.note, link_origin = EXCLUDED.link_origin, updated_at = EXCLUDED.updated_at"""
+
+
+def _link_key(link: dict) -> tuple:
+    return (link["from_path"], link["to_path"], link["rel_type"])
+
+
+def _sync_link(conn, link: dict) -> bool:
+    """Resolve from_path/to_path to this connection's local node ids and upsert the
+    link. Returns False (no-op) if either node isn't present on this side yet."""
+    ids = conn.execute(
+        "SELECT (SELECT id FROM memory_nodes WHERE path = %s AND deleted_at IS NULL) AS from_id, "
+        "(SELECT id FROM memory_nodes WHERE path = %s AND deleted_at IS NULL) AS to_id",
+        (link["from_path"], link["to_path"]),
+    ).fetchone()
+    if not ids["from_id"] or not ids["to_id"]:
+        return False
+    conn.execute(_LINKS_UPSERT, (
+        ids["from_id"], ids["to_id"], link["rel_type"], link["note"],
+        link["link_origin"], link["updated_at"],
+    ))
+    return True
+
+
 @mcp.tool()
 def memory_sync() -> str:
     """Bidirektionaler Sync des Memory-Trees mit der Remote-Postgres-Instanz.
@@ -1758,6 +1914,34 @@ def memory_sync() -> str:
                     local_conn.execute(_SYNC_INSERT, _sync_row(remote_n))
                     pulled += 1
 
+        # --- Sync memory_links (after nodes, so both sides can resolve ids) ---
+        with get_db() as local_conn:
+            local_links = local_conn.execute(_LINKS_SELECT).fetchall()
+        local_by_key = {_link_key(l): l for l in local_links}
+
+        links_pushed = 0
+        with remote_db_url() as rurl:
+            rc = psycopg.connect(rurl, row_factory=dict_row)
+            try:
+                remote_links = rc.execute(_LINKS_SELECT).fetchall()
+                remote_by_key = {_link_key(l): l for l in remote_links}
+                for l in local_links:
+                    r = remote_by_key.get(_link_key(l))
+                    if r is None or l["updated_at"] > r["updated_at"]:
+                        if _sync_link(rc, l):
+                            links_pushed += 1
+                rc.commit()
+            finally:
+                rc.close()
+
+        links_pulled = 0
+        with get_db() as local_conn:
+            for l in remote_links:
+                loc = local_by_key.get(_link_key(l))
+                if loc is None or l["updated_at"] > loc["updated_at"]:
+                    if _sync_link(local_conn, l):
+                        links_pulled += 1
+
         # Re-link parent_id on both sides + refresh vector index for newly pulled rows
         with get_db() as local_conn:
             local_conn.execute(_BACKFILL_PARENT_SQL)
@@ -1792,9 +1976,296 @@ def memory_sync() -> str:
 
         tunnel_note = f" (via SSH-Tunnel {get_remote_ssh_host()})" if get_remote_ssh_host() else ""
         return (f"Sync abgeschlossen{tunnel_note}. Lokal→Remote: {pushed} gepusht. "
-                f"Remote→Lokal: {pulled} gepullt." + _format_conflicts(conflicts))
+                f"Remote→Lokal: {pulled} gepullt. Links: {links_pushed} gepusht, "
+                f"{links_pulled} gepullt." + _format_conflicts(conflicts))
     except Exception as exc:
         return f"Sync fehlgeschlagen: {exc}"
+
+
+# =====================================================================
+# DIARY TABLE SYNC (projects/milestones/tasks/logs/reminders/wiki_pages/
+# errors_solutions) — separate from memory_sync() above so a failure in one
+# doesn't block the other. Same last-write-wins model, but these tables use
+# SERIAL PKs that are independent per DB instance, so they can't be matched by
+# id like memory_nodes. Two match-key strategies:
+#   - projects: matched by `name` (already UNIQUE) — no new column needed.
+#   - everything else: matched by the `sync_id` UUID column added for this
+#     purpose. The SERIAL `id` stays untouched — it's still the FK target and
+#     what tools return to callers ("Meilenstein M{id}").
+# Parent FKs (project_id, milestone_id) are resolved via the parent's stable
+# key (name / sync_id) on each side rather than transferred as raw integers.
+# =====================================================================
+
+_DIARY_CHILD_TABLES = {
+    # table:            data columns (excludes sync_id/project_id/updated_at/deleted_at)
+    "milestones":       ("title", "completed", "completed_at"),
+    "logs":             ("timestamp", "author", "entry", "level", "worker"),
+    "reminders":        ("target_date", "note", "completed"),
+    "wiki_pages":        ("title", "content"),
+    "errors_solutions": ("error_msg", "solution_msg"),
+}
+_TASK_COLS = ("title", "completed")
+
+
+def _ensure_remote_diary_schema(conn) -> None:
+    """Idempotent fallback: adds the sync_id/updated_at/deleted_at columns this sync
+    needs if the remote process hasn't been restarted since the migration landed in
+    diary_db._SCHEMA (that restart normally does this already)."""
+    conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+    for table in (*_DIARY_CHILD_TABLES, "tasks"):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+        conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_sync_id_idx ON {table}(sync_id)")
+
+
+def _sync_projects(local_conn, remote_conn) -> tuple[int, int]:
+    """Push/pull `projects`, matched by `name` (already UNIQUE)."""
+    select_sql = "SELECT name, status, archived, config, deleted_at, created_at, updated_at FROM projects"
+    insert_sql = """INSERT INTO projects (name, status, archived, config, deleted_at, created_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (name) DO UPDATE SET
+            status=EXCLUDED.status, archived=EXCLUDED.archived, config=EXCLUDED.config,
+            deleted_at=EXCLUDED.deleted_at, updated_at=EXCLUDED.updated_at"""
+
+    def values(r):
+        return (r["name"], r["status"], r["archived"],
+                json.dumps(r["config"]) if r.get("config") is not None else "{}",
+                r["deleted_at"], r["created_at"], r["updated_at"])
+
+    local_rows = local_conn.execute(select_sql).fetchall()
+    remote_rows = remote_conn.execute(select_sql).fetchall()
+    local_by_name = {r["name"]: r for r in local_rows}
+    remote_by_name = {r["name"]: r for r in remote_rows}
+
+    pushed = 0
+    for name, r in local_by_name.items():
+        o = remote_by_name.get(name)
+        if o is None or r["updated_at"] > o["updated_at"]:
+            remote_conn.execute(insert_sql, values(r))
+            pushed += 1
+    pulled = 0
+    for name, r in remote_by_name.items():
+        o = local_by_name.get(name)
+        if o is None or r["updated_at"] > o["updated_at"]:
+            local_conn.execute(insert_sql, values(r))
+            pulled += 1
+    return pushed, pulled
+
+
+def _resolve_project_id_any(conn, name: str):
+    """Resolve a project's id by name, INCLUDING tombstoned projects.
+
+    Unlike get_project_id() (which filters deleted_at IS NULL for normal tool use),
+    sync's FK resolution must still find a project that was tombstoned in the very
+    same sync run — e.g. delete_project() tombstones the project and its children
+    together, and syncs projects before children; if this filtered out deleted
+    projects, every child of a just-deleted project would silently fail to push its
+    own tombstone (parent "not found" => skipped) and the deletion would never
+    propagate.
+    """
+    row = conn.execute("SELECT id FROM projects WHERE name = %s", (name,)).fetchone()
+    return row["id"] if row else None
+
+
+def _sync_project_child(local_conn, remote_conn, table: str, cols: tuple) -> tuple[int, int]:
+    """Push/pull a table whose parent is `projects`, matched by `sync_id`.
+
+    The parent's project_id is transferred as its portable `project_name` and
+    re-resolved to a local integer id on each side (_resolve_project_id_any).
+    """
+    col_list = ", ".join(f"t.{c}" for c in cols)
+    select_sql = (
+        f"SELECT t.sync_id, p.name AS project_name, {col_list}, t.updated_at, t.deleted_at "
+        f"FROM {table} t JOIN projects p ON t.project_id = p.id"
+    )
+    insert_cols = ["sync_id", "project_id", *cols, "updated_at", "deleted_at"]
+    placeholders = ", ".join(["%s"] * len(insert_cols))
+    update_set = ", ".join(f"{c}=EXCLUDED.{c}" for c in ("project_id", *cols, "updated_at", "deleted_at"))
+    insert_sql = (
+        f"INSERT INTO {table} ({', '.join(insert_cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT (sync_id) DO UPDATE SET {update_set}"
+    )
+
+    def values(r, pid):
+        return (r["sync_id"], pid, *(r[c] for c in cols), r["updated_at"], r["deleted_at"])
+
+    local_rows = local_conn.execute(select_sql).fetchall()
+    remote_rows = remote_conn.execute(select_sql).fetchall()
+    local_by_id = {r["sync_id"]: r for r in local_rows}
+    remote_by_id = {r["sync_id"]: r for r in remote_rows}
+
+    pushed = 0
+    for sync_id, r in local_by_id.items():
+        o = remote_by_id.get(sync_id)
+        if o is None or r["updated_at"] > o["updated_at"]:
+            pid = _resolve_project_id_any(remote_conn, r["project_name"])
+            if pid is None:
+                continue  # parent project hasn't synced to this side (yet)
+            remote_conn.execute(insert_sql, values(r, pid))
+            pushed += 1
+    pulled = 0
+    for sync_id, r in remote_by_id.items():
+        o = local_by_id.get(sync_id)
+        if o is None or r["updated_at"] > o["updated_at"]:
+            pid = _resolve_project_id_any(local_conn, r["project_name"])
+            if pid is None:
+                continue
+            local_conn.execute(insert_sql, values(r, pid))
+            pulled += 1
+    return pushed, pulled
+
+
+def _sync_tasks(local_conn, remote_conn) -> tuple[int, int]:
+    """Push/pull `tasks`, matched by `sync_id`; parent milestone resolved via the
+    milestone's own `sync_id` (not project name — tasks hang off milestones)."""
+    col_list = ", ".join(f"t.{c}" for c in _TASK_COLS)
+    select_sql = (
+        f"SELECT t.sync_id, m.sync_id AS milestone_sync_id, {col_list}, t.updated_at, t.deleted_at "
+        f"FROM tasks t JOIN milestones m ON t.milestone_id = m.id"
+    )
+    insert_cols = ["sync_id", "milestone_id", *_TASK_COLS, "updated_at", "deleted_at"]
+    placeholders = ", ".join(["%s"] * len(insert_cols))
+    update_set = ", ".join(f"{c}=EXCLUDED.{c}" for c in ("milestone_id", *_TASK_COLS, "updated_at", "deleted_at"))
+    insert_sql = (
+        f"INSERT INTO tasks ({', '.join(insert_cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT (sync_id) DO UPDATE SET {update_set}"
+    )
+
+    def values(r, mid):
+        return (r["sync_id"], mid, *(r[c] for c in _TASK_COLS), r["updated_at"], r["deleted_at"])
+
+    def resolve_milestone_id(conn, milestone_sync_id):
+        row = conn.execute("SELECT id FROM milestones WHERE sync_id = %s", (milestone_sync_id,)).fetchone()
+        return row["id"] if row else None
+
+    local_rows = local_conn.execute(select_sql).fetchall()
+    remote_rows = remote_conn.execute(select_sql).fetchall()
+    local_by_id = {r["sync_id"]: r for r in local_rows}
+    remote_by_id = {r["sync_id"]: r for r in remote_rows}
+
+    pushed = 0
+    for sync_id, r in local_by_id.items():
+        o = remote_by_id.get(sync_id)
+        if o is None or r["updated_at"] > o["updated_at"]:
+            mid = resolve_milestone_id(remote_conn, r["milestone_sync_id"])
+            if mid is None:
+                continue
+            remote_conn.execute(insert_sql, values(r, mid))
+            pushed += 1
+    pulled = 0
+    for sync_id, r in remote_by_id.items():
+        o = local_by_id.get(sync_id)
+        if o is None or r["updated_at"] > o["updated_at"]:
+            mid = resolve_milestone_id(local_conn, r["milestone_sync_id"])
+            if mid is None:
+                continue
+            local_conn.execute(insert_sql, values(r, mid))
+            pulled += 1
+    return pushed, pulled
+
+
+@mcp.tool()
+def memory_sync_diary() -> str:
+    """Bidirektionaler Sync der Diary-Tabellen (Projekte, Meilensteine, Aufgaben,
+    Logs, Wiedervorlagen, Wiki-Seiten, Errors/Solutions) mit der Remote-Postgres-
+    Instanz — analog zu memory_sync(), aber für die klassischen Diary-Tabellen statt
+    den Memory-Tree. Last-write-wins über updated_at, Löschungen sind Tombstones
+    (deleted_at) und propagieren statt zu resurrecten.
+
+    Voraussetzung: DIARY_REMOTE_URL (+ optional DIARY_REMOTE_SSH_HOST), wie bei
+    memory_sync().
+    """
+    if not get_remote_url():
+        return (
+            "DIARY_REMOTE_URL ist nicht gesetzt.\n"
+            "Beispiel: export DIARY_REMOTE_URL='postgresql://claude:pw@127.0.0.1:54320/diary_mcp'\n"
+            "Für SSH-Tunnel zusätzlich: export DIARY_REMOTE_SSH_HOST='dorn'"
+        )
+
+    try:
+        with get_db() as local_conn:
+            with remote_db_url() as rurl:
+                remote_conn = psycopg.connect(rurl, row_factory=dict_row)
+                try:
+                    _ensure_remote_diary_schema(remote_conn)
+
+                    counts = {}
+                    # Dependency order: projects before their children, milestones
+                    # before tasks (tasks resolve their parent via milestone.sync_id).
+                    counts["projects"] = _sync_projects(local_conn, remote_conn)
+                    counts["milestones"] = _sync_project_child(
+                        local_conn, remote_conn, "milestones", _DIARY_CHILD_TABLES["milestones"]
+                    )
+                    counts["tasks"] = _sync_tasks(local_conn, remote_conn)
+                    for table in ("logs", "reminders", "wiki_pages", "errors_solutions"):
+                        counts[table] = _sync_project_child(
+                            local_conn, remote_conn, table, _DIARY_CHILD_TABLES[table]
+                        )
+
+                    remote_conn.commit()
+                finally:
+                    remote_conn.close()
+    except Exception as exc:
+        return f"Sync fehlgeschlagen: {exc}"
+
+    tunnel_note = f" (via SSH-Tunnel {get_remote_ssh_host()})" if get_remote_ssh_host() else ""
+    total_pushed = sum(p for p, _ in counts.values())
+    total_pulled = sum(u for _, u in counts.values())
+    detail = ", ".join(f"{t}: {p}↑/{u}↓" for t, (p, u) in counts.items())
+    return (f"Diary-Sync abgeschlossen{tunnel_note}. Gesamt: {total_pushed} gepusht, "
+            f"{total_pulled} gepullt.\n{detail}")
+
+
+@mcp.tool()
+def memory_purge_tombstones_diary(older_than_days: int = 30) -> str:
+    """Entfernt endgültig (HARD-DELETE) alte Diary-Tombstones (Projekte, Meilensteine,
+    Aufgaben, Logs, Wiedervorlagen, Wiki-Seiten, Errors/Solutions), lokal und remote
+    (falls konfiguriert) — analog zu memory_purge_tombstones(), aber für die
+    Diary-Tabellen. Kind-Tabellen zuerst (FK-Reihenfolge), dann Projekte.
+
+    older_than_days: Mindestalter eines Tombstones in Tagen (Default 30).
+    """
+    if older_than_days < 0:
+        return "Fehler: older_than_days darf nicht negativ sein."
+
+    interval = f"{int(older_than_days)} days"
+    # Child-before-parent order so a project purge doesn't strand orphaned rows
+    # under FK constraints (tasks -> milestones -> projects; the rest hang off
+    # projects directly).
+    tables = ("tasks", "milestones", "logs", "reminders", "wiki_pages", "errors_solutions", "projects")
+
+    def purge(conn) -> dict:
+        counts = {}
+        for table in tables:
+            counts[table] = conn.execute(
+                f"DELETE FROM {table} WHERE deleted_at IS NOT NULL AND deleted_at < now() - %s::interval",
+                (interval,),
+            ).rowcount
+        return counts
+
+    with get_db() as conn:
+        local_counts = purge(conn)
+    local_total = sum(local_counts.values())
+
+    remote_note = ""
+    if get_remote_url():
+        try:
+            with remote_db_url() as rurl:
+                rc = psycopg.connect(rurl, row_factory=dict_row)
+                try:
+                    remote_counts = purge(rc)
+                    rc.commit()
+                finally:
+                    rc.close()
+            tunnel = f" (via SSH-Tunnel {get_remote_ssh_host()})" if get_remote_ssh_host() else ""
+            remote_note = f" Remote{tunnel}: {sum(remote_counts.values())} entfernt."
+        except Exception as exc:  # noqa: BLE001
+            remote_note = f" Remote-Purge fehlgeschlagen: {exc}"
+    else:
+        remote_note = " (keine Remote konfiguriert — nur lokal)"
+
+    return f"Diary-Tombstone-Purge (>{older_than_days}d): Lokal {local_total} entfernt.{remote_note}"
 
 
 _SYMMETRIC_REL_TYPES = {"related", "supports", "contradicts"}
@@ -1842,7 +2313,7 @@ def memory_link(from_path: str, to_path: str, rel_type: str = "related", note: s
 
         if existing:
             conn.execute(
-                "UPDATE memory_links SET note = %s, link_origin = 'explicit' WHERE id = %s",
+                "UPDATE memory_links SET note = %s, link_origin = 'explicit', updated_at = now() WHERE id = %s",
                 (note_val, existing["id"]),
             )
         else:
@@ -2442,6 +2913,94 @@ def memory_unpin(path: str) -> str:
     return f"Pin für '{path}' entfernt (pin_triggers leer)."
 
 
+# Compiled-pattern cache for memory_check_triggers — keyword sets are tiny and
+# stable across a process's lifetime, so caching the regex avoids recompiling
+# it on every single Stop-hook invocation.
+_KEYWORD_PATTERN_CACHE: dict[str, "re.Pattern"] = {}
+
+
+def _keyword_pattern(keyword: str) -> "re.Pattern":
+    pat = _KEYWORD_PATTERN_CACHE.get(keyword)
+    if pat is None:
+        pat = re.compile(r"\b" + re.escape(keyword) + r"\b", re.IGNORECASE)
+        _KEYWORD_PATTERN_CACHE[keyword] = pat
+    return pat
+
+
+@mcp.tool()
+def memory_set_keywords(path: str, keywords: str) -> str:
+    """Setzt oder löscht Auto-Trigger-Keywords für einen Memory-Node.
+
+    keywords: kommagetrennte Liste exakter Begriffe/Phrasen (z.B. "NPM Plus Admin, npm-plus"),
+              leer = Keywords entfernen.
+
+    Taucht einer dieser Begriffe später wörtlich (case-insensitive, Wortgrenzen-exakt,
+    KEIN Fuzzy-/Substring-Match) in der Unterhaltung auf — egal ob im User-Text oder in
+    Claudes eigener Antwort — wird der volle Inhalt dieses Memory-Nodes automatisch als
+    Kontext für den nächsten Turn injiziert (via Stop-Hook, memory_check_triggers).
+
+    WICHTIG — sparsam einsetzen: Anders als die reine Prüfung (billiges String-Matching,
+    keine KI) kostet ein AUSGELÖSTER Trigger Kontext-Tokens wie jedes andere Pinning
+    (memory_pin). Nur für Begriffe setzen, bei denen ein automatischer Reminder wirklich
+    Mehrwert bringt — nicht für generische/häufige Wörter (Gefahr unnötig vieler Treffer).
+    """
+    kw_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else []
+    with get_db() as conn:
+        result = conn.execute(
+            "UPDATE memory_nodes SET trigger_keywords = %s, updated_at = now() "
+            "WHERE path = %s AND deleted_at IS NULL RETURNING path",
+            (kw_list, path),
+        ).fetchone()
+        if not result:
+            return f"Node '{path}' nicht gefunden."
+    if kw_list:
+        return f"Keywords für '{path}' gesetzt: {', '.join(kw_list)}"
+    return f"Keywords für '{path}' entfernt."
+
+
+@mcp.tool()
+def memory_check_triggers(text: str) -> str:
+    """Prüft einen Text auf gesetzte Auto-Trigger-Keywords (memory_set_keywords) und liefert Treffer.
+
+    Rein deterministisches Wortgrenzen-Matching (Regex, case-insensitive) — KEINE KI,
+    KEINE Embeddings. Daher schnell und ohne False-Positives durch bloße Bedeutungs-
+    ähnlichkeit (nur exakte Wort-/Phrasentreffer zählen).
+
+    Wird normalerweise automatisch durch den Stop-Hook (diary_keyword_trigger.py)
+    aufgerufen, der sowohl deine Antwort als auch die letzte User-Nachricht prüft —
+    manueller Aufruf ist nur für Debugging/Tests nötig. Gibt "" zurück, wenn nichts trifft.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT path, title, body, trigger_keywords FROM memory_nodes "
+            "WHERE deleted_at IS NULL AND trigger_keywords <> '{}'"
+        ).fetchall()
+    if not rows:
+        return ""
+
+    hits = []
+    for r in rows:
+        matched_kw = [kw for kw in r["trigger_keywords"] if _keyword_pattern(kw).search(text)]
+        if matched_kw:
+            hits.append((r, matched_kw))
+    if not hits:
+        return ""
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE memory_nodes SET access_count = access_count + 1, accessed_at = now() "
+            "WHERE path = ANY(%s)",
+            ([r["path"] for r, _ in hits],),
+        )
+
+    lines = []
+    for r, matched_kw in hits:
+        lines.append(f"[Auto-Trigger: {', '.join(matched_kw)}] {r['path']} — {r['title']}")
+        lines.append(r["body"] or "")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 @mcp.tool()
 def memory_project_context(project_slug: str, only_pinned: bool = True) -> str:
     """Liefert den Memory-Kontext für ein Projekt — gedacht zum automatischen Injizieren beim Projektstart.
@@ -2659,6 +3218,20 @@ def _ensure_remote_schema(conn) -> None:
         conn.execute(f"ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS embedding_v vector({EMBED_DIM})")
         conn.execute("CREATE INDEX IF NOT EXISTS memory_nodes_embv_idx "
                      "ON memory_nodes USING hnsw (embedding_v vector_cosine_ops)")
+    # memory_links: needed for the (from_path,to_path,rel_type)-matched link sync.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_links (
+            id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            from_id    UUID NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
+            to_id      UUID NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
+            rel_type   TEXT NOT NULL DEFAULT 'related',
+            note       TEXT,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            UNIQUE(from_id, to_id, rel_type)
+        )
+    """)
+    conn.execute("ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS link_origin TEXT NOT NULL DEFAULT 'explicit'")
+    conn.execute("ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()")
 
 
 def main() -> None:

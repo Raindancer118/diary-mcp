@@ -139,7 +139,9 @@ def remote_db_url() -> Generator[str, None, None]:
 
 
 def get_project_id(conn: psycopg.Connection, project_name: str) -> int | None:
-    row = conn.execute("SELECT id FROM projects WHERE name = %s", (project_name,)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM projects WHERE name = %s AND deleted_at IS NULL", (project_name,)
+    ).fetchone()
     return row["id"] if row else None
 
 
@@ -324,6 +326,68 @@ _SCHEMA = [
     # bump timestamps, corrupting the last-write-wins sync (endless ping-pong / stale
     # overwrites). All app-level UPDATEs set updated_at=now() explicitly instead.
     "DROP TRIGGER IF EXISTS memory_nodes_updated_at ON memory_nodes",
+
+    # --- Multi-table diary sync (v0.8.0) ---------------------------------------
+    # SERIAL PKs (projects.id, milestones.id, ...) are assigned independently per
+    # Postgres instance and can't be used to match rows across Laptop/Dorn. Two
+    # strategies, same idea as memory_nodes.path:
+    #   - projects: matched by `name` (already UNIQUE) — no new column needed.
+    #   - all other tables: a `sync_id` UUID is the stable cross-DB identity; the
+    #     SERIAL `id` stays untouched (still the FK target and the id tools return
+    #     to callers, e.g. "Meilenstein M{id}").
+    # `updated_at` (LWW) and `deleted_at` (tombstone) follow the memory_nodes
+    # pattern exactly, including the "no DB trigger" rule above — every UPDATE in
+    # diary_server.py sets updated_at=now() explicitly.
+    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE INDEX IF NOT EXISTS projects_deleted_idx ON projects(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    "ALTER TABLE milestones ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL",
+    "ALTER TABLE milestones ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+    "ALTER TABLE milestones ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS milestones_sync_id_idx ON milestones(sync_id)",
+    "CREATE INDEX IF NOT EXISTS milestones_deleted_idx ON milestones(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_sync_id_idx ON tasks(sync_id)",
+    "CREATE INDEX IF NOT EXISTS tasks_deleted_idx ON tasks(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    "ALTER TABLE logs ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL",
+    "ALTER TABLE logs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+    "ALTER TABLE logs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS logs_sync_id_idx ON logs(sync_id)",
+    "CREATE INDEX IF NOT EXISTS logs_deleted_idx ON logs(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL",
+    "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+    "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS reminders_sync_id_idx ON reminders(sync_id)",
+    "CREATE INDEX IF NOT EXISTS reminders_deleted_idx ON reminders(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    "ALTER TABLE wiki_pages ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL",
+    "ALTER TABLE wiki_pages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS wiki_pages_sync_id_idx ON wiki_pages(sync_id)",
+    "CREATE INDEX IF NOT EXISTS wiki_pages_deleted_idx ON wiki_pages(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    "ALTER TABLE errors_solutions ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid() NOT NULL",
+    "ALTER TABLE errors_solutions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+    "ALTER TABLE errors_solutions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS errors_solutions_sync_id_idx ON errors_solutions(sync_id)",
+    "CREATE INDEX IF NOT EXISTS errors_solutions_deleted_idx ON errors_solutions(deleted_at) WHERE deleted_at IS NOT NULL",
+
+    # memory_links: needs updated_at so the (from_path,to_path,rel_type)-matched sync
+    # in memory_sync() can LWW-merge note/link_origin edits, same rule as everywhere else.
+    "ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+
+    # trigger_keywords: deterministic keyword-based auto-injection (v0.9.0). Distinct
+    # from pin_triggers (session-start/compact lifecycle events) — these fire whenever
+    # an exact word-boundary keyword match shows up in the conversation (checked by the
+    # Stop hook diary_keyword_trigger.py against BOTH the user's and Claude's own text).
+    # Plain string/regex matching only — deliberately no embeddings/LLM involved, so this
+    # stays fast and free of semantic-similarity false positives. Set via memory_set_keywords().
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS trigger_keywords TEXT[] DEFAULT '{}'",
+    "CREATE INDEX IF NOT EXISTS memory_nodes_keywords_idx ON memory_nodes USING GIN(trigger_keywords) WHERE trigger_keywords <> '{}'",
 ]
 
 # Backfill parent_id from path for any unlinked nodes (idempotent self-heal).
