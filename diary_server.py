@@ -316,20 +316,37 @@ def get_projects(include_archived: bool = None) -> str:
         if not projects:
             return "Keine Projekte gefunden."
 
+        # Batch fetch milestones
+        project_ids = [p["id"] for p in projects]
+        milestones_all = conn.execute(
+            "SELECT project_id, completed FROM milestones WHERE project_id = ANY(%s) AND deleted_at IS NULL",
+            (project_ids,),
+        ).fetchall()
+        
+        milestones_by_project = {}
+        for m in milestones_all:
+            milestones_by_project.setdefault(m["project_id"], []).append(m)
+
+        # Batch fetch reminders
+        reminders_all = conn.execute(
+            "SELECT project_id, target_date, completed FROM reminders WHERE project_id = ANY(%s) AND deleted_at IS NULL",
+            (project_ids,),
+        ).fetchall()
+        
+        reminders_by_project = {}
+        for r in reminders_all:
+            reminders_by_project.setdefault(r["project_id"], []).append(r)
+
         result = ["Aktuelle Projekte im Diary:"]
         for p in projects:
-            milestones = conn.execute(
-                "SELECT completed FROM milestones WHERE project_id = %s AND deleted_at IS NULL", (p["id"],)
-            ).fetchall()
+            pid = p["id"]
+            milestones = milestones_by_project.get(pid, [])
             comp = 0.0
             if milestones:
                 comp_count = sum(1 for m in milestones if m["completed"])
                 comp = round((comp_count / len(milestones)) * 100, 1)
 
-            reminders = conn.execute(
-                "SELECT target_date, completed FROM reminders WHERE project_id = %s AND deleted_at IS NULL",
-                (p["id"],),
-            ).fetchall()
+            reminders = reminders_by_project.get(pid, [])
             due_count = sum(
                 1 for r in reminders if not r["completed"] and _is_reminder_due(r["target_date"])
             )
@@ -391,13 +408,21 @@ def get_project(project_name: str) -> str:
         res.append("\nMeilensteine & Aufgaben:")
         if not milestones:
             res.append("  (Keine)")
+        else:
+            milestone_ids = [m["id"] for m in milestones]
+            tasks_all = conn.execute(
+                "SELECT * FROM tasks WHERE milestone_id = ANY(%s) AND deleted_at IS NULL",
+                (milestone_ids,),
+            ).fetchall()
+            tasks_by_m = {}
+            for t in tasks_all:
+                tasks_by_m.setdefault(t["milestone_id"], []).append(t)
+
         for m in milestones:
             mark = "[x]" if m["completed"] else "[ ]"
             comp_date = f" (am {m['completed_at']})" if m["completed"] and m["completed_at"] else ""
             res.append(f"  M{m['id']}: {mark} {m['title']}{comp_date}")
-            for t in conn.execute(
-                "SELECT * FROM tasks WHERE milestone_id = %s AND deleted_at IS NULL", (m["id"],)
-            ).fetchall():
+            for t in tasks_by_m.get(m["id"], []):
                 t_mark = "[x]" if t["completed"] else "[ ]"
                 res.append(f"      T{t['id']}: {t_mark} {t['title']}")
 
@@ -2038,19 +2063,24 @@ def _sync_projects(local_conn, remote_conn) -> tuple[int, int]:
     local_by_name = {r["name"]: r for r in local_rows}
     remote_by_name = {r["name"]: r for r in remote_rows}
 
-    pushed = 0
+    pushed_data = []
     for name, r in local_by_name.items():
         o = remote_by_name.get(name)
         if o is None or r["updated_at"] > o["updated_at"]:
-            remote_conn.execute(insert_sql, values(r))
-            pushed += 1
-    pulled = 0
+            pushed_data.append(values(r))
+    if pushed_data:
+        with remote_conn.cursor() as cur:
+            cur.executemany(insert_sql, pushed_data)
+
+    pulled_data = []
     for name, r in remote_by_name.items():
         o = local_by_name.get(name)
         if o is None or r["updated_at"] > o["updated_at"]:
-            local_conn.execute(insert_sql, values(r))
-            pulled += 1
-    return pushed, pulled
+            pulled_data.append(values(r))
+    if pulled_data:
+        with local_conn.cursor() as cur:
+            cur.executemany(insert_sql, pulled_data)
+    return len(pushed_data), len(pulled_data)
 
 
 def _resolve_project_id_any(conn, name: str):
@@ -2095,25 +2125,42 @@ def _sync_project_child(local_conn, remote_conn, table: str, cols: tuple) -> tup
     local_by_id = {r["sync_id"]: r for r in local_rows}
     remote_by_id = {r["sync_id"]: r for r in remote_rows}
 
-    pushed = 0
+    remote_pid_cache = {}
+    def get_remote_pid(name):
+        if name not in remote_pid_cache:
+            remote_pid_cache[name] = _resolve_project_id_any(remote_conn, name)
+        return remote_pid_cache[name]
+
+    local_pid_cache = {}
+    def get_local_pid(name):
+        if name not in local_pid_cache:
+            local_pid_cache[name] = _resolve_project_id_any(local_conn, name)
+        return local_pid_cache[name]
+
+    pushed_data = []
     for sync_id, r in local_by_id.items():
         o = remote_by_id.get(sync_id)
         if o is None or r["updated_at"] > o["updated_at"]:
-            pid = _resolve_project_id_any(remote_conn, r["project_name"])
+            pid = get_remote_pid(r["project_name"])
             if pid is None:
                 continue  # parent project hasn't synced to this side (yet)
-            remote_conn.execute(insert_sql, values(r, pid))
-            pushed += 1
-    pulled = 0
+            pushed_data.append(values(r, pid))
+    if pushed_data:
+        with remote_conn.cursor() as cur:
+            cur.executemany(insert_sql, pushed_data)
+
+    pulled_data = []
     for sync_id, r in remote_by_id.items():
         o = local_by_id.get(sync_id)
         if o is None or r["updated_at"] > o["updated_at"]:
-            pid = _resolve_project_id_any(local_conn, r["project_name"])
+            pid = get_local_pid(r["project_name"])
             if pid is None:
                 continue
-            local_conn.execute(insert_sql, values(r, pid))
-            pulled += 1
-    return pushed, pulled
+            pulled_data.append(values(r, pid))
+    if pulled_data:
+        with local_conn.cursor() as cur:
+            cur.executemany(insert_sql, pulled_data)
+    return len(pushed_data), len(pulled_data)
 
 
 def _sync_tasks(local_conn, remote_conn) -> tuple[int, int]:
@@ -2144,25 +2191,42 @@ def _sync_tasks(local_conn, remote_conn) -> tuple[int, int]:
     local_by_id = {r["sync_id"]: r for r in local_rows}
     remote_by_id = {r["sync_id"]: r for r in remote_rows}
 
-    pushed = 0
+    remote_mid_cache = {}
+    def get_remote_mid(sync_id):
+        if sync_id not in remote_mid_cache:
+            remote_mid_cache[sync_id] = resolve_milestone_id(remote_conn, sync_id)
+        return remote_mid_cache[sync_id]
+
+    local_mid_cache = {}
+    def get_local_mid(sync_id):
+        if sync_id not in local_mid_cache:
+            local_mid_cache[sync_id] = resolve_milestone_id(local_conn, sync_id)
+        return local_mid_cache[sync_id]
+
+    pushed_data = []
     for sync_id, r in local_by_id.items():
         o = remote_by_id.get(sync_id)
         if o is None or r["updated_at"] > o["updated_at"]:
-            mid = resolve_milestone_id(remote_conn, r["milestone_sync_id"])
+            mid = get_remote_mid(r["milestone_sync_id"])
             if mid is None:
                 continue
-            remote_conn.execute(insert_sql, values(r, mid))
-            pushed += 1
-    pulled = 0
+            pushed_data.append(values(r, mid))
+    if pushed_data:
+        with remote_conn.cursor() as cur:
+            cur.executemany(insert_sql, pushed_data)
+
+    pulled_data = []
     for sync_id, r in remote_by_id.items():
         o = local_by_id.get(sync_id)
         if o is None or r["updated_at"] > o["updated_at"]:
-            mid = resolve_milestone_id(local_conn, r["milestone_sync_id"])
+            mid = get_local_mid(r["milestone_sync_id"])
             if mid is None:
                 continue
-            local_conn.execute(insert_sql, values(r, mid))
-            pulled += 1
-    return pushed, pulled
+            pulled_data.append(values(r, mid))
+    if pulled_data:
+        with local_conn.cursor() as cur:
+            cur.executemany(insert_sql, pulled_data)
+    return len(pushed_data), len(pulled_data)
 
 
 @mcp.tool()

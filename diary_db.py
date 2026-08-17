@@ -34,17 +34,21 @@ def get_remote_url() -> str | None:
     return os.environ.get("DIARY_REMOTE_URL")
 
 
+import threading
+
+_local = threading.local()
+
 @contextmanager
 def get_db() -> Generator:
-    conn = psycopg.connect(get_database_url(), row_factory=dict_row)
+    if not hasattr(_local, "conn") or getattr(_local.conn, "closed", True):
+        _local.conn = psycopg.connect(get_database_url(), row_factory=dict_row)
+    conn = _local.conn
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    finally:
-        conn.close()
 
 
 @contextmanager
