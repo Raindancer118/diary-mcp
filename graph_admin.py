@@ -450,3 +450,96 @@ def memory_report(scope_path: str = "") -> str:
             if a and b:
                 md.append(f"- {a['path']} ↔ {b['path']}")
     return "\n".join(md)
+
+
+@admin_mcp.tool()
+def memory_consolidate_report(
+    scope_path: str = "",
+    dup_threshold: float = 0.93,
+    stale_days: int = 180,
+    max_pairs: int = 20,
+) -> str:
+    """Findet Konsolidierungs-Kandidaten im kuratierten Memory-Tree: Near-Duplicate-
+    Paare (Merge-Kandidaten) und veraltete, kaum genutzte Nodes (Archivierungs-
+    Kandidaten). REIN LESEND — löscht/mergt nichts von selbst.
+
+    Motivation: memory_infer_links findet ähnliche Paare, aber verknüpft sie nur
+    (rel_type='related'); es gibt keine Möglichkeit, echte Near-Duplikate als
+    Merge-Kandidaten zu erkennen, und für den kuratierten Tier existiert (anders
+    als für 'extracted' mit seinem TTL) kein Verfall-Mechanismus — die kuratierte
+    Ebene wächst bei langfristigem Agentic Use unbegrenzt weiter, was Suchqualität
+    und -kosten schleichend verschlechtert.
+
+    NEAR-DUPLICATES: paarweiser Cosine-Vergleich (brute-force, wie memory_infer_links)
+    aller kuratierten, embedded Nodes unter scope_path (leer = ganzer Baum).
+    dup_threshold ist bewusst höher als memory_infer_links' Default (0.82) — hier
+    geht es um "praktisch dasselbe", nicht "thematisch verwandt". Ergebnis ist ein
+    Vorschlag für memory_merge(keep_path, merge_path), keine automatische Aktion.
+
+    STALE CANDIDATES: kuratierte Nodes mit importance <= 0.4, ohne aktives Pinning
+    (pin_triggers leer — gepinnte Nodes sind bewusst dauerhaft wichtig und werden
+    nie als veraltet vorgeschlagen), deren letzte Aktivität (accessed_at, ersatzweise
+    updated_at) älter als stale_days ist. Vorschlag: importance senken, aktualisieren
+    oder memory_delete.
+
+    max_pairs begrenzt beide Listen (Report-Länge, kein Sicherheitsmechanismus).
+    """
+    if not 0.0 < dup_threshold <= 1.0:
+        return "Fehler: dup_threshold muss zwischen 0.0 (exklusiv) und 1.0 liegen."
+
+    scope_clause = "AND (path = %s OR path LIKE %s)" if scope_path else ""
+    scope_params = [scope_path, f"{_escape_like(scope_path)}/%"] if scope_path else []
+
+    with diary_db.get_db() as conn:
+        embedded = conn.execute(
+            f"""SELECT id, path, title, embedding FROM memory_nodes
+                WHERE deleted_at IS NULL AND origin = 'curated' AND embedding IS NOT NULL
+                {scope_clause}""",
+            scope_params,
+        ).fetchall()
+
+        dup_pairs = []
+        if len(embedded) >= 2:
+            unit_vecs = [diary_embed.normalize(r["embedding"]) for r in embedded]
+            for i in range(len(embedded)):
+                for j in range(i + 1, len(embedded)):
+                    sim = diary_embed.dot(unit_vecs[i], unit_vecs[j])
+                    if sim >= dup_threshold:
+                        dup_pairs.append((sim, embedded[i], embedded[j]))
+            dup_pairs.sort(key=lambda p: p[0], reverse=True)
+            dup_pairs = dup_pairs[:max_pairs]
+
+        stale = conn.execute(
+            f"""SELECT path, title, importance, COALESCE(accessed_at, updated_at) AS last_touch
+                FROM memory_nodes
+                WHERE deleted_at IS NULL AND origin = 'curated' AND importance <= 0.4
+                  AND pin_triggers = '{{}}'
+                  AND COALESCE(accessed_at, updated_at) < now() - %s::interval
+                  {scope_clause}
+                ORDER BY last_touch ASC LIMIT %s""",
+            [f"{int(stale_days)} days", *scope_params, max_pairs] if scope_path
+            else [f"{int(stale_days)} days", max_pairs],
+        ).fetchall()
+
+    lines = [f"Konsolidierungs-Report — {scope_path or '/'} "
+             f"(dup_threshold={dup_threshold}, stale_days={stale_days}):"]
+
+    lines.append(f"\n## Near-Duplicates ({len(dup_pairs)})")
+    if dup_pairs:
+        for sim, a, b in dup_pairs:
+            lines.append(f"  [{sim:.3f}] {a['path']} ({a['title']}) ↔ {b['path']} ({b['title']})"
+                         f"  — z.B. memory_merge('{a['path']}', '{b['path']}')")
+    else:
+        reason = "zu wenige embedded Nodes" if len(embedded) < 2 else "keine über dup_threshold"
+        lines.append(f"  (keine — {reason})")
+
+    lines.append("\n## Stale Candidates ({}, importance<=0.4, ungepinnt, >{}d inaktiv)".format(
+        len(stale), stale_days))
+    if stale:
+        for r in stale:
+            lines.append(f"  {r['path']} ({r['title']}) — importance {r['importance']}, "
+                         f"zuletzt aktiv {r['last_touch']}")
+    else:
+        lines.append("  (keine)")
+
+    return "\n".join(lines)

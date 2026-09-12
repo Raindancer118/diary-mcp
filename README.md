@@ -114,11 +114,11 @@ Register in `settings.json` (see `~/.claude/hooks/` for the actual scripts):
 | `memory_pin(path, on_start, on_compact)` | Mark memory for auto-injection |
 | `memory_link(from_path, to_path, rel_type)` | Create a knowledge-graph link |
 | `memory_sync()` | Bidirectional sync via SSH tunnel |
-| `memory_health()` | Report expired, empty, or contradicting nodes |
 | `memory_promote(path)` | Promote extracted memory to curated |
+| `memory_merge(keep_path, merge_path)` | Fold a curated duplicate/near-duplicate into another node (body append, embedding refresh, link repoint), then tombstone it |
 | `memory_purge_tombstones(older_than_days)` | Clean up soft-deleted nodes |
 
-Knowledge-graph introspection/maintenance tools (`memory_explain`, `memory_path`, `memory_graph_stats`, `memory_infer_links`, `memory_query_graph`, `memory_report`) live on the separate `diary-admin-mcp` entry point, not on the main server — see Architecture.
+Knowledge-graph introspection/maintenance tools (`memory_explain`, `memory_path`, `memory_graph_stats`, `memory_infer_links`, `memory_query_graph`, `memory_report`, `memory_consolidate_report`) live on the separate `diary-admin-mcp` entry point, not on the main server — see Architecture. `memory_consolidate_report` surfaces near-duplicate curated pairs (merge candidates for `memory_merge`) and stale, low-importance, unpinned nodes (archive/prune candidates) — a read-only report, no automatic deletion or merging.
 
 ## Environment variables
 

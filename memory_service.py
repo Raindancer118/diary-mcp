@@ -468,6 +468,101 @@ def memory_delete(path: str) -> str:
 
 
 @mcp.tool()
+def memory_merge(keep_path: str, merge_path: str) -> str:
+    """Führt zwei kuratierte Memory-Nodes zusammen: merge_path wird in keep_path
+    eingefaltet und danach als Tombstone gelöscht (memory_delete-Semantik, kein
+    Kaskadieren auf Kinder von merge_path — für Merges gedacht, nicht für
+    Teilbäume). Gegenstück zu memory_consolidate_report's Near-Duplicate-Vorschlägen:
+    dieses Tool führt die Zusammenführung explizit aus (keine automatische Aktion).
+
+    Ablauf:
+      1. merge_path's body wird unter einem Trenner an keep_path's body angehängt
+         (kein Content-Verlust; bei echten Duplikaten entsteht dadurch Redundanz,
+         die man danach manuell kürzen kann — sicherer als automatisch zu deduplizieren).
+      2. keep_path's Embedding wird aus dem neuen, kombinierten Text neu berechnet.
+      3. Alle Links, die auf merge_path zeigten, werden auf keep_path umgehängt
+         (sonst würde der Graph nach dem Tombstone Links auf einen gelöschten
+         Node zeigen); bereits existierende identische Links auf keep_path werden
+         nicht dupliziert.
+      4. merge_path wird per Tombstone gelöscht (wie memory_delete).
+    """
+    if keep_path == merge_path:
+        return "Fehler: keep_path und merge_path dürfen nicht identisch sein."
+
+    with diary_db.get_db() as conn:
+        keep = conn.execute(
+            "SELECT id, title, body FROM memory_nodes WHERE path = %s AND deleted_at IS NULL",
+            (keep_path,),
+        ).fetchone()
+        if not keep:
+            return f"Ziel-Node '{keep_path}' nicht gefunden."
+        merge = conn.execute(
+            "SELECT id, title, body FROM memory_nodes WHERE path = %s AND deleted_at IS NULL",
+            (merge_path,),
+        ).fetchone()
+        if not merge:
+            return f"Quell-Node '{merge_path}' nicht gefunden."
+
+        combined_body = (
+            f"{keep['body'] or ''}\n\n--- merged from {merge_path} ({merge['title']}) ---\n"
+            f"{merge['body'] or ''}"
+        ).strip()
+        new_embedding = diary_embed.embed(f"{keep['title']}\n{combined_body}")
+
+        conn.execute(
+            "UPDATE memory_nodes SET body = %s, embedding = %s, updated_at = now() WHERE id = %s",
+            (combined_body, new_embedding, keep["id"]),
+        )
+        _refresh_vector(conn, keep_path, new_embedding)
+
+        # Repoint merge_path's links onto keep_path instead of leaving them
+        # dangling on a soon-to-be-tombstoned node. Skip self-loops (a link
+        # between merge_path and keep_path itself) and exact duplicates of a
+        # link keep_path already has.
+        outgoing = conn.execute(
+            "SELECT id, to_id, rel_type FROM memory_links WHERE from_id = %s", (merge["id"],)
+        ).fetchall()
+        for l in outgoing:
+            if l["to_id"] == keep["id"]:
+                conn.execute("DELETE FROM memory_links WHERE id = %s", (l["id"],))
+                continue
+            conn.execute(
+                "UPDATE memory_links SET from_id = %s WHERE id = %s "
+                "AND NOT EXISTS (SELECT 1 FROM memory_links "
+                "WHERE from_id = %s AND to_id = %s AND rel_type = %s)",
+                (keep["id"], l["id"], keep["id"], l["to_id"], l["rel_type"]),
+            )
+        incoming = conn.execute(
+            "SELECT id, from_id, rel_type FROM memory_links WHERE to_id = %s", (merge["id"],)
+        ).fetchall()
+        for l in incoming:
+            if l["from_id"] == keep["id"]:
+                conn.execute("DELETE FROM memory_links WHERE id = %s", (l["id"],))
+                continue
+            conn.execute(
+                "UPDATE memory_links SET to_id = %s WHERE id = %s "
+                "AND NOT EXISTS (SELECT 1 FROM memory_links "
+                "WHERE from_id = %s AND to_id = %s AND rel_type = %s)",
+                (keep["id"], l["id"], l["from_id"], keep["id"], l["rel_type"]),
+            )
+        # Any repoint that hit the NOT EXISTS guard (duplicate) leaves the old
+        # row pointing at merge_path — clean those up so no link references
+        # the soon-to-be-tombstoned node.
+        conn.execute(
+            "DELETE FROM memory_links WHERE from_id = %s OR to_id = %s",
+            (merge["id"], merge["id"]),
+        )
+
+        conn.execute(
+            "UPDATE memory_nodes SET deleted_at = now(), updated_at = now() WHERE id = %s",
+            (merge["id"],),
+        )
+
+    return (f"'{merge_path}' in '{keep_path}' gemergt (Body angehängt, Embedding neu berechnet, "
+            f"Links umgehängt) und als Tombstone gelöscht.")
+
+
+@mcp.tool()
 def memory_purge_tombstones(older_than_days: int = 30) -> str:
     """Entfernt endgültig (HARD-DELETE) alle Tombstones, deren Löschung älter als N Tage ist.
 

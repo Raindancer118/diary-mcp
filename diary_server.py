@@ -61,7 +61,7 @@ from diary_project_tools import (  # noqa: E402,F401
 # --- Re-exports: memory_service -----------------------------------------------
 from memory_service import (  # noqa: E402,F401
     memory_context, memory_tree, memory_get, memory_upsert, memory_save_extracted,
-    memory_promote, memory_prune_extracted, memory_delete, memory_purge_tombstones,
+    memory_promote, memory_prune_extracted, memory_delete, memory_merge, memory_purge_tombstones,
     memory_set_importance, memory_pin, memory_unpin, memory_project_context,
     memory_set_project_config, memory_get_project_config,
     memory_set_project_dir, memory_unset_project_dir,
@@ -77,7 +77,7 @@ from graph_core import memory_link, memory_get_links  # noqa: E402,F401
 # --- Re-exports: graph_admin (plain functions, NOT tools on this server) ------
 from graph_admin import (  # noqa: E402,F401
     memory_infer_links, memory_explain, memory_path, memory_graph_stats,
-    memory_query_graph, memory_report,
+    memory_query_graph, memory_report, memory_consolidate_report,
 )
 
 # --- Re-exports: sync_manager --------------------------------------------------

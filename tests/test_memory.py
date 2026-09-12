@@ -1493,3 +1493,110 @@ class TestMemoryRecall:
 #     stays in the schema (no destructive migration on the live synced DB),
 #     but the tools are gone; there is nothing left to unit-test at this layer.
 # ===========================================================================
+
+
+# ===========================================================================
+# 20. Consolidation/decay for the curated tier (v0.12.0): memory_infer_links
+#     already finds semantically-similar pairs but only ever *links* them —
+#     nothing ever flagged near-duplicates as merge candidates or surfaced
+#     stale, low-value curated nodes. Long-running agentic use grows the
+#     curated tree indefinitely with no equivalent of the extracted tier's
+#     TTL/prune lifecycle, degrading search quality/cost over time.
+# ===========================================================================
+
+class TestMemoryConsolidateReport:
+    def _node_with_vec(self, path, vec, title="T", body="B", importance=0.5):
+        import diary_server
+        with patch("diary_embed.embed", return_value=vec):
+            diary_server.memory_upsert(path=path, title=title, body=body, importance=importance)
+
+    def _age_node(self, path, days):
+        """Backdate accessed_at/updated_at directly (bypassing the tool layer,
+        which always stamps now())."""
+        conn = _local_conn()
+        try:
+            conn.execute(
+                "UPDATE memory_nodes SET accessed_at = now() - %s::interval, "
+                "updated_at = now() - %s::interval WHERE path = %s",
+                (f"{days} days", f"{days} days", path),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_flags_near_duplicate_pair(self):
+        vec = [0.3] * 384
+        self._node_with_vec("/user/cons-dup-a", vec, title="DupA")
+        self._node_with_vec("/user/cons-dup-b", vec, title="DupB")
+        import diary_server
+        result = diary_server.memory_consolidate_report()
+        assert "cons-dup-a" in result and "cons-dup-b" in result
+
+    def test_does_not_flag_dissimilar_pair_as_duplicate(self):
+        half = 192
+        vec_a = [1.0] * half + [0.0] * half
+        vec_b = [0.0] * half + [1.0] * half
+        self._node_with_vec("/user/cons-diff-a", vec_a, title="DiffA", importance=0.9)
+        self._node_with_vec("/user/cons-diff-b", vec_b, title="DiffB", importance=0.9)
+        import diary_server
+        result = diary_server.memory_consolidate_report(dup_threshold=0.95)
+        # Both nodes exist but must not be reported as a duplicate pair together.
+        dup_section = result.split("Stale")[0]
+        assert not ("cons-diff-a" in dup_section and "cons-diff-b" in dup_section)
+
+    def test_flags_stale_low_importance_node(self):
+        self._node_with_vec("/user/cons-stale", [0.1] * 384, title="StaleNode", importance=0.2)
+        self._age_node("/user/cons-stale", days=200)
+        import diary_server
+        result = diary_server.memory_consolidate_report(stale_days=180)
+        assert "cons-stale" in result
+
+    def test_pinned_node_excluded_from_stale(self):
+        self._node_with_vec("/user/cons-pinned", [0.15] * 384, title="PinnedNode", importance=0.1)
+        self._age_node("/user/cons-pinned", days=200)
+        import diary_server
+        diary_server.memory_pin("/user/cons-pinned", on_start=True)
+        result = diary_server.memory_consolidate_report(stale_days=180)
+        assert "cons-pinned" not in result
+
+    def test_recent_low_importance_node_not_stale(self):
+        self._node_with_vec("/user/cons-fresh", [0.12] * 384, title="FreshNode", importance=0.1)
+        import diary_server
+        result = diary_server.memory_consolidate_report(stale_days=180)
+        assert "cons-fresh" not in result
+
+
+class TestMemoryMerge:
+    def test_merge_appends_body_and_tombstones_source(self):
+        import diary_server
+        _upsert("/user/merge-keep", title="Keep", body="Original keep body.")
+        _upsert("/user/merge-src", title="Src", body="Distinct source body content.")
+        result = diary_server.memory_merge("/user/merge-keep", "/user/merge-src")
+        assert "merge-src" in result
+        kept = _get_node("/user/merge-keep")
+        assert "Original keep body." in kept["body"]
+        assert "Distinct source body content." in kept["body"]
+        source = _get_node("/user/merge-src")
+        assert source["deleted_at"] is not None
+
+    def test_merge_repoints_links_to_survivor(self):
+        import diary_server
+        _upsert("/user/merge-keep2", title="Keep2", body="keep body")
+        _upsert("/user/merge-src2", title="Src2", body="src body")
+        _upsert("/user/merge-neighbor", title="Neighbor", body="neighbor body")
+        diary_server.memory_link("/user/merge-src2", "/user/merge-neighbor", rel_type="derived_from")
+        diary_server.memory_merge("/user/merge-keep2", "/user/merge-src2")
+        links = diary_server.memory_get_links("/user/merge-keep2")
+        assert "merge-neighbor" in links
+
+    def test_merge_source_not_found(self):
+        import diary_server
+        _upsert("/user/merge-keep3", title="Keep3", body="b")
+        result = diary_server.memory_merge("/user/merge-keep3", "/user/does-not-exist-merge-src")
+        assert "nicht gefunden" in result
+
+    def test_merge_keep_not_found(self):
+        import diary_server
+        _upsert("/user/merge-src4", title="Src4", body="b")
+        result = diary_server.memory_merge("/user/does-not-exist-merge-keep", "/user/merge-src4")
+        assert "nicht gefunden" in result
