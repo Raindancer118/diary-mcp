@@ -153,10 +153,8 @@ calls only in this phase (no automatic background sync). Verified end-to-end
 against a real running diary-relay with two separate diary-mcp processes
 (not just mocked tests) during development.
 
-**Not yet deployed to production** — diary-relay needs a Dorn port +
-firewall rule + Saphira reverse-proxy host before it's reachable by anyone
-outside `localhost`; see the plan doc for the exact steps, gated on explicit
-go-ahead since it touches shared production infrastructure.
+**Live at https://diary-relay.tstieh.de** (deployed 12.09.2026) — pass this
+URL as `relay_url` to `diary_link_init`.
 
 ## Memory tools
 
