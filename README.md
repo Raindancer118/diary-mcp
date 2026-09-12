@@ -113,6 +113,21 @@ Two complementary mechanisms keep the knowledge graph populated without a manual
 
   Deployed locally as a systemd user timer (daily, 04:30): `~/.config/systemd/user/diary-link-inference.{service,timer}`, enabled via `systemctl --user enable --now diary-link-inference.timer`. Output/errors log to `~/.local/share/diary-link-inference.log`.
 
+## Backup export (v0.14.0)
+
+`scripts/memory_backup_export.py` mirrors every curated node as a Markdown file (frontmatter: title, type, tags, importance, valid_until, pin_triggers, updated_at) into a separate, private git repo — [diary-mcp-backup](https://github.com/Raindancer118/diary-mcp-backup) — giving a human-readable, diffable point-in-time backup independent of Postgres. Wipes and rewrites the whole `memory-tree/` directory each run so deletions show up as real diffs; commits + pushes only when something changed.
+
+```
+BACKUP_REPO_DIR=~/Projekte/SEProjects/diary-mcp-backup \
+  ~/.local/share/uv/tools/diary-mcp/bin/python scripts/memory_backup_export.py
+```
+
+Deployed locally as a systemd user timer (daily, 04:00, i.e. before the link-inference timer): `~/.config/systemd/user/diary-memory-backup.{service,timer}`. Log: `~/.local/share/diary-memory-backup.log`.
+
+## Tag lookup
+
+`memory_list_by_tag(tag, include_extracted=False)` — the `tags` column (settable since the original schema via `memory_upsert(tags=...)`) was write-only until v0.14.0; this queries curated nodes by exact tag match.
+
 ## Memory tools
 
 | Tool | Purpose |
@@ -125,6 +140,7 @@ Two complementary mechanisms keep the knowledge graph populated without a manual
 | `memory_context()` | Session start: tree + recently changed nodes |
 | `memory_project_context(slug)` | Load auto-inject memories for a project |
 | `memory_tree(path)` | Compact hierarchy from a given path |
+| `memory_list_by_tag(tag)` | Exact-match lookup of curated memories by tag |
 | `memory_pin(path, on_start, on_compact)` | Mark memory for auto-injection |
 | `memory_link(from_path, to_path, rel_type)` | Create a knowledge-graph link |
 | `memory_sync()` | Bidirectional sync via SSH tunnel |

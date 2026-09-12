@@ -1685,3 +1685,47 @@ class TestAutoLinkOnUpsert:
         import diary_server
         result = diary_server.memory_explain("/user/al-cap-new")
         assert result.count("-->") <= memory_service.AUTO_LINK_MAX_NEW
+
+
+# ===========================================================================
+# 22. Tag-based lookup (v0.14.0): the `tags` column existed since the original
+#     schema and memory_upsert already accepted a comma-separated tags string,
+#     but nothing could ever query by tag afterwards — tags were write-only.
+# ===========================================================================
+
+class TestMemoryListByTag:
+    def test_lists_nodes_with_tag(self):
+        import diary_server
+        _upsert("/user/tag-a", title="TagA", body="a", tags="sharing,project-x")
+        _upsert("/user/tag-b", title="TagB", body="b", tags="project-x")
+        _upsert("/user/tag-c", title="TagC", body="c", tags="other")
+        result = diary_server.memory_list_by_tag("project-x")
+        assert "tag-a" in result and "tag-b" in result
+        assert "tag-c" not in result
+
+    def test_no_match_returns_friendly_message(self):
+        import diary_server
+        result = diary_server.memory_list_by_tag("no-such-tag-xyz")
+        assert isinstance(result, str)
+        assert "tag-a" not in result
+
+    def test_excludes_extracted_by_default(self):
+        import diary_server
+        _upsert("/user/tag-extracted", title="TagExtracted", body="e",
+                tags="sharing", origin="extracted")
+        result = diary_server.memory_list_by_tag("sharing")
+        assert "tag-extracted" not in result
+
+    def test_includes_extracted_when_requested(self):
+        import diary_server
+        _upsert("/user/tag-extracted2", title="TagExtracted2", body="e",
+                tags="sharing2", origin="extracted")
+        result = diary_server.memory_list_by_tag("sharing2", include_extracted=True)
+        assert "tag-extracted2" in result
+
+    def test_excludes_tombstoned(self):
+        import diary_server
+        _upsert("/user/tag-deleted", title="TagDeleted", body="d", tags="deltag")
+        diary_server.memory_delete("/user/tag-deleted")
+        result = diary_server.memory_list_by_tag("deltag")
+        assert "tag-deleted" not in result

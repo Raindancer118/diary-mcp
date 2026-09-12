@@ -186,6 +186,33 @@ def memory_tree(path: str = "/", include_extracted: bool = False) -> str:
 
 
 @mcp.tool()
+def memory_list_by_tag(tag: str, include_extracted: bool = False) -> str:
+    """Listet alle Memory-Nodes mit einem bestimmten Tag.
+
+    Der `tags`-Spalte konnte man Werte schon immer beim Anlegen mitgeben
+    (memory_upsert(tags=...)), aber es gab bisher keine Möglichkeit, danach
+    gezielt danach zu filtern — tags waren write-only. Exakter Tag-Match
+    (keine Teilstring-/Fuzzy-Suche); für inhaltliche Suche memory_search nutzen.
+    """
+    origin_clause = "" if include_extracted else "AND origin = 'curated'"
+    with diary_db.get_db() as conn:
+        nodes = conn.execute(
+            f"SELECT path, type, title, importance, updated_at FROM memory_nodes "
+            f"WHERE deleted_at IS NULL {origin_clause} AND %s = ANY(tags) ORDER BY path",
+            (tag,),
+        ).fetchall()
+
+    if not nodes:
+        scope = "alle Tiers" if include_extracted else "kuratiert"
+        return f"Keine Memory-Nodes mit Tag '{tag}' gefunden ({scope})."
+
+    lines = [f"Memory-Nodes mit Tag '{tag}' ({len(nodes)}):"]
+    for n in nodes:
+        lines.append(f"  [{n['type']}] {n['path']} — {n['title']} (importance {n['importance']})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def memory_get(path: str) -> str:
     """Gibt den vollen Inhalt eines Memory-Nodes zurück und trackt den Zugriff."""
     with diary_db.get_db() as conn:

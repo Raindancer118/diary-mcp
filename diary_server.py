@@ -60,7 +60,7 @@ from diary_project_tools import (  # noqa: E402,F401
 
 # --- Re-exports: memory_service -----------------------------------------------
 from memory_service import (  # noqa: E402,F401
-    memory_context, memory_tree, memory_get, memory_upsert, memory_save_extracted,
+    memory_context, memory_tree, memory_list_by_tag, memory_get, memory_upsert, memory_save_extracted,
     memory_promote, memory_prune_extracted, memory_delete, memory_merge, memory_purge_tombstones,
     memory_set_importance, memory_pin, memory_unpin, memory_project_context,
     memory_set_project_config, memory_get_project_config,
