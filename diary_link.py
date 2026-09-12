@@ -29,6 +29,32 @@ import diary_db
 from diary_bootstrap import mcp
 from memory_service import memory_upsert
 
+# Incoming memories come from a paired peer (authenticated by Box decryption
+# succeeding), but the CONTENT of that decrypted JSON is still untrusted —
+# a buggy or malicious peer could try to point `path` outside the /links/<alias>/
+# namespace. _sanitize_incoming_path rejects anything that isn't a clean,
+# traversal-free absolute path; alias itself is locally chosen (not
+# peer-controlled) but gets the same treatment as defense-in-depth.
+_VALID_MEMORY_TYPES = {"user", "feedback", "project", "reference", "note", "category"}
+_MAX_TITLE_LEN = 500
+_MAX_BODY_LEN = 200_000
+
+
+def _is_safe_path_segment(alias_or_segment: str) -> bool:
+    return bool(alias_or_segment) and alias_or_segment not in (".", "..") and "/" not in alias_or_segment
+
+
+def _sanitize_incoming_path(alias: str, raw_path) -> str | None:
+    """Builds the local /links/<alias>/... path for a peer-supplied path,
+    returning None if it isn't a clean, traversal-free absolute path (empty,
+    missing leading slash, or containing '.'/'..' segments)."""
+    if not isinstance(raw_path, str) or not raw_path.startswith("/"):
+        return None
+    segments = raw_path.split("/")[1:]  # raw_path starts with '/', so [0] is always ''
+    if not segments or any(not _is_safe_path_segment(s) for s in segments):
+        return None
+    return f"/links/{alias}/" + "/".join(segments)
+
 
 def _relay_post(relay_url: str, path: str, token: str | None = None, json_body: dict | None = None) -> dict:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -111,6 +137,8 @@ def diary_link_redeem_pairing_code(code: str, alias: str) -> str:
     """Löst einen von der anderen Person geteilten Pairing-Code ein und legt die
     Verknüpfung lokal unter `alias` an (frei wählbarer Name, z.B. der Vorname
     der Person — muss lokal eindeutig sein)."""
+    if not _is_safe_path_segment(alias):
+        return "Alias darf kein '/', '.' oder '..' enthalten und nicht leer sein."
     with diary_db.get_db() as conn:
         identity = _get_identity(conn)
         if not identity:
@@ -138,6 +166,8 @@ def diary_link_check_pairing_code(code: str, alias: str) -> str:
     Verknüpfung lokal unter `alias` an — Gegenstück zu diary_link_redeem_pairing_code
     für die Seite, die den Code ERSTELLT hat: der Redeemer erfährt link_id/Peer-Info
     direkt aus der Redeem-Antwort, die Ersteller-Seite muss aktiv nachfragen."""
+    if not _is_safe_path_segment(alias):
+        return "Alias darf kein '/', '.' oder '..' enthalten und nicht leer sein."
     with diary_db.get_db() as conn:
         identity = _get_identity(conn)
         if not identity:
@@ -218,9 +248,19 @@ def diary_link_sync(alias: str, tag: str) -> str:
         for msg in pulled["messages"]:
             plaintext = box.decrypt(_unb64(msg["ciphertext"]))
             data = json.loads(plaintext)
-            local_path = f"/links/{alias}{data['path']}"
-            memory_upsert(path=local_path, title=data["title"], body=data.get("body") or "",
-                          type=data.get("type", "note"), tags=f"from:{alias}")
+            # `data` was authenticated by successful Box decryption (it did come
+            # from the paired peer), but its CONTENT is still untrusted — a
+            # buggy or malicious peer could try to point `path` outside the
+            # /links/<alias>/ namespace (e.g. '/../feedback/x') or send an
+            # oversized payload. Skip anything that doesn't check out rather
+            # than let one bad message break the whole sync.
+            local_path = _sanitize_incoming_path(alias, data.get("path"))
+            if local_path is None:
+                continue
+            node_type = data.get("type") if data.get("type") in _VALID_MEMORY_TYPES else "note"
+            title = str(data.get("title") or "")[:_MAX_TITLE_LEN]
+            body = str(data.get("body") or "")[:_MAX_BODY_LEN]
+            memory_upsert(path=local_path, title=title, body=body, type=node_type, tags=f"from:{alias}")
             received += 1
 
         conn.execute("UPDATE diary_links SET last_synced_at = now() WHERE id = %s", (link["id"],))

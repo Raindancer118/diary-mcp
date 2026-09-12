@@ -1963,3 +1963,62 @@ class TestDiaryLink:
         assert row is not None
         assert bytes(row["peer_public_key"]) == bob_pub
         assert row["relay_link_id"] == "relay-link-abc"
+
+    def test_redeem_rejects_alias_with_path_separator(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        with patch("diary_link._relay_post") as m:
+            result = diary_link.diary_link_redeem_pairing_code("SOMECODE", "../evil")
+        assert "Alias" in result
+        m.assert_not_called()
+
+    def _sync_with_incoming_path(self, incoming_path):
+        """Set up Alice + a 'bob' link, then run diary_link_sync with a single
+        crafted incoming message whose decrypted payload has `incoming_path`."""
+        import diary_link
+        import base64
+        from nacl.public import PrivateKey, PublicKey, Box
+
+        bob_priv = PrivateKey.generate()
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        alice_pub_bytes = bytes(self._identity_row()["public_key"])
+        self._insert_link("bob", bytes(bob_priv.public_key), peer_display_name="Bob",
+                           relay_link_id="relay-link-mal")
+
+        box = Box(bob_priv, PublicKey(alice_pub_bytes))
+        payload = json.dumps({"path": incoming_path, "title": "Evil", "body": "x", "type": "note"}).encode()
+        ciphertext = base64.b64encode(bytes(box.encrypt(payload))).decode()
+
+        def fake_relay_get(relay_url, path, token, params=None):
+            return {"messages": [{"message_id": "mx", "ciphertext": ciphertext, "created_at": "2026-01-01T00:00:00+00:00"}]}
+
+        with patch("diary_link._relay_post", return_value={"message_id": "m1", "created_at": "x"}), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get), \
+             patch("diary_embed.embed", return_value=None):
+            return diary_link.diary_link_sync("bob", "no-such-tag-so-nothing-pushed")
+
+    def test_sync_rejects_dotdot_path_traversal(self):
+        result = self._sync_with_incoming_path("/../../feedback/evil-injected")
+        assert "0 empfangen" in result
+        assert _get_node("/feedback/evil-injected") is None
+        conn = _local_conn()
+        try:
+            rows = conn.execute("SELECT path FROM memory_nodes WHERE path LIKE %s", ("%evil%",)).fetchall()
+        finally:
+            conn.close()
+        assert rows == []
+
+    def test_sync_rejects_path_missing_leading_slash(self):
+        result = self._sync_with_incoming_path("no-leading-slash")
+        assert "0 empfangen" in result
+
+    def test_sync_rejects_empty_path(self):
+        result = self._sync_with_incoming_path("")
+        assert "0 empfangen" in result
+
+    def test_sync_accepts_normal_path(self):
+        result = self._sync_with_incoming_path("/notes/ok")
+        assert "1 empfangen" in result
+        assert _get_node("/links/bob/notes/ok") is not None
