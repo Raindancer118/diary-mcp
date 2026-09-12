@@ -1,6 +1,6 @@
 [project]
 name = "diary-mcp"
-version = "0.9.0"
+version = "0.11.0"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,8 +13,9 @@ dependencies = [
 ]
 
 [project.scripts]
-diary-mcp      = "diary_server:main"
-diary-web      = "diary_web:main"
+diary-mcp       = "diary_server:main"
+diary-admin-mcp = "diary_admin_server:main"
+diary-web       = "diary_web:main"
 
 [project.optional-dependencies]
 dev = [
@@ -23,7 +24,12 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["diary_server", "diary_db", "diary_config", "diary_logger", "diary_http_receiver", "diary_web", "diary_embed"]
+py-modules = [
+    "diary_server", "diary_bootstrap", "diary_project_tools", "memory_service",
+    "search_engine", "graph_core", "graph_admin", "diary_admin_bootstrap",
+    "diary_admin_server", "sync_manager",
+    "diary_db", "diary_config", "diary_logger", "diary_http_receiver", "diary_web", "diary_embed",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

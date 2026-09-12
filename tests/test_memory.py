@@ -1344,77 +1344,152 @@ class TestMemoryLinksSync:
 
 
 # ===========================================================================
-# 17. Keyword-trigger auto-injection (v0.9.0) — deterministic, no embeddings/LLM.
-#     memory_set_keywords() sets trigger_keywords; memory_check_triggers()
-#     matches a text against them with strict word-boundary regex.
+# 17. Extracted-tier tripwire (v0.10.0): even in default (curated-only) search,
+#     a near-duplicate hit in the extracted tier (cosine >= 0.85) is surfaced
+#     as a distinct "Sicherheitsnetz" block, without polluting normal ranking.
 # ===========================================================================
 
-class TestKeywordTriggers:
-    def test_set_keywords_returns_confirmation(self):
+class TestExtractedTripwire:
+    def test_near_duplicate_extracted_memory_surfaces_as_tripwire(self):
         import diary_server
 
-        _upsert("/user/kw-set", title="T", body="B")
-        result = diary_server.memory_set_keywords("/user/kw-set", "npm plus admin, foo-bar")
-        assert "npm plus admin" in result
-        assert "foo-bar" in result
+        near_dup_vec = [1.0] + [0.0] * 383
+        with patch("diary_embed.embed", return_value=near_dup_vec):
+            diary_server.memory_save_extracted(
+                "/user/tripwire-near-dup", "Tripwire Near Dup",
+                "Sehr aehnlicher Inhalt aus einer frueheren Session.",
+            )
+            result = diary_server.memory_search("QueryThatMatchesNothingViaFTS12345")
 
-    def test_set_keywords_missing_node_reports_not_found(self):
+        assert "Sicherheitsnetz" in result
+        assert "/user/tripwire-near-dup" in result
+
+    def test_dissimilar_extracted_memory_does_not_surface_as_tripwire(self):
         import diary_server
 
-        result = diary_server.memory_set_keywords("/user/does-not-exist-kw", "x")
-        assert "nicht gefunden" in result
+        far_vec = [0.0, 1.0] + [0.0] * 382
+        with patch("diary_embed.embed", return_value=far_vec):
+            diary_server.memory_save_extracted(
+                "/user/tripwire-far", "Tripwire Far", "Voellig anderer Inhalt."
+            )
 
-    def test_empty_keywords_clears_them(self):
+        near_dup_vec = [1.0] + [0.0] * 383
+        with patch("diary_embed.embed", return_value=near_dup_vec):
+            result = diary_server.memory_search("QueryThatMatchesNothingViaFTS99999")
+
+        assert "/user/tripwire-far" not in result
+
+    def test_tripwire_not_shown_when_include_extracted_true(self):
+        """include_extracted=True already searches the extracted tier directly —
+        the tripwire block would be a redundant, confusing second listing."""
         import diary_server
 
-        _upsert("/user/kw-clear", title="T", body="B")
-        diary_server.memory_set_keywords("/user/kw-clear", "something")
-        result = diary_server.memory_set_keywords("/user/kw-clear", "")
-        assert "entfernt" in result
-        node = _get_node("/user/kw-clear")
-        assert node["trigger_keywords"] == []
+        near_dup_vec = [1.0] + [0.0] * 383
+        with patch("diary_embed.embed", return_value=near_dup_vec):
+            diary_server.memory_save_extracted(
+                "/user/tripwire-incl", "Tripwire Incl UniqueZYX", "Inhalt."
+            )
+            result = diary_server.memory_search("Tripwire Incl UniqueZYX", include_extracted=True)
 
-    def test_check_triggers_exact_phrase_match(self):
+        assert "Sicherheitsnetz" not in result
+
+
+# ===========================================================================
+# 18. Just-in-time contradiction surfacing (v0.10.0): a 'contradicts' link is
+#     now shown inline on memory_get() and memory_search() for the affected
+#     node(s), instead of only being visible via a manual memory_health() run.
+# ===========================================================================
+
+class TestContradictionSurfacing:
+    def test_memory_get_shows_contradiction_warning(self):
         import diary_server
 
-        _upsert("/user/kw-match", title="NPM Plus Admin Doku", body="So funktioniert es.")
-        diary_server.memory_set_keywords("/user/kw-match", "npm plus admin")
+        _upsert("/user/contra-a", title="Contra A", body="Aussage A")
+        _upsert("/user/contra-b", title="Contra B", body="Aussage B")
+        diary_server.memory_link("/user/contra-a", "/user/contra-b", rel_type="contradicts")
 
-        result = diary_server.memory_check_triggers("Wie richte ich NPM Plus Admin ein?")
-        assert "/user/kw-match" in result
-        assert "So funktioniert es." in result
+        result = diary_server.memory_get("/user/contra-a")
+        assert "WIDERSPRUCH" in result
+        assert "/user/contra-b" in result
 
-    def test_check_triggers_is_case_insensitive(self):
+    def test_memory_get_no_warning_without_contradiction(self):
         import diary_server
 
-        _upsert("/user/kw-case", title="Case Test", body="Inhalt")
-        diary_server.memory_set_keywords("/user/kw-case", "DeployTarget")
+        _upsert("/user/no-contra", title="No Contra", body="Aussage")
+        result = diary_server.memory_get("/user/no-contra")
+        assert "WIDERSPRUCH" not in result
 
-        result = diary_server.memory_check_triggers("bitte den deploytarget pruefen")
-        assert "/user/kw-case" in result
-
-    def test_check_triggers_no_match_returns_empty(self):
+    def test_memory_search_shows_contradiction_warning(self):
         import diary_server
 
-        _upsert("/user/kw-nomatch", title="No Match", body="Inhalt")
-        diary_server.memory_set_keywords("/user/kw-nomatch", "very-specific-term")
+        _upsert("/user/search-contra-a", title="SearchContraUniqueXYZ", body="Aussage A")
+        _upsert("/user/search-contra-b", title="Contra B other", body="Aussage B")
+        diary_server.memory_link(
+            "/user/search-contra-a", "/user/search-contra-b", rel_type="contradicts"
+        )
 
-        result = diary_server.memory_check_triggers("Ein voellig unrelated Satz.")
-        assert result == ""
+        result = diary_server.memory_search("SearchContraUniqueXYZ")
+        assert "WIDERSPRUCH" in result
+        assert "/user/search-contra-b" in result
 
-    def test_check_triggers_rejects_substring_false_positive(self):
-        """'npm plus admin' as a keyword must not match inside a longer run of
-        similar-looking words — only the exact contiguous phrase counts."""
+
+class TestMemoryRecall:
+    """memory_recall: one-shot agent recall — hybrid search + 1-hop graph
+    expansion + contradiction warnings in a single tool call, so an agent
+    doesn't need memory_search + memory_get_links as two round-trips (and
+    doesn't need the admin-only memory_query_graph, which is semantic-only
+    and not on the main tool surface)."""
+
+    def test_recall_finds_fts_hit(self):
         import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/recall-fts", title="RecallFtsUniqueTerm", body="content")
+            result = diary_server.memory_recall("RecallFtsUniqueTerm")
+        assert "recall-fts" in result
 
-        _upsert("/user/kw-substr", title="Substr Test", body="Inhalt")
-        diary_server.memory_set_keywords("/user/kw-substr", "npm plus admin")
-
-        result = diary_server.memory_check_triggers("adminpanel npm pluswert admin")
-        assert result == ""
-
-    def test_check_triggers_no_keywords_set_anywhere_returns_empty(self):
+    def test_recall_expands_one_hop_neighbor(self):
         import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/recall-hub", title="RecallHubUniqueTerm", body="hub content")
+            _upsert("/user/recall-neighbor", title="RecallNeighbor", body="neighbor content")
+            diary_server.memory_link("/user/recall-hub", "/user/recall-neighbor", rel_type="requires")
+            result = diary_server.memory_recall("RecallHubUniqueTerm")
+        assert "recall-hub" in result
+        assert "recall-neighbor" in result
+        assert "requires" in result
 
-        result = diary_server.memory_check_triggers("irgendein Text ohne Bezug")
-        assert result == ""
+    def test_recall_no_results(self):
+        import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            result = diary_server.memory_recall("TermThatDefinitelyDoesNotExist99999recall")
+        assert isinstance(result, str)
+
+    def test_recall_respects_top_k(self):
+        import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/recall-k1", title="RecallTopKSharedTerm one", body="c1")
+            _upsert("/user/recall-k2", title="RecallTopKSharedTerm two", body="c2")
+            _upsert("/user/recall-k3", title="RecallTopKSharedTerm three", body="c3")
+            result = diary_server.memory_recall("RecallTopKSharedTerm", top_k=1)
+        hits = sum(p in result for p in ("recall-k1", "recall-k2", "recall-k3"))
+        assert hits == 1
+
+    def test_recall_shows_contradiction_warning(self):
+        import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/recall-contra-a", title="RecallContraUniqueXYZ", body="a")
+            _upsert("/user/recall-contra-b", title="Contra B other", body="b")
+            diary_server.memory_link("/user/recall-contra-a", "/user/recall-contra-b", rel_type="contradicts")
+            result = diary_server.memory_recall("RecallContraUniqueXYZ")
+        assert "WIDERSPRUCH" in result
+
+
+# ===========================================================================
+# 19. Injection consolidation (v0.10.0): the deterministic trigger_keywords
+#     mechanism (memory_set_keywords/memory_check_triggers, v0.9.0) was retired
+#     in favor of an automatic per-turn FTS retrieval hook
+#     (~/.claude/hooks/diary_prompt_retrieval.py) — see Project.md and the
+#     architecture-review sparring session. The trigger_keywords DB column
+#     stays in the schema (no destructive migration on the live synced DB),
+#     but the tools are gone; there is nothing left to unit-test at this layer.
+# ===========================================================================

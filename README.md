@@ -7,13 +7,14 @@ Provides Claude with a structured, searchable, cross-session memory system and a
 ## Features
 
 - **Memory tree** — hierarchical key-value store (`/user/...`, `/feedback/...`, `/projects/<slug>/...`, `/references/...`) with importance scoring, decay via `valid_until`, and a knowledge-graph layer (links: related/supports/contradicts/requires/derived_from)
-- **Two-tier model** — `curated` (consciously saved, always searched) vs. `extracted` (auto-captured from session transcripts, not searched by default to keep costs low)
+- **Two-tier model** — `curated` (consciously saved, always searched) vs. `extracted` (auto-captured from session transcripts, not searched by default to keep costs low). A similarity **tripwire** (cosine ≥ 0.85) still surfaces near-duplicate extracted hits as a "see also" hint even in default search, so the tier never becomes fully write-only.
 - **Semantic search** — multilingual embeddings via fastembed (`paraphrase-multilingual-MiniLM-L12-v2`, 384d, CPU-only). pgvector + HNSW where available, numpy brute-force fallback
-- **Hybrid search** — FTS ∪ semantic via Reciprocal Rank Fusion, ranked by importance + recency
-- **Session hooks** — SessionStart injects project-scoped and global memories; SessionEnd optionally extracts structured memories from the conversation (per-project opt-in, off by default)
+- **Hybrid search** — FTS ∪ semantic via Reciprocal Rank Fusion, ranked by importance + recency. `contradicts` links on a matched node are surfaced inline (also on `memory_get`), instead of only being visible via a manual `memory_health()` run.
+- **Session hooks** — SessionStart injects project-scoped and global memories; UserPromptSubmit runs an automatic FTS-only per-turn retrieval against curated memories (deterministic, no embeddings — see Architecture); SessionEnd optionally extracts structured memories from the conversation (per-project opt-in, off by default)
 - **Project diary** — log entries, milestones, tasks, wiki pages, reminders, error/solution pairs per project
 - **Web UI** — read-only FastAPI dashboard on `localhost:8765` (`diary-web`)
 - **Bidirectional sync** — `memory_sync()` opens an ephemeral SSH tunnel and syncs last-write-wins, including soft-deleted tombstones and embeddings
+- **Two entry points** — `diary-mcp` (day-to-day tool surface) and `diary-admin-mcp` (knowledge-graph introspection/maintenance: explain/path/stats/infer/report), kept separate so an ordinary session isn't shown audit-only tools it never needs
 
 ## Requirements
 
@@ -27,11 +28,12 @@ Provides Claude with a structured, searchable, cross-session memory system and a
 uv tool install .
 ```
 
-This installs two CLI entry points:
+This installs three CLI entry points:
 
 | Command | Description |
 |---------|-------------|
-| `diary-mcp` | MCP server (stdio transport) |
+| `diary-mcp` | Main MCP server (stdio transport) — day-to-day tool surface |
+| `diary-admin-mcp` | Admin MCP server (stdio transport) — knowledge-graph introspection/maintenance tools, add only when doing an audit |
 | `diary-web` | Local web dashboard on port 8765 |
 
 ### Database setup
@@ -59,6 +61,19 @@ Add to your `.mcp.json`:
 }
 ```
 
+Add `diary-admin-mcp` the same way, only for the duration of a graph audit:
+
+```json
+{
+  "mcpServers": {
+    "diary-admin": {
+      "command": "diary-admin-mcp",
+      "env": { "DIARY_DATABASE_URL": "postgresql://localhost/diary_mcp" }
+    }
+  }
+}
+```
+
 For cross-machine sync, also set:
 
 ```
@@ -68,34 +83,42 @@ DIARY_REMOTE_URL=postgresql://localhost:54321/diary_mcp
 
 ### Session hooks
 
-Register in `settings.json` to auto-inject memories on session start and capture extractions on end:
+Register in `settings.json` (see `~/.claude/hooks/` for the actual scripts):
 
 ```json
 {
   "hooks": {
-    "PreToolUse": [],
-    "UserPromptSubmit": [{ "command": "python3 ~/.claude/hooks/diary_session_start.py" }],
-    "Stop": [{ "command": "python3 ~/.claude/hooks/diary_session_end.py" }]
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/diary_session_start.py" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/diary_prompt_retrieval.py" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/diary_session_end.py" }] }]
   }
 }
 ```
+
+- **SessionStart** injects memories pinned (`pin_triggers`) for `start`/`compact`, scoped to the project (via `cwd` → slug resolution) plus global `/user`, `/feedback`.
+- **UserPromptSubmit** (`diary_prompt_retrieval.py`) runs the current prompt through Postgres FTS (the same tsvector index `memory_search` uses) against curated memories, scoped the same way, and silently injects the top matches. Deliberately FTS-only, not semantic — loading the embedding model fresh on every single prompt would reintroduce the cold-start stall documented in `Project.md`'s v0.8.1 postmortem. This replaced the old `trigger_keywords`/`memory_set_keywords` mechanism (retired in v0.10.0), which required maintaining an exact keyword list per memory by hand.
+- **SessionEnd** optionally extracts structured memories from the conversation (per-project opt-in via `memory_set_project_config`, off by default).
 
 ## Memory tools
 
 | Tool | Purpose |
 |------|---------|
 | `memory_upsert(path, title, body, type, ...)` | Save or update a memory |
-| `memory_get(path)` | Read a node, tracks access |
-| `memory_search(query)` | Lexical FTS with ILIKE fallback |
+| `memory_get(path)` | Read a node, tracks access, surfaces `contradicts` warnings |
+| `memory_search(query)` | Hybrid FTS+semantic search (RRF), extracted-tier tripwire, contradiction warnings |
+| `memory_recall(query, top_k)` | One-shot agentic recall: same hybrid search, compacted to top_k, plus 1-hop graph neighbors + contradiction warnings in a single call |
 | `memory_search_semantic(query)` | Semantic search (meaning, cross-lingual) |
 | `memory_context()` | Session start: tree + recently changed nodes |
 | `memory_project_context(slug)` | Load auto-inject memories for a project |
 | `memory_tree(path)` | Compact hierarchy from a given path |
 | `memory_pin(path, on_start, on_compact)` | Mark memory for auto-injection |
+| `memory_link(from_path, to_path, rel_type)` | Create a knowledge-graph link |
 | `memory_sync()` | Bidirectional sync via SSH tunnel |
 | `memory_health()` | Report expired, empty, or contradicting nodes |
 | `memory_promote(path)` | Promote extracted memory to curated |
 | `memory_purge_tombstones(older_than_days)` | Clean up soft-deleted nodes |
+
+Knowledge-graph introspection/maintenance tools (`memory_explain`, `memory_path`, `memory_graph_stats`, `memory_infer_links`, `memory_query_graph`, `memory_report`) live on the separate `diary-admin-mcp` entry point, not on the main server — see Architecture.
 
 ## Environment variables
 
@@ -118,18 +141,36 @@ createdb diary_mcp_pytest && createdb diary_mcp_pytest_remote
 uv run pytest
 ```
 
-44 tests cover upsert/update, access tracking, tombstones, two-tier visibility, hybrid search, embedding fallback, sync round-trip, extracted lifecycle, and project config.
+98 tests cover upsert/update, access tracking, tombstones, two-tier visibility (incl. the extracted-tier tripwire), hybrid search, contradiction surfacing, embedding fallback, sync round-trip, extracted lifecycle, and project config.
 
 CI runs on GitHub Actions with a pgvector service container.
 
 ## Architecture
 
 ```
-diary_server.py   — FastMCP stdio server (22 memory_* tools + diary tools)
+diary_server.py          — main FastMCP stdio server: bootstrap + re-exports (thin by design)
+diary_bootstrap.py        — shared `mcp` FastMCP instance for the main server
+diary_project_tools.py    — projects/logs/errors/milestones/tasks/reminders/wiki tools
+memory_service.py         — memory tree CRUD, two-tier lifecycle, pinning, contradiction lookup
+search_engine.py          — hybrid search (FTS+semantic, RRF), ranking, extracted-tier tripwire
+graph_core.py             — memory_link / memory_get_links (kept on the main server)
+sync_manager.py           — memory_sync / memory_sync_diary / tombstone purges
+
+diary_admin_server.py     — separate diary-admin-mcp entry point
+diary_admin_bootstrap.py  — its own `admin_mcp` FastMCP instance
+graph_admin.py            — knowledge-graph introspection/maintenance tools (explain/path/
+                             stats/infer/report) — admin-only, not on the main server's tool
+                             surface (see module docstring for the 2026-08 rationale)
+
 diary_db.py       — PostgreSQL access layer (psycopg3)
 diary_embed.py    — fastembed wrapper, lazy-load, pgvector-aware
 diary_web.py      — FastAPI read-only dashboard
 diary_config.py   — env config
 ```
 
-Memory nodes are stored with UUID primary keys (conflict-free sync), `path` unique index, `importance` (0–1), `access_count`/`accessed_at`, `valid_until`, `origin` (curated|extracted), and a 384-dimensional embedding column. The knowledge graph lives in a `memory_links` table.
+The tool-implementation modules import `diary_db`/`diary_embed` as modules (`diary_db.get_db()`,
+not `from diary_db import get_db`) rather than importing individual functions by name — the test
+suite reloads `diary_db`/`diary_embed` between DB targets, and a `from...import` binding would
+keep pointing at the stale pre-reload function object.
+
+Memory nodes are stored with UUID primary keys (conflict-free sync), `path` unique index, `importance` (0–1), `access_count`/`accessed_at`, `valid_until`, `origin` (curated|extracted), `trigger_keywords` (retired in v0.10.0, column kept for schema stability — no destructive migration on the live synced DB), and a 384-dimensional embedding column. The knowledge graph lives in a `memory_links` table.
