@@ -402,7 +402,21 @@ def memory_upsert(
             auto_linked = _auto_link_new_node(conn, node_id, embedding)
             if auto_linked:
                 msg += f" (+{len(auto_linked)} auto-verlinkt: {', '.join(auto_linked)})"
-        return msg
+
+    # Auto-push to diary federation links (v0.16.0), deliberately OUTSIDE the
+    # `with` block above: this hits the network (diary-relay), and holding a
+    # DB transaction open across a network call is exactly the anti-pattern
+    # that caused the 46-minute stuck transaction in the v0.8.1 postmortem
+    # (Project.md). diary_link's push_node_on_upsert() never raises — a
+    # missing identity, no matching link, or an unreachable relay just means
+    # "not pushed", never a failed save.
+    if origin == "curated" and tag_list:
+        import diary_link  # local import: diary_link imports memory_upsert from this module at load time
+        pushed_to = diary_link.push_node_on_upsert(path, title, body, type, tag_list)
+        if pushed_to:
+            msg += f" (an {len(pushed_to)} Diary-Link(s) auto-gesynct: {', '.join(pushed_to)})"
+
+    return msg
 
 
 @mcp.tool()

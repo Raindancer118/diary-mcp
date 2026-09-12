@@ -416,6 +416,12 @@ _SCHEMA = [
         established_at TIMESTAMPTZ DEFAULT now(),
         last_synced_at TIMESTAMPTZ
     )""",
+
+    # sync_tags (v0.16.0): tags a link auto-syncs on the periodic cron run
+    # (scripts/diary_link_sync_cron.py), set via diary_link_set_sync_tags().
+    # Empty by default — a link is opt-in to automatic sync, same as
+    # DIARY_AUTO_EXTRACT/auto_inject default-off pattern elsewhere in this project.
+    "ALTER TABLE diary_links ADD COLUMN IF NOT EXISTS sync_tags TEXT[] DEFAULT '{}'",
 ]
 
 # Backfill parent_id from path for any unlinked nodes (idempotent self-heal).

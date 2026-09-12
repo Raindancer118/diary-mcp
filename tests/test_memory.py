@@ -1908,6 +1908,58 @@ class TestDiaryLink:
             conn.close()
         assert link_row["last_synced_at"] is not None
 
+    def test_sync_second_call_only_pushes_changed_nodes(self):
+        """A repeated diary_link_sync() must not resend unchanged nodes every
+        time (that would mean a nightly cron re-pushing the whole tag scope as
+        fresh relay messages forever) — only nodes touched since the last sync."""
+        import diary_link
+        from nacl.public import PrivateKey
+
+        bob_priv = PrivateKey.generate()
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        self._insert_link("bob", bytes(bob_priv.public_key), relay_link_id="relay-link-1")
+
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/node-a", title="A", body="a", tags="share-tag")
+
+        push_calls = []
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            if path.endswith("/messages"):
+                push_calls.append(json_body["ciphertext"])
+                return {"message_id": "m", "created_at": "x"}
+            raise AssertionError(f"unexpected relay_post call: {path}")
+
+        def fake_relay_get(relay_url, path, token, params=None):
+            return {"messages": []}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get), \
+             patch("diary_embed.embed", return_value=None):
+            first = diary_link.diary_link_sync("bob", "share-tag")
+        assert "1 gepusht" in first
+        assert len(push_calls) == 1
+
+        # Nothing changed — a second run must push nothing.
+        with patch("diary_link._relay_post", side_effect=fake_relay_post), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get), \
+             patch("diary_embed.embed", return_value=None):
+            second = diary_link.diary_link_sync("bob", "share-tag")
+        assert "0 gepusht" in second
+        assert len(push_calls) == 1
+
+        # A brand-new node with the same tag, added after the first sync, must
+        # be picked up by the next run.
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/node-b", title="B", body="b", tags="share-tag")
+        with patch("diary_link._relay_post", side_effect=fake_relay_post), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get), \
+             patch("diary_embed.embed", return_value=None):
+            third = diary_link.diary_link_sync("bob", "share-tag")
+        assert "1 gepusht" in third
+        assert len(push_calls) == 2
+
     def test_unlink_removes_link_and_calls_relay(self):
         import diary_link
         with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
@@ -2022,3 +2074,227 @@ class TestDiaryLink:
         result = self._sync_with_incoming_path("/notes/ok")
         assert "1 empfangen" in result
         assert _get_node("/links/bob/notes/ok") is not None
+
+
+# ===========================================================================
+# 24. Automatic diary-link sync scheduling (v0.16.0): diary_link_set_sync_tags
+#     records which tags a link should auto-sync; scripts/diary_link_sync_cron.py
+#     (systemd user timer, same pattern as link_inference_cron.py) reads that
+#     config and calls diary_link_sync() for every configured (link, tag) pair.
+# ===========================================================================
+
+class TestDiaryLinkAutoSync:
+    def _insert_link(self, alias, peer_public_key_bytes, peer_display_name="Peer",
+                      relay_link_id="relay-link-1"):
+        conn = _local_conn()
+        try:
+            conn.execute(
+                "INSERT INTO diary_links (relay_link_id, peer_alias, peer_display_name, "
+                "peer_public_key) VALUES (%s,%s,%s,%s)",
+                (relay_link_id, alias, peer_display_name, peer_public_key_bytes),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_sync_tags_default_empty(self):
+        import diary_link
+        self._insert_link("bob", b"\x01" * 32)
+        result = diary_link.diary_link_list()
+        assert "Auto-Sync-Tags: aus" in result
+
+    def test_set_sync_tags_unknown_alias(self):
+        import diary_link
+        result = diary_link.diary_link_set_sync_tags("no-such-alias", "some-tag")
+        assert "no-such-alias" in result
+
+    def test_set_sync_tags_stores_comma_separated_list(self):
+        import diary_link
+        self._insert_link("bob", b"\x01" * 32)
+        result = diary_link.diary_link_set_sync_tags("bob", "team-x, recipes ,team-x")
+        assert "team-x" in result and "recipes" in result
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT sync_tags FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row["sync_tags"] == ["team-x", "recipes", "team-x"]
+        assert "team-x" in diary_link.diary_link_list()
+
+    def test_set_sync_tags_empty_string_disables(self):
+        import diary_link
+        self._insert_link("bob", b"\x01" * 32)
+        diary_link.diary_link_set_sync_tags("bob", "team-x")
+        result = diary_link.diary_link_set_sync_tags("bob", "")
+        assert "deaktiviert" in result
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT sync_tags FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row["sync_tags"] == []
+
+    def test_cron_skips_links_without_sync_tags(self):
+        import diary_link
+        from scripts import diary_link_sync_cron
+        self._insert_link("bob", b"\x01" * 32)
+        with patch("diary_link.diary_link_sync") as m:
+            diary_link_sync_cron.main()
+        m.assert_not_called()
+
+    def test_cron_calls_sync_for_each_configured_tag(self):
+        import diary_link
+        self._insert_link("bob", b"\x01" * 32, relay_link_id="relay-link-bob")
+        self._insert_link("carol", b"\x02" * 32, relay_link_id="relay-link-carol")
+        diary_link.diary_link_set_sync_tags("bob", "team-x,recipes")
+        diary_link.diary_link_set_sync_tags("carol", "team-x")
+
+        from scripts import diary_link_sync_cron
+        with patch("diary_link.diary_link_sync", return_value="ok") as m:
+            diary_link_sync_cron.main()
+
+        calls = {c.args for c in m.call_args_list}
+        assert calls == {("bob", "team-x"), ("bob", "recipes"), ("carol", "team-x")}
+
+    def test_cron_continues_after_one_link_fails(self):
+        import diary_link
+        self._insert_link("bob", b"\x01" * 32, relay_link_id="relay-link-bob")
+        self._insert_link("carol", b"\x02" * 32, relay_link_id="relay-link-carol")
+        diary_link.diary_link_set_sync_tags("bob", "team-x")
+        diary_link.diary_link_set_sync_tags("carol", "team-x")
+
+        def fake_sync(alias, tag):
+            if alias == "bob":
+                raise RuntimeError("relay unreachable")
+            return "ok"
+
+        from scripts import diary_link_sync_cron
+        with patch("diary_link.diary_link_sync", side_effect=fake_sync) as m:
+            diary_link_sync_cron.main()  # must not raise
+        assert m.call_count == 2
+
+    def test_set_sync_tags_triggers_initial_catchup_push_for_new_tag(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        self._insert_link("bob", bob_pub)
+
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/pre-existing", title="Existing", body="pre-existing content", tags="new-tag")
+
+        with patch("diary_link._relay_post", return_value={"message_id": "m", "created_at": "x"}) as m:
+            result = diary_link.diary_link_set_sync_tags("bob", "new-tag")
+
+        assert "initial gepusht" in result
+        push_calls = [c for c in m.call_args_list if c.args[1].endswith("/messages")]
+        assert len(push_calls) == 1
+
+    def test_set_sync_tags_reconfigure_same_tag_does_not_repush(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        self._insert_link("bob", bob_pub)
+
+        with patch("diary_link._relay_post", return_value={"message_id": "m", "created_at": "x"}):
+            diary_link.diary_link_set_sync_tags("bob", "team-x")  # first enable
+
+        with patch("diary_link._relay_post") as m:
+            result = diary_link.diary_link_set_sync_tags("bob", "team-x")  # re-set, unchanged
+        assert "initial gepusht" not in result
+        m.assert_not_called()
+
+
+# ===========================================================================
+# 25. Write-time auto-push (v0.16.0): memory_upsert() of a curated node whose
+#     tags overlap a link's sync_tags pushes that ONE node to the relay
+#     immediately, without waiting for the nightly cron. push_node_on_upsert()
+#     must never raise (a relay hiccup must never break the save) and must run
+#     after memory_upsert's own DB transaction is closed (no network call
+#     inside an open transaction — see Project.md v0.8.1 postmortem).
+# ===========================================================================
+
+class TestDiaryLinkWriteTimePush:
+    def _insert_link(self, alias, peer_public_key_bytes, sync_tags, relay_link_id="relay-link-1"):
+        conn = _local_conn()
+        try:
+            conn.execute(
+                "INSERT INTO diary_links (relay_link_id, peer_alias, peer_display_name, "
+                "peer_public_key, sync_tags) VALUES (%s,%s,%s,%s,%s)",
+                (relay_link_id, alias, "Peer", peer_public_key_bytes, sync_tags),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_upsert_pushes_to_link_with_matching_sync_tag(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        self._insert_link("bob", bob_pub, ["team-x"])
+
+        with patch("diary_link._relay_post", return_value={"message_id": "m1", "created_at": "x"}) as m, \
+             patch("diary_embed.embed", return_value=None):
+            result = _upsert("/projects/foo/status", title="Status", body="on track", tags="team-x")
+
+        assert "1 Diary-Link(s) auto-gesynct" in result
+        assert "bob" in result
+        push_calls = [c for c in m.call_args_list if c.args[1].endswith("/messages")]
+        assert len(push_calls) == 1
+
+    def test_upsert_does_not_push_without_matching_tag(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        self._insert_link("bob", bob_pub, ["team-x"])
+
+        with patch("diary_link._relay_post") as m, patch("diary_embed.embed", return_value=None):
+            result = _upsert("/projects/foo/status", title="Status", body="on track", tags="unrelated-tag")
+
+        assert "auto-gesynct" not in result
+        m.assert_not_called()
+
+    def test_upsert_without_identity_does_not_raise(self):
+        with patch("diary_embed.embed", return_value=None):
+            result = _upsert("/projects/foo/status", title="Status", body="on track", tags="team-x")
+        assert "auto-gesynct" not in result
+
+    def test_upsert_survives_relay_failure(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        self._insert_link("bob", bob_pub, ["team-x"])
+
+        with patch("diary_link._relay_post", side_effect=RuntimeError("relay down")), \
+             patch("diary_embed.embed", return_value=None):
+            result = _upsert("/projects/foo/status", title="Status", body="on track", tags="team-x")
+
+        assert "aktualisiert" in result or "erstellt" in result
+        assert "auto-gesynct" not in result
+
+    def test_push_node_on_upsert_never_touches_last_synced_at(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        self._insert_link("bob", bob_pub, ["team-x"])
+
+        with patch("diary_link._relay_post", return_value={"message_id": "m1", "created_at": "x"}):
+            diary_link.push_node_on_upsert("/projects/foo/status", "Status", "on track", "note", ["team-x"])
+
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT last_synced_at FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row["last_synced_at"] is None

@@ -88,6 +88,7 @@ from sync_manager import memory_sync, memory_sync_diary, memory_purge_tombstones
 from diary_link import (  # noqa: E402,F401
     diary_link_init, diary_link_create_pairing_code, diary_link_check_pairing_code,
     diary_link_redeem_pairing_code, diary_link_list, diary_link_sync, diary_link_unlink,
+    diary_link_set_sync_tags,
 )
 
 

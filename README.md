@@ -148,13 +148,52 @@ diary_link_unlink("bob")
 ```
 
 Incoming synced content lands under `/links/<alias>/<original-path>`, tagged
-`from:<alias>` — it never overwrites your own tree. Manual, explicit sync
-calls only in this phase (no automatic background sync). Verified end-to-end
-against a real running diary-relay with two separate diary-mcp processes
-(not just mocked tests) during development.
+`from:<alias>` — it never overwrites your own tree. `diary_link_sync()`
+itself stays a manual, explicit tool call. Verified end-to-end against a real
+running diary-relay with two separate diary-mcp processes (not just mocked
+tests) during development.
 
 **Live at https://diary-relay.tstieh.de** (deployed 12.09.2026) — pass this
 URL as `relay_url` to `diary_link_init`.
+
+### Automatic sync (v0.16.0)
+
+Opt-in, on top of the manual tool — same two-mechanism pattern as
+[Automatic linking](#automatic-linking-v0130) (write-time + periodic batch):
+
+```
+diary_link_set_sync_tags("bob", "share-with-bob,recipes")   # comma-separated; "" disables
+```
+
+- **Write-time push (`diary_link.push_node_on_upsert`):** every `memory_upsert()`
+  of a curated node whose tags overlap a link's `sync_tags` immediately
+  encrypts and pushes that ONE node to the relay for that link — "on change",
+  no waiting for a schedule. Runs after `memory_upsert`'s own DB transaction is
+  closed (a network call must never sit inside an open transaction, see
+  `Project.md`'s v0.8.1 postmortem). Never raises: a missing identity, no
+  matching link, or an unreachable relay just means "not pushed", never a
+  failed save.
+- **Periodic batch (`scripts/diary_link_sync_cron.py`):** reads every link's
+  `sync_tags` (empty by default — a link stays untouched unless explicitly
+  opted in) and calls `diary_link_sync(alias, tag)` for each configured pair —
+  this is what actually **pulls** the peer's messages, and catches anything
+  the write-time push missed (e.g. a relay outage at save time). Its push side
+  is a **delta** (`updated_at > last_synced_at`), not a full resend of the
+  whole tag scope every night — otherwise a nightly run would recreate one
+  fresh relay message per tagged node forever, even for content that never
+  changed. `diary_link_set_sync_tags()` separately triggers a one-time full
+  catch-up push when a tag is newly enabled, so pre-existing tagged nodes
+  aren't stranded waiting for an edit. One failing (link, tag) pair is logged
+  and skipped, not fatal to the rest of the run. Not a Claude Code hook — a
+  plain script for a scheduler, run with the diary-mcp tool's own installed
+  Python:
+
+```
+~/.local/share/uv/tools/diary-mcp/bin/python scripts/diary_link_sync_cron.py
+```
+
+Deployed locally as a systemd user timer (daily, 04:15, between the memory
+backup and link-inference timers): `~/.config/systemd/user/diary-link-sync.{service,timer}`, enabled via `systemctl --user enable --now diary-link-sync.timer`. Log: `~/.local/share/diary-link-sync.log`.
 
 ## Memory tools
 

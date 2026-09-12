@@ -16,8 +16,14 @@ Only a tag-scoped subset of curated memories is ever shared (memory_upsert's
 is namespaced under /links/<alias>/... and tagged `from:<alias>` so it can
 never silently overwrite the receiver's own tree.
 
-Manual, explicit tool calls only in this phase (no automatic background
-sync) — same pattern as memory_sync()/memory_sync_diary().
+diary_link_sync() itself stays a manual, explicit tool call — same pattern as
+memory_sync()/memory_sync_diary(). Automatic scheduling (v0.16.0) is a
+separate opt-in layer on top: diary_link_set_sync_tags(alias, tags) records
+which tags a link should auto-sync, and scripts/diary_link_sync_cron.py (a
+systemd user timer, same pattern as link_inference_cron.py/
+memory_backup_export.py) calls the plain diary_link_sync() function for every
+link/tag pair on a schedule. A link with no sync_tags configured is never
+touched by the cron job.
 """
 import base64
 import json
@@ -190,7 +196,7 @@ def diary_link_check_pairing_code(code: str, alias: str) -> str:
 
 @mcp.tool()
 def diary_link_list() -> str:
-    """Listet alle bestehenden Diary-Links (Alias, Anzeigename, letzter Sync)."""
+    """Listet alle bestehenden Diary-Links (Alias, Anzeigename, letzter Sync, Auto-Sync-Tags)."""
     with diary_db.get_db() as conn:
         links = conn.execute("SELECT * FROM diary_links ORDER BY established_at").fetchall()
     if not links:
@@ -198,19 +204,166 @@ def diary_link_list() -> str:
     lines = ["Diary-Links:"]
     for l in links:
         last = l["last_synced_at"] or "nie"
-        lines.append(f"  {l['peer_alias']} ({l['peer_display_name']}) — zuletzt gesynct: {last}")
+        auto = ", ".join(l["sync_tags"]) if l["sync_tags"] else "aus"
+        lines.append(f"  {l['peer_alias']} ({l['peer_display_name']}) — zuletzt gesynct: {last} — Auto-Sync-Tags: {auto}")
     return "\n".join(lines)
 
 
 @mcp.tool()
+def diary_link_set_sync_tags(alias: str, tags: str) -> str:
+    """Legt fest, welche Tags für den Link `alias` automatisch gesynct werden.
+
+    Zwei Mechanismen nutzen das (analog zum Auto-Linking-Muster: write-time +
+    periodischer Batch): (1) JEDER memory_upsert() eines kuratierten Nodes mit
+    einem dieser Tags pusht den Node SOFORT ("on change") verschlüsselt an
+    diesen Link (memory_service.py ruft dafür push_node_on_upsert() auf, nachdem
+    die eigene DB-Transaktion geschlossen ist — kein Netzwerkaufruf in einer
+    offenen Transaktion, s. Project.md v0.8.1-Postmortem). (2) Der periodische
+    Cron-Job (scripts/diary_link_sync_cron.py, systemd-User-Timer) ruft zusätzlich
+    täglich das volle diary_link_sync(alias, tag) auf — das holt eingehende
+    Nachrichten des Peers ab (Pull) und fängt Nodes ab, die z.B. während eines
+    Relay-Ausfalls nicht sofort rausgingen.
+
+    `tags`: kommagetrennte Liste (wie memory_upsert's tags-Parameter), z.B.
+    'projekt-x,rezepte'. Leerer String schaltet Auto-Sync für diesen Link wieder
+    aus (Default: aus — ein Link muss hierüber explizit opt-in gemacht werden).
+
+    Für neu hinzugekommene Tags (in `tags`, aber noch nicht vorher konfiguriert)
+    wird EINMALIG sofort ein voller Push aller schon bestehenden, so getaggten
+    Nodes ausgelöst — sonst würden Nodes, die schon vor dem Opt-in existierten
+    und seither nicht mehr editiert wurden, nie automatisch beim Peer ankommen
+    (weder Write-Time-Push noch der Delta-Push von diary_link_sync würden sie
+    erfassen). Bereits konfigurierte Tags lösen das nicht erneut aus.
+    """
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    with diary_db.get_db() as conn:
+        link = conn.execute("SELECT * FROM diary_links WHERE peer_alias = %s", (alias,)).fetchone()
+        if not link:
+            return f"Kein Link mit Alias '{alias}'."
+        old_tags = set(link["sync_tags"] or [])
+        conn.execute("UPDATE diary_links SET sync_tags = %s WHERE id = %s", (tag_list, link["id"]))
+        identity = _get_identity(conn)
+
+    if not tag_list:
+        return f"Auto-Sync für '{alias}' deaktiviert."
+
+    msg = f"Auto-Sync für '{alias}' aktiviert für Tags: {', '.join(tag_list)}."
+
+    # Initial catch-up push happens in its own DB round-trip, deliberately
+    # AFTER the transaction above is closed — same reasoning as
+    # push_node_on_upsert: a network call to the relay must never sit inside
+    # an open DB transaction (Project.md v0.8.1 postmortem).
+    newly_added = [t for t in dict.fromkeys(tag_list) if t not in old_tags]
+    if newly_added and identity:
+        own_priv = PrivateKey(bytes(identity["private_key"]))
+        pushed_total = 0
+        with diary_db.get_db() as conn:
+            for tag in newly_added:
+                try:
+                    pushed_total += _push_nodes_for_tag(conn, identity, own_priv, link, tag, since=None)
+                except Exception:  # noqa: BLE001 — a relay hiccup during setup shouldn't fail the config change
+                    continue
+        if pushed_total:
+            msg += f" ({pushed_total} bestehende Node(s) initial gepusht.)"
+    return msg
+
+
+def _push_nodes_for_tag(conn, identity, own_priv, link, tag: str, since=None) -> int:
+    """Encrypts+pushes every curated node tagged `tag` to `link` and returns how
+    many. `since` (a timestamp or None) restricts to nodes touched after it —
+    None means "all of them" (used for the one-time catch-up when a tag is
+    newly enabled, and for a link's very first sync). Shared by diary_link_sync
+    (delta push, see its docstring) and diary_link_set_sync_tags' initial
+    catch-up push, so both stay in sync with a single implementation."""
+    peer_pub = PublicKey(bytes(link["peer_public_key"]))
+    box = Box(own_priv, peer_pub)
+    if since:
+        nodes = conn.execute(
+            "SELECT path, title, body, type FROM memory_nodes "
+            "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags) AND updated_at > %s",
+            (tag, since),
+        ).fetchall()
+    else:
+        nodes = conn.execute(
+            "SELECT path, title, body, type FROM memory_nodes "
+            "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags)",
+            (tag,),
+        ).fetchall()
+    pushed = 0
+    for n in nodes:
+        payload = json.dumps({
+            "path": n["path"], "title": n["title"], "body": n["body"], "type": n["type"],
+        }).encode()
+        ciphertext = bytes(box.encrypt(payload))
+        _relay_post(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
+                    token=identity["relay_token"], json_body={"ciphertext": _b64(ciphertext)})
+        pushed += 1
+    return pushed
+
+
+def push_node_on_upsert(path: str, title: str, body: str, node_type: str, tag_list: list[str]) -> list[str]:
+    """Write-time Auto-Push (v0.16.0): wird von memory_service.memory_upsert()
+    NACH dem Schließen der eigenen DB-Transaktion aufgerufen (der Netzwerk-Call
+    zum Relay darf keine offene Transaktion blockieren). Pusht genau DIESEN
+    einen Node — nicht den ganzen Tag-Scope wie diary_link_sync() — an jeden
+    Link, dessen sync_tags eines von `tag_list` enthält.
+
+    Nie fatal: kein Identity/kein passender Link/ein nicht erreichbarer Relay
+    bedeutet einfach "an diesen Link nicht gepusht", nie einen Fehler, der den
+    eigentlichen memory_upsert()-Aufruf kaputt machen dürfte. Berührt bewusst
+    NICHT last_synced_at (das steuert den Pull-Cursor von diary_link_sync() und
+    bleibt dessen alleinige Zuständigkeit).
+    """
+    if not tag_list:
+        return []
+    pushed_to: list[str] = []
+    try:
+        with diary_db.get_db() as conn:
+            identity = _get_identity(conn)
+            if not identity:
+                return []
+            links = conn.execute(
+                "SELECT * FROM diary_links WHERE sync_tags && %s", (tag_list,)
+            ).fetchall()
+            if not links:
+                return []
+            own_priv = PrivateKey(bytes(identity["private_key"]))
+            payload = json.dumps({"path": path, "title": title, "body": body, "type": node_type}).encode()
+            for link in links:
+                try:
+                    peer_pub = PublicKey(bytes(link["peer_public_key"]))
+                    box = Box(own_priv, peer_pub)
+                    ciphertext = bytes(box.encrypt(payload))
+                    _relay_post(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
+                                token=identity["relay_token"], json_body={"ciphertext": _b64(ciphertext)})
+                    pushed_to.append(link["peer_alias"])
+                except Exception:  # noqa: BLE001 — one unreachable link must not break the others or the save
+                    continue
+    except Exception:  # noqa: BLE001 — DB hiccup here must not break the save either
+        return pushed_to
+    return pushed_to
+
+
+@mcp.tool()
 def diary_link_sync(alias: str, tag: str) -> str:
-    """Synct kuratierte Memories mit einem verknüpften Diary: verschlüsselt alle
-    kuratierten Nodes mit `tag` einzeln für den Peer (E2EE, PyNaCl Box) und pusht
-    sie über den Relay; pullt neue Nachrichten des Peers seit dem letzten Sync,
+    """Synct kuratierte Memories mit einem verknüpften Diary: verschlüsselt
+    kuratierte Nodes mit `tag` für den Peer (E2EE, PyNaCl Box) und pusht sie über
+    den Relay; pullt neue Nachrichten des Peers seit dem letzten Sync,
     entschlüsselt sie und legt sie lokal unter /links/<alias>/<pfad> ab, getaggt
     mit 'from:<alias>' — überschreibt nie den eigenen Tree.
 
-    Manueller, expliziter Aufruf (kein automatischer Hintergrund-Sync in dieser Phase).
+    Push ist DELTA seit dem letzten Sync (nur Nodes mit updated_at > letztem
+    last_synced_at) — beim allerersten Sync mit diesem Link (last_synced_at
+    NULL) werden alle passenden Nodes gepusht. Das verhindert, dass ein
+    wiederholter Aufruf (insbesondere der nächtliche Cron, s.u.) jede Nacht
+    den kompletten Tag-Scope erneut als frische Relay-Nachrichten verschickt —
+    unveränderte Nodes wurden beim letzten Mal schon (oder per Write-Time-Push,
+    s. push_node_on_upsert) übertragen.
+
+    Manueller, expliziter Tool-Aufruf; wird zusätzlich vom periodischen Cron-Job
+    (scripts/diary_link_sync_cron.py) für jedes per diary_link_set_sync_tags()
+    konfigurierte Tag aufgerufen (Fangnetz für alles, was der Write-Time-Push
+    z.B. wegen eines Relay-Ausfalls verpasst hat, plus der einzige Ort, der pullt).
     """
     with diary_db.get_db() as conn:
         identity = _get_identity(conn)
@@ -221,24 +374,9 @@ def diary_link_sync(alias: str, tag: str) -> str:
             return f"Kein Link mit Alias '{alias}' — zuerst diary_link_redeem_pairing_code() aufrufen."
 
         own_priv = PrivateKey(bytes(identity["private_key"]))
-        peer_pub = PublicKey(bytes(link["peer_public_key"]))
-        box = Box(own_priv, peer_pub)
+        box = Box(own_priv, PublicKey(bytes(link["peer_public_key"])))
 
-        nodes = conn.execute(
-            "SELECT path, title, body, type FROM memory_nodes "
-            "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags)",
-            (tag,),
-        ).fetchall()
-
-        pushed = 0
-        for n in nodes:
-            payload = json.dumps({
-                "path": n["path"], "title": n["title"], "body": n["body"], "type": n["type"],
-            }).encode()
-            ciphertext = bytes(box.encrypt(payload))
-            _relay_post(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
-                        token=identity["relay_token"], json_body={"ciphertext": _b64(ciphertext)})
-            pushed += 1
+        pushed = _push_nodes_for_tag(conn, identity, own_priv, link, tag, since=link["last_synced_at"])
 
         params = {"since": link["last_synced_at"].isoformat()} if link["last_synced_at"] else {}
         pulled = _relay_get(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
