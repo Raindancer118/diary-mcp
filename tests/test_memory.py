@@ -823,9 +823,14 @@ class TestKnowledgeGraph:
         assert "requires" in result
 
     def test_path_multi_hop(self):
-        _upsert("/user/kg-m1", title="M1", body="m1")
-        _upsert("/user/kg-m2", title="M2", body="m2")
-        _upsert("/user/kg-m3", title="M3", body="m3")
+        # embed=None: real embeddings of these near-identical short bodies would
+        # trigger write-time auto-linking (v0.13.0) and create a direct
+        # kg-m1<->kg-m3 shortcut, defeating the multi-hop scenario this test
+        # is actually about.
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/kg-m1", title="M1", body="m1")
+            _upsert("/user/kg-m2", title="M2", body="m2")
+            _upsert("/user/kg-m3", title="M3", body="m3")
         import diary_server
         diary_server.memory_link("/user/kg-m1", "/user/kg-m2")
         diary_server.memory_link("/user/kg-m2", "/user/kg-m3")
@@ -867,9 +872,14 @@ class TestKnowledgeGraph:
         vec_a = [1.0] * half + [0.0] * half
         vec_b = [1.0] * half + [0.0] * half
         vec_c = [0.0] * half + [1.0] * half
-        self._node_with_vec("/user/kg-inf-a", vec_a)
-        self._node_with_vec("/user/kg-inf-b", vec_b)
-        self._node_with_vec("/user/kg-inf-c", vec_c)
+        # Disable write-time auto-linking (v0.13.0) for setup: vec_a/vec_b are
+        # similar enough (sim=1.0) to be auto-linked at upsert already, which
+        # would make the memory_infer_links() call below a no-op and defeat
+        # what this test actually exercises — memory_infer_links' own logic.
+        with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):
+            self._node_with_vec("/user/kg-inf-a", vec_a)
+            self._node_with_vec("/user/kg-inf-b", vec_b)
+            self._node_with_vec("/user/kg-inf-c", vec_c)
         import diary_server
         result = diary_server.memory_infer_links(threshold=0.9)
         assert "kg-inf-a" in result and "kg-inf-b" in result
@@ -1600,3 +1610,78 @@ class TestMemoryMerge:
         _upsert("/user/merge-src4", title="Src4", body="b")
         result = diary_server.memory_merge("/user/does-not-exist-merge-keep", "/user/merge-src4")
         assert "nicht gefunden" in result
+
+
+# ===========================================================================
+# 21. Automatic link inference at write time (v0.13.0): memory_infer_links
+#     always required a manual call to catch up on the whole tree. This closes
+#     the gap for the common case — a freshly upserted curated node — by
+#     comparing it against existing curated embeddings inline (the embedding
+#     is already computed for the upsert, so this is nearly free) and inserting
+#     inferred links above threshold immediately, capped per upsert to avoid
+#     graph spam. A periodic batch job (scripts/link_inference_cron.py) still
+#     covers nodes whose embeddings/threshold change after the fact.
+# ===========================================================================
+
+class TestAutoLinkOnUpsert:
+    def _upsert_vec(self, path, vec, title="T", body="B", origin="curated"):
+        import diary_server
+        with patch("diary_embed.embed", return_value=vec):
+            return diary_server.memory_upsert(path=path, title=title, body=body, origin=origin)
+
+    def test_creates_inferred_link_above_threshold(self):
+        vec = [0.4] * 384
+        self._upsert_vec("/user/al-a", vec, title="AutoLinkA")
+        self._upsert_vec("/user/al-b", vec, title="AutoLinkB")
+        import diary_server
+        result = diary_server.memory_explain("/user/al-b")
+        assert "al-a" in result
+        assert "INFERRED" in result
+
+    def test_no_link_below_threshold(self):
+        half = 192
+        vec_a = [1.0] * half + [0.0] * half
+        vec_b = [0.0] * half + [1.0] * half
+        self._upsert_vec("/user/al-diff-a", vec_a, title="AutoLinkDiffA")
+        self._upsert_vec("/user/al-diff-b", vec_b, title="AutoLinkDiffB")
+        import diary_server
+        result = diary_server.memory_explain("/user/al-diff-b")
+        assert "al-diff-a" not in result
+
+    def test_does_not_duplicate_existing_explicit_link(self):
+        vec = [0.5] * 384
+        self._upsert_vec("/user/al-dup-a", vec, title="AutoLinkDupA")
+        self._upsert_vec("/user/al-dup-b", vec, title="AutoLinkDupB")
+        import diary_server
+        diary_server.memory_link("/user/al-dup-a", "/user/al-dup-b", rel_type="related")
+        # Re-upsert b (e.g. a body edit) — must not add a second link row.
+        self._upsert_vec("/user/al-dup-b", vec, title="AutoLinkDupB", body="edited")
+        conn = _local_conn()
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_links ml "
+                "JOIN memory_nodes a ON ml.from_id = a.id JOIN memory_nodes b ON ml.to_id = b.id "
+                "WHERE (a.path = %s AND b.path = %s) OR (a.path = %s AND b.path = %s)",
+                ("/user/al-dup-a", "/user/al-dup-b", "/user/al-dup-b", "/user/al-dup-a"),
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+        assert count == 1
+
+    def test_extracted_origin_not_auto_linked(self):
+        vec = [0.6] * 384
+        self._upsert_vec("/user/al-ext-a", vec, title="AutoLinkExtA")
+        self._upsert_vec("/user/al-ext-b", vec, title="AutoLinkExtB", origin="extracted")
+        import diary_server
+        result = diary_server.memory_explain("/user/al-ext-a")
+        assert "al-ext-b" not in result
+
+    def test_respects_max_new_cap(self):
+        import memory_service
+        vec = [0.7] * 384
+        for i in range(memory_service.AUTO_LINK_MAX_NEW + 2):
+            self._upsert_vec(f"/user/al-cap-{i}", vec, title=f"AutoLinkCap{i}")
+        self._upsert_vec("/user/al-cap-new", vec, title="AutoLinkCapNew")
+        import diary_server
+        result = diary_server.memory_explain("/user/al-cap-new")
+        assert result.count("-->") <= memory_service.AUTO_LINK_MAX_NEW

@@ -18,6 +18,14 @@ from diary_bootstrap import mcp
 # Extracted memories auto-expire after this many days unless promoted to curated.
 EXTRACTED_TTL_DAYS = 90
 
+# Write-time auto-linking (v0.13.0): same similarity bar as memory_infer_links'
+# default, but capped much lower per call since this fires on every curated
+# upsert — a handful of new links per save is useful context, dozens would be
+# graph spam. The periodic batch job (scripts/link_inference_cron.py) uses the
+# higher max_new from memory_infer_links for its less-frequent, whole-tree pass.
+AUTO_LINK_THRESHOLD = 0.82
+AUTO_LINK_MAX_NEW = 3
+
 # memory_context() session snapshot bounds. The "recently updated" section dumps
 # full bodies; without caps it can exceed the MCP client's token limit when many
 # nodes were touched recently (e.g. right after seeding the DB). Cap node count
@@ -258,6 +266,51 @@ def _refresh_vector(conn, path: str, embedding) -> None:
     )
 
 
+def _auto_link_new_node(conn, node_id, embedding) -> list[str]:
+    """Compares a freshly upserted curated node against every other curated,
+    embedded node and inserts an inferred 'related' link for pairs above
+    AUTO_LINK_THRESHOLD — capped at AUTO_LINK_MAX_NEW (highest-similarity
+    first). Skips pairs that already have ANY link (explicit or inferred, any
+    rel_type) so it never overrides or duplicates one. Returns the paths of
+    newly-linked nodes for the caller's result message."""
+    if embedding is None:
+        return []
+    others = conn.execute(
+        "SELECT id, path, embedding FROM memory_nodes "
+        "WHERE deleted_at IS NULL AND origin = 'curated' AND embedding IS NOT NULL AND id != %s",
+        (node_id,),
+    ).fetchall()
+    if not others:
+        return []
+
+    unit_new = diary_embed.normalize(embedding)
+    scored = []
+    for o in others:
+        sim = diary_embed.dot(unit_new, diary_embed.normalize(o["embedding"]))
+        if sim >= AUTO_LINK_THRESHOLD:
+            scored.append((sim, o))
+    scored.sort(key=lambda s: s[0], reverse=True)
+
+    created = []
+    for sim, o in scored:
+        if len(created) >= AUTO_LINK_MAX_NEW:
+            break
+        existing = conn.execute(
+            "SELECT id FROM memory_links WHERE (from_id=%s AND to_id=%s) OR (from_id=%s AND to_id=%s)",
+            (node_id, o["id"], o["id"], node_id),
+        ).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            "INSERT INTO memory_links (from_id, to_id, rel_type, link_origin) "
+            "VALUES (%s, %s, 'related', 'inferred') "
+            "ON CONFLICT (from_id, to_id, rel_type) DO NOTHING",
+            (node_id, o["id"]),
+        )
+        created.append(o["path"])
+    return created
+
+
 @mcp.tool()
 def memory_upsert(
     path: str,
@@ -301,15 +354,28 @@ def memory_upsert(
                 (title, body, type, tag_list, importance, valid_until_val, origin, embedding, path),
             )
             _refresh_vector(conn, path, embedding)
-            return f"Memory '{path}' aktualisiert."
+            node_id = existing["id"]
+            msg = f"Memory '{path}' aktualisiert."
         else:
-            conn.execute(
+            inserted = conn.execute(
                 "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, origin, embedding) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                 (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, origin, embedding),
-            )
+            ).fetchone()
             _refresh_vector(conn, path, embedding)
-            return f"Memory '{path}' erstellt."
+            node_id = inserted["id"]
+            msg = f"Memory '{path}' erstellt."
+
+        # Auto-link at write time (v0.13.0): only for curated nodes — the
+        # embedding just computed above is reused here for free, so a fresh
+        # or edited memory picks up its strongest related links immediately
+        # instead of waiting for a manual memory_infer_links() call or the
+        # periodic batch cron (scripts/link_inference_cron.py).
+        if origin == "curated":
+            auto_linked = _auto_link_new_node(conn, node_id, embedding)
+            if auto_linked:
+                msg += f" (+{len(auto_linked)} auto-verlinkt: {', '.join(auto_linked)})"
+        return msg
 
 
 @mcp.tool()

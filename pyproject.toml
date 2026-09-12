@@ -1,11 +1,11 @@
 [project]
 name = "diary-mcp"
-version = "0.12.0"
+version = "0.13.0"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.28.0",
+    "mcp>=1.28.0,<2",
     "psycopg[binary]>=3.1",
     "fastapi[standard]>=0.115",
     "uvicorn>=0.34",

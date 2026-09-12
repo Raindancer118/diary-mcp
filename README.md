@@ -99,6 +99,20 @@ Register in `settings.json` (see `~/.claude/hooks/` for the actual scripts):
 - **UserPromptSubmit** (`diary_prompt_retrieval.py`) runs the current prompt through Postgres FTS (the same tsvector index `memory_search` uses) against curated memories, scoped the same way, and silently injects the top matches. Deliberately FTS-only, not semantic — loading the embedding model fresh on every single prompt would reintroduce the cold-start stall documented in `Project.md`'s v0.8.1 postmortem. This replaced the old `trigger_keywords`/`memory_set_keywords` mechanism (retired in v0.10.0), which required maintaining an exact keyword list per memory by hand.
 - **SessionEnd** optionally extracts structured memories from the conversation (per-project opt-in via `memory_set_project_config`, off by default).
 
+## Automatic linking (v0.13.0)
+
+Two complementary mechanisms keep the knowledge graph populated without a manual `memory_infer_links()` call:
+
+- **Write-time (`memory_upsert`):** every curated save/edit compares the node's just-computed embedding against all other curated, embedded nodes and inserts `related`/`inferred` links above `AUTO_LINK_THRESHOLD` (0.82, `memory_service.py`) — capped at `AUTO_LINK_MAX_NEW` (3) per upsert to avoid graph spam. Nearly free (the embedding is already computed for the save itself); immediate.
+- **Periodic batch (`scripts/link_inference_cron.py`):** re-runs `memory_infer_links()` over the whole curated tree — catches pairs the per-upsert pass can't (e.g. after `memory_reembed_all`, or ones that exceeded the per-upsert cap). NOT a Claude Code hook — a plain script for a scheduler, run with the diary-mcp tool's own installed Python so `import graph_admin` resolves:
+
+  ```
+  DIARY_LINK_INFERENCE_THRESHOLD=0.82 DIARY_LINK_INFERENCE_MAX_NEW=50 \
+    ~/.local/share/uv/tools/diary-mcp/bin/python scripts/link_inference_cron.py
+  ```
+
+  Deployed locally as a systemd user timer (daily, 04:30): `~/.config/systemd/user/diary-link-inference.{service,timer}`, enabled via `systemctl --user enable --now diary-link-inference.timer`. Output/errors log to `~/.local/share/diary-link-inference.log`.
+
 ## Memory tools
 
 | Tool | Purpose |
