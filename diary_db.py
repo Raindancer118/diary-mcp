@@ -392,6 +392,30 @@ _SCHEMA = [
     # stays fast and free of semantic-similarity false positives. Set via memory_set_keywords().
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS trigger_keywords TEXT[] DEFAULT '{}'",
     "CREATE INDEX IF NOT EXISTS memory_nodes_keywords_idx ON memory_nodes USING GIN(trigger_keywords) WHERE trigger_keywords <> '{}'",
+
+    # --- Diary federation (v0.15.0): E2EE pairing/sync with another person's
+    # diary-mcp via a separate relay service (diary-relay) that only ever sees
+    # ciphertext + public keys, never private keys or plaintext. See
+    # diary_link.py. Single-row table (at most one identity per local diary).
+    """CREATE TABLE IF NOT EXISTS diary_identity (
+        id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        display_name   TEXT NOT NULL,
+        private_key    BYTEA NOT NULL,
+        public_key     BYTEA NOT NULL,
+        relay_url      TEXT NOT NULL,
+        relay_diary_id TEXT NOT NULL,
+        relay_token    TEXT NOT NULL,
+        created_at     TIMESTAMPTZ DEFAULT now()
+    )""",
+    """CREATE TABLE IF NOT EXISTS diary_links (
+        id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        relay_link_id  TEXT NOT NULL UNIQUE,
+        peer_alias     TEXT NOT NULL UNIQUE,
+        peer_display_name TEXT NOT NULL,
+        peer_public_key BYTEA NOT NULL,
+        established_at TIMESTAMPTZ DEFAULT now(),
+        last_synced_at TIMESTAMPTZ
+    )""",
 ]
 
 # Backfill parent_id from path for any unlinked nodes (idempotent self-heal).

@@ -127,6 +127,11 @@ def clean_memory_nodes(test_databases):
         # "never synced" state (otherwise a prior test's last_sync would leak
         # and trip false conflict detection).
         conn.execute("DELETE FROM diary_meta")
+        # diary_identity is a singleton table — leaking one test's identity
+        # into the next would make every diary_link_init() call after the
+        # first report "already exists".
+        conn.execute("DELETE FROM diary_links")
+        conn.execute("DELETE FROM diary_identity")
 
     # Re-seed categories (init_db seeds them, but we deleted everything)
     diary_db.init_db()

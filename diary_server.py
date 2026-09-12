@@ -43,6 +43,7 @@ import memory_service  # noqa: E402
 import search_engine  # noqa: E402
 import graph_core  # noqa: E402
 import sync_manager  # noqa: E402
+import diary_link  # noqa: E402
 import graph_admin  # noqa: E402 — NOT registered on `mcp`, see module docstring above.
 
 # --- Re-exports: diary_project_tools -----------------------------------------
@@ -82,6 +83,12 @@ from graph_admin import (  # noqa: E402,F401
 
 # --- Re-exports: sync_manager --------------------------------------------------
 from sync_manager import memory_sync, memory_sync_diary, memory_purge_tombstones_diary  # noqa: E402,F401
+
+# --- Re-exports: diary_link (E2EE federation with another person's diary-mcp) --
+from diary_link import (  # noqa: E402,F401
+    diary_link_init, diary_link_create_pairing_code, diary_link_check_pairing_code,
+    diary_link_redeem_pairing_code, diary_link_list, diary_link_sync, diary_link_unlink,
+)
 
 
 def main() -> None:

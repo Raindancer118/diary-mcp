@@ -1,6 +1,6 @@
 [project]
 name = "diary-mcp"
-version = "0.14.0"
+version = "0.15.0"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,6 +10,8 @@ dependencies = [
     "fastapi[standard]>=0.115",
     "uvicorn>=0.34",
     "fastembed>=0.4",
+    "pynacl>=1.5",
+    "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -27,7 +29,7 @@ dev = [
 py-modules = [
     "diary_server", "diary_bootstrap", "diary_project_tools", "memory_service",
     "search_engine", "graph_core", "graph_admin", "diary_admin_bootstrap",
-    "diary_admin_server", "sync_manager",
+    "diary_admin_server", "sync_manager", "diary_link",
     "diary_db", "diary_config", "diary_logger", "diary_http_receiver", "diary_web", "diary_embed",
 ]
 

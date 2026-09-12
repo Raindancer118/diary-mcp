@@ -7,6 +7,7 @@ hybrid search, sync round-trip, extracted lifecycle, project config.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import time
 from datetime import datetime, timedelta
@@ -1729,3 +1730,236 @@ class TestMemoryListByTag:
         diary_server.memory_delete("/user/tag-deleted")
         result = diary_server.memory_list_by_tag("deltag")
         assert "tag-deleted" not in result
+
+
+# ===========================================================================
+# 23. Diary federation (v0.15.0): E2EE pairing/sync with another person's
+#     diary-mcp via the separate diary-relay service. diary_link.py talks to
+#     the relay over HTTP (mocked here via _relay_post/_relay_get/_relay_delete
+#     so these tests need no live relay) and does real PyNaCl encryption
+#     round-trips — the relay itself is tested in the diary-relay repo.
+# ===========================================================================
+
+class TestDiaryLink:
+    def _identity_row(self):
+        conn = _local_conn()
+        try:
+            return conn.execute("SELECT * FROM diary_identity LIMIT 1").fetchone()
+        finally:
+            conn.close()
+
+    def _insert_link(self, alias, peer_public_key_bytes, peer_display_name="Peer",
+                      relay_link_id="relay-link-1", last_synced_at=None):
+        conn = _local_conn()
+        try:
+            conn.execute(
+                "INSERT INTO diary_links (relay_link_id, peer_alias, peer_display_name, "
+                "peer_public_key, last_synced_at) VALUES (%s,%s,%s,%s,%s)",
+                (relay_link_id, alias, peer_display_name, peer_public_key_bytes, last_synced_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_init_creates_identity_and_registers(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}) as m:
+            result = diary_link.diary_link_init("Alice", "http://relay.test")
+        assert "Alice" in result
+        m.assert_called_once()
+        row = self._identity_row()
+        assert row is not None
+        assert row["display_name"] == "Alice"
+        assert row["relay_diary_id"] == "d1"
+        assert row["relay_token"] == "tok1"
+        assert len(bytes(row["private_key"])) == 32
+        assert len(bytes(row["public_key"])) == 32
+
+    def test_init_is_idempotent(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}) as m:
+            diary_link.diary_link_init("Alice", "http://relay.test")
+            result = diary_link.diary_link_init("Alice", "http://relay.test")
+        assert "bereits" in result
+        m.assert_called_once()
+
+    def test_create_pairing_code_without_identity(self):
+        import diary_link
+        with patch("diary_link._relay_post") as m:
+            result = diary_link.diary_link_create_pairing_code()
+        assert "diary_link_init" in result
+        m.assert_not_called()
+
+    def test_create_pairing_code_returns_code(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        with patch("diary_link._relay_post", return_value={"code": "ABC12345", "expires_at": "2026-01-01T00:00:00+00:00"}):
+            result = diary_link.diary_link_create_pairing_code()
+        assert "ABC12345" in result
+
+    def test_redeem_pairing_code_stores_link(self):
+        import diary_link
+        from nacl.public import PrivateKey
+        import base64
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        with patch("diary_link._relay_post", return_value={
+            "link_id": "relay-link-xyz", "peer_diary_id": "d2",
+            "peer_display_name": "Bob", "peer_public_key": base64.b64encode(bob_pub).decode(),
+        }):
+            result = diary_link.diary_link_redeem_pairing_code("SOMECODE", "bob")
+        assert "Bob" in result and "bob" in result
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT * FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert bytes(row["peer_public_key"]) == bob_pub
+        assert row["relay_link_id"] == "relay-link-xyz"
+
+    def test_redeem_rejects_duplicate_alias(self):
+        import diary_link
+        self._insert_link("bob", b"\x00" * 32)
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        with patch("diary_link._relay_post") as m:
+            result = diary_link.diary_link_redeem_pairing_code("SOMECODE", "bob")
+        assert "bob" in result
+        m.assert_not_called()
+
+    def test_list_shows_links(self):
+        import diary_link
+        self._insert_link("bob", b"\x01" * 32, peer_display_name="Bob", relay_link_id="relay-link-bob")
+        self._insert_link("carol", b"\x02" * 32, peer_display_name="Carol", relay_link_id="relay-link-carol")
+        result = diary_link.diary_link_list()
+        assert "bob" in result and "carol" in result
+
+    def test_sync_without_link_returns_error(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        result = diary_link.diary_link_sync("no-such-alias", "some-tag")
+        assert "no-such-alias" in result
+
+    def test_sync_push_and_pull_roundtrip(self):
+        import diary_link
+        import base64
+        from nacl.public import PrivateKey, PublicKey, Box
+
+        bob_priv = PrivateKey.generate()
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        alice_pub_bytes = bytes(self._identity_row()["public_key"])
+
+        self._insert_link("bob", bytes(bob_priv.public_key), peer_display_name="Bob",
+                           relay_link_id="relay-link-1")
+
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/share-me", title="ShareMe", body="secret body for bob",
+                    tags="share-with-bob")
+
+        pushed_ciphertexts = []
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            if path.endswith("/messages"):
+                pushed_ciphertexts.append(json_body["ciphertext"])
+                return {"message_id": "m1", "created_at": "2026-01-01T00:00:00+00:00"}
+            raise AssertionError(f"unexpected relay_post call: {path}")
+
+        # Simulate Bob having pushed one message meant for Alice.
+        incoming_box = Box(bob_priv, PublicKey(alice_pub_bytes))
+        incoming_payload = json.dumps({
+            "path": "/from-bob/note", "title": "FromBob", "body": "hi alice", "type": "note",
+        }).encode()
+        incoming_ciphertext = base64.b64encode(bytes(incoming_box.encrypt(incoming_payload))).decode()
+
+        def fake_relay_get(relay_url, path, token, params=None):
+            return {"messages": [{"message_id": "mx", "ciphertext": incoming_ciphertext,
+                                   "created_at": "2026-01-01T00:00:00+00:00"}]}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get), \
+             patch("diary_embed.embed", return_value=None):
+            result = diary_link.diary_link_sync("bob", "share-with-bob")
+
+        assert "1 gepusht" in result
+        assert "1 empfangen" in result
+
+        # Verify the pushed ciphertext decrypts (from Bob's side) to the original node.
+        assert len(pushed_ciphertexts) == 1
+        outgoing_box = Box(bob_priv, PublicKey(alice_pub_bytes))
+        decrypted = json.loads(outgoing_box.decrypt(base64.b64decode(pushed_ciphertexts[0])))
+        assert decrypted["title"] == "ShareMe"
+        assert decrypted["body"] == "secret body for bob"
+
+        # Verify the pulled message landed locally, namespaced under the alias.
+        received = _get_node("/links/bob/from-bob/note")
+        assert received is not None
+        assert received["title"] == "FromBob"
+        assert "from:bob" in received["tags"]
+
+        conn = _local_conn()
+        try:
+            link_row = conn.execute("SELECT last_synced_at FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert link_row["last_synced_at"] is not None
+
+    def test_unlink_removes_link_and_calls_relay(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        self._insert_link("bob", b"\x03" * 32, relay_link_id="relay-link-9")
+
+        with patch("diary_link._relay_delete", return_value={"status": "unlinked"}) as m:
+            result = diary_link.diary_link_unlink("bob")
+        assert "bob" in result
+        m.assert_called_once()
+        assert "relay-link-9" in m.call_args.args[1]
+
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT id FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row is None
+
+    def test_check_pairing_code_not_yet_redeemed(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        with patch("diary_link._relay_get", return_value={"redeemed": False}) as m:
+            result = diary_link.diary_link_check_pairing_code("SOMECODE", "bob")
+        assert "noch nicht eingelöst" in result
+        m.assert_called_once()
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT id FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row is None
+
+    def test_check_pairing_code_redeemed_stores_link(self):
+        import diary_link
+        import base64
+        from nacl.public import PrivateKey
+        bob_pub = bytes(PrivateKey.generate().public_key)
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        with patch("diary_link._relay_get", return_value={
+            "redeemed": True, "link_id": "relay-link-abc", "peer_diary_id": "d2",
+            "peer_display_name": "Bob", "peer_public_key": base64.b64encode(bob_pub).decode(),
+        }):
+            result = diary_link.diary_link_check_pairing_code("SOMECODE", "bob")
+        assert "Bob" in result and "bob" in result
+        conn = _local_conn()
+        try:
+            row = conn.execute("SELECT * FROM diary_links WHERE peer_alias = %s", ("bob",)).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert bytes(row["peer_public_key"]) == bob_pub
+        assert row["relay_link_id"] == "relay-link-abc"

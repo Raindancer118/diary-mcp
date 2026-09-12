@@ -128,6 +128,36 @@ Deployed locally as a systemd user timer (daily, 04:00, i.e. before the link-inf
 
 `memory_list_by_tag(tag, include_extracted=False)` — the `tags` column (settable since the original schema via `memory_upsert(tags=...)`) was write-only until v0.14.0; this queries curated nodes by exact tag match.
 
+## Diary federation (v0.15.0)
+
+E2EE pairing/sync with another person's diary-mcp instance via the separate
+[diary-relay](https://github.com/Raindancer118/diary-relay) service — see
+that repo for the server side and full trust model. The relay only ever
+sees ciphertext and public keys, never private keys or plaintext; encryption
+uses PyNaCl `Box` (X25519 + XSalsa20-Poly1305), one long-lived keypair per
+diary. Only a tag-scoped subset of curated memories is ever shared.
+
+```
+diary_link_init("Alice", "https://diary-relay.example")   # once, generates the keypair
+diary_link_create_pairing_code()                          # share the code out-of-band
+diary_link_check_pairing_code(code, "bob")                # poll until the other side redeems it
+# ...meanwhile the other person runs diary_link_redeem_pairing_code(code, "alice")...
+diary_link_sync("bob", "share-with-bob")                  # push tagged nodes, pull + decrypt theirs
+diary_link_list()
+diary_link_unlink("bob")
+```
+
+Incoming synced content lands under `/links/<alias>/<original-path>`, tagged
+`from:<alias>` — it never overwrites your own tree. Manual, explicit sync
+calls only in this phase (no automatic background sync). Verified end-to-end
+against a real running diary-relay with two separate diary-mcp processes
+(not just mocked tests) during development.
+
+**Not yet deployed to production** — diary-relay needs a Dorn port +
+firewall rule + Saphira reverse-proxy host before it's reachable by anyone
+outside `localhost`; see the plan doc for the exact steps, gated on explicit
+go-ahead since it touches shared production infrastructure.
+
 ## Memory tools
 
 | Tool | Purpose |
