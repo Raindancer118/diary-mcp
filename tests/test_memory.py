@@ -1908,6 +1908,47 @@ class TestDiaryLink:
             conn.close()
         assert link_row["last_synced_at"] is not None
 
+    def test_sync_since_param_sent_to_relay_is_utc(self):
+        """Reproduces /projects/diary-mcp/link-sync-pull-not-working-20260913:
+        diary-relay stores/compares `created_at` as UTC ISO strings via plain
+        SQLite text comparison (`created_at > ?`, deliberately no datetime
+        parsing on the relay). The local Postgres session's TIMESTAMPTZ values
+        come back with the session's own timezone offset (Europe/Berlin here,
+        not UTC) — if `since` is sent to the relay in that local offset,
+        `"+02:00"`-suffixed timestamps sort AFTER `"+00:00"`-suffixed ones with
+        the same or later real instant, so genuinely new peer messages are
+        silently excluded and diary_link_sync() reports "0 empfangen" forever
+        after the first call bumps last_synced_at."""
+        import diary_link
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from nacl.public import PrivateKey
+
+        bob_priv = PrivateKey.generate()
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        # Simulate what a Postgres session with TimeZone=Europe/Berlin actually
+        # returns for a TIMESTAMPTZ column: a tz-aware datetime in local offset.
+        local_last_sync = datetime(2026, 9, 13, 16, 0, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+        self._insert_link("bob", bytes(bob_priv.public_key), relay_link_id="relay-link-1",
+                           last_synced_at=local_last_sync)
+
+        captured_params = []
+
+        def fake_relay_get(relay_url, path, token, params=None):
+            captured_params.append(params)
+            return {"messages": []}
+
+        with patch("diary_link._relay_post", return_value={"message_id": "m", "created_at": "x"}), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get):
+            diary_link.diary_link_sync("bob", "no-such-tag")
+
+        since = captured_params[0]["since"]
+        assert since.endswith("+00:00") or since.endswith("Z"), (
+            f"since param sent to the relay must be normalized to UTC to compare "
+            f"correctly against the relay's UTC-stored created_at strings — got {since!r}"
+        )
+
     def test_sync_second_call_only_pushes_changed_nodes(self):
         """A repeated diary_link_sync() must not resend unchanged nodes every
         time (that would mean a nightly cron re-pushing the whole tag scope as

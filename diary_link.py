@@ -27,6 +27,7 @@ touched by the cron job.
 """
 import base64
 import json
+from datetime import timezone
 
 import httpx
 from nacl.public import Box, PrivateKey, PublicKey
@@ -378,7 +379,15 @@ def diary_link_sync(alias: str, tag: str) -> str:
 
         pushed = _push_nodes_for_tag(conn, identity, own_priv, link, tag, since=link["last_synced_at"])
 
-        params = {"since": link["last_synced_at"].isoformat()} if link["last_synced_at"] else {}
+        # The relay stores/compares `created_at` as plain UTC ISO strings
+        # (deliberately no datetime parsing, see diary-relay/app.py) — the
+        # local Postgres session returns TIMESTAMPTZ values in its own session
+        # timezone (e.g. Europe/Berlin), so `since` MUST be normalized to UTC
+        # here or a "+02:00"-suffixed value can string-sort after genuinely
+        # newer "+00:00" relay timestamps and silently hide new messages
+        # (see /projects/diary-mcp/link-sync-pull-not-working-20260913).
+        params = ({"since": link["last_synced_at"].astimezone(timezone.utc).isoformat()}
+                  if link["last_synced_at"] else {})
         pulled = _relay_get(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
                              token=identity["relay_token"], params=params)
 
