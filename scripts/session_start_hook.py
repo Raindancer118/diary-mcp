@@ -37,10 +37,15 @@ def _database_url() -> str:
     return os.environ.get("DIARY_DATABASE_URL", "postgresql://localhost/diary_mcp")
 
 
+def _log_error(context: str, exc: Exception) -> None:
+    print(f"[diary-mcp session_start_hook] {context}: {exc!r}", file=sys.stderr)
+
+
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
-    except Exception:
+    except Exception as exc:
+        _log_error("failed to parse stdin JSON", exc)
         payload = {}
 
     source = payload.get("source") or "startup"
@@ -58,7 +63,8 @@ def main() -> None:
     try:
         import psycopg
         from psycopg.rows import dict_row
-    except Exception:
+    except Exception as exc:
+        _log_error("psycopg import failed", exc)
         return
 
     base = f"/projects/{slug}"
@@ -72,7 +78,8 @@ def main() -> None:
                 "ORDER BY (path LIKE %s) DESC, importance DESC, path",
                 (trigger, base, f"{base}/%", f"{base}%"),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        _log_error("DB query failed", exc)
         return
 
     if not rows:
