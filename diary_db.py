@@ -239,17 +239,12 @@ _SCHEMA = [
         access_count INTEGER DEFAULT 0,
         accessed_at  TIMESTAMPTZ,
         valid_until  TIMESTAMPTZ,
-        auto_inject  BOOLEAN DEFAULT FALSE,
         origin       TEXT NOT NULL DEFAULT 'curated',
         created_at   TIMESTAMPTZ DEFAULT now(),
         updated_at   TIMESTAMPTZ DEFAULT now()
     )""",
     # Migrations: add columns to existing tables (idempotent)
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ",
-    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS auto_inject BOOLEAN DEFAULT FALSE",
-    # reinject_on_compact: re-inject this memory into context after a compaction
-    # (for setups that compact often). Independent of auto_inject (session start).
-    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS reinject_on_compact BOOLEAN DEFAULT FALSE",
     # origin: 'curated' = von Claude bewusst gespeichert (Default-Suche).
     #         'extracted' = automatisch aus Chat-Transkripten geerntet (nur auf Anfrage).
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'curated'",
@@ -263,34 +258,12 @@ _SCHEMA = [
     # resurrecting them on the next sync. Excluded from every read path.
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS memory_nodes_deleted_idx ON memory_nodes(deleted_at) WHERE deleted_at IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS memory_nodes_autoinject_idx ON memory_nodes(auto_inject) WHERE auto_inject",
     "CREATE INDEX IF NOT EXISTS memory_nodes_origin_idx ON memory_nodes(origin)",
-    # pin_triggers: ersetzt auto_inject + reinject_on_compact durch ein einzelnes Array-Konzept.
-    # Erlaubte Werte: 'start' (= session start, war auto_inject) und 'compact' (= nach
-    # Kompaktierung, war reinject_on_compact). Leer-Array = nicht gepinnt.
+    # pin_triggers: 'start' (session start) und/oder 'compact' (nach Kompaktierung).
+    # Leer-Array = nicht gepinnt. Ersetzt die früheren auto_inject/reinject_on_compact
+    # Spalten (Migration dazu ist abgeschlossen und wurde entfernt, siehe git history).
     "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS pin_triggers TEXT[] DEFAULT '{}'",
     "CREATE INDEX IF NOT EXISTS memory_nodes_pin_idx ON memory_nodes USING GIN(pin_triggers) WHERE pin_triggers <> '{}'",
-    # Migration: pin_triggers aus alten Spalten befüllen + alte Spalten entfernen (idempotent).
-    # Prüft via information_schema, ob auto_inject noch existiert; wenn ja, backfill + DROP.
-    """DO $$
-    BEGIN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'memory_nodes' AND column_name = 'auto_inject'
-        ) THEN
-            UPDATE memory_nodes SET pin_triggers = (
-                CASE
-                    WHEN auto_inject AND reinject_on_compact THEN ARRAY['start','compact']
-                    WHEN auto_inject THEN ARRAY['start']
-                    WHEN reinject_on_compact THEN ARRAY['compact']
-                    ELSE '{}'::TEXT[]
-                END
-            );
-            ALTER TABLE memory_nodes DROP COLUMN IF EXISTS auto_inject;
-            ALTER TABLE memory_nodes DROP COLUMN IF EXISTS reinject_on_compact;
-        END IF;
-    END
-    $$""",
     # Knowledge-graph: associative links between memory nodes
     # rel_type: related | supports | contradicts | requires | derived_from
     """CREATE TABLE IF NOT EXISTS memory_links (
