@@ -35,8 +35,29 @@ def sock_path() -> Path:
     override = os.environ.get("DIARY_EMBED_SOCK")
     if override:
         return Path(override)
-    base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        # Per-user, mode 0700 by systemd convention — already private.
+        base = Path(xdg)
+    else:
+        # tempfile.gettempdir() (/tmp) is world-writable — a plain socket
+        # there lets another local user pre-create the path, squat on the
+        # name, or read memory content sent as embed requests. Use a
+        # dedicated per-uid subdirectory instead so only we can create or
+        # see files in it.
+        base = Path(tempfile.gettempdir()) / f"diary-mcp-{os.getuid()}"
+    _ensure_private_dir(base)
     return base / "diary-mcp-embed.sock"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create path as a directory only this user can read/write/enter, and
+    refuse to trust it if it already exists owned by someone else."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = path.stat()
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"refusing to use {path}: owned by uid {st.st_uid}, not us")
+    os.chmod(path, 0o700)
 
 
 def _send_message(conn: socket.socket, payload: bytes) -> None:
@@ -58,9 +79,21 @@ def _recv_message(conn: socket.socket) -> bytes:
     return _recv_exact(conn, length)
 
 
+def _owned_by_us(path: Path) -> bool:
+    """False if the socket file exists but belongs to another local user —
+    never connect to or trust such a socket (it could be an impersonation
+    attempt reading memory content sent as embed requests)."""
+    try:
+        return path.stat().st_uid == os.getuid()
+    except FileNotFoundError:
+        return False
+
+
 def _is_alive(path: Path) -> bool:
     """True if something is actually listening on path (vs. a stale socket
     file left behind by a process that died without cleaning up)."""
+    if not _owned_by_us(path):
+        return False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
@@ -85,9 +118,23 @@ class EmbedServer:
         instead)."""
         path = sock_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # A pre-existing socket file we don't own is never ours to reclaim —
+        # could be another local user's file (impersonation/hijack attempt).
+        # Refuse outright rather than trying to unlink or bind over it.
+        if path.exists() and not _owned_by_us(path):
+            _log.warning(
+                "Refusing embed IPC socket at %s: owned by another user", path
+            )
+            return False
+
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.bind(str(path))
+            old_umask = os.umask(0o177)  # belt-and-suspenders: bind creates the file 0600
+            try:
+                sock.bind(str(path))
+            finally:
+                os.umask(old_umask)
         except OSError:
             if _is_alive(path):
                 sock.close()
@@ -95,15 +142,20 @@ class EmbedServer:
             # Stale socket file from a process that died uncleanly — reclaim it.
             try:
                 path.unlink()
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 pass
             try:
-                sock.bind(str(path))
+                old_umask = os.umask(0o177)
+                try:
+                    sock.bind(str(path))
+                finally:
+                    os.umask(old_umask)
             except OSError as exc:
                 _log.warning("Could not bind embed IPC socket at %s: %s", path, exc)
                 sock.close()
                 return False
 
+        os.chmod(path, 0o600)
         sock.listen(32)
         self._sock = sock
         self._path = path
@@ -161,6 +213,10 @@ def request_remote(texts: list[str], timeout: float = 30.0) -> list | None:
     """Ask the shared embedding server (if any) to embed texts. Returns None
     on any failure — caller should fall back to loading its own model."""
     path = sock_path()
+    if path.exists() and not _owned_by_us(path):
+        # Never send memory content to a socket owned by another local user.
+        _log.warning("Refusing to use embed IPC socket at %s: owned by another user", path)
+        return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)

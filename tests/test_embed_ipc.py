@@ -69,6 +69,43 @@ def test_client_roundtrip_through_server(sock_path):
         server.stop()
 
 
+def test_socket_created_with_restrictive_permissions(sock_path):
+    server = ipc.EmbedServer(lambda texts: [[1.0] for _ in texts])
+    assert server.try_start() is True
+    try:
+        mode = sock_path.stat().st_mode & 0o777
+        assert mode == 0o600
+    finally:
+        server.stop()
+
+
+def test_default_sock_path_uses_private_per_uid_dir(monkeypatch):
+    monkeypatch.delenv("DIARY_EMBED_SOCK", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    path = ipc.sock_path()
+    assert f"-{os.getuid()}" in path.parent.name
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
+    assert path.parent.stat().st_uid == os.getuid()
+
+
+def test_refuses_foreign_owned_socket_file(sock_path, monkeypatch):
+    # Simulate a socket file that exists but isn't ours by making
+    # _owned_by_us report False, regardless of the real filesystem owner
+    # (we can't actually chown to another uid without root in a test).
+    real_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    real_sock.bind(str(sock_path))
+    real_sock.listen(1)
+    try:
+        monkeypatch.setattr(ipc, "_owned_by_us", lambda p: False)
+        server = ipc.EmbedServer(lambda texts: [[1.0] for _ in texts])
+        assert server.try_start() is False  # must not reclaim/bind over it
+
+        vectors = ipc.request_remote(["x"], timeout=1.0)
+        assert vectors is None  # must not send data to it either
+    finally:
+        real_sock.close()
+
+
 def test_liveness_probe_does_not_disrupt_server(sock_path, caplog):
     # _is_alive() connects and disconnects without sending anything (that's
     # exactly what election does when it finds an existing socket file).
