@@ -33,9 +33,15 @@ init_db()
 # Loading the embedding model (heavy import + ONNX session init) takes seconds
 # and would otherwise happen synchronously inside whichever tool call embeds
 # first (memory_search always embeds the query). Warm it in the background so
-# it's typically ready before the user's first real request lands; _get_model's
-# lock makes this race-safe against a real request that beats the warmup.
-threading.Thread(target=diary_embed.is_available, daemon=True, name="embed-warmup").start()
+# it's typically ready before the user's first real request lands.
+#
+# diary_embed.warmup() first elects this process's role in the shared-
+# embedding IPC scheme (diary_embed_ipc.py): if another diary-mcp process on
+# this machine already owns the model, this process becomes a lightweight
+# client and never loads its own ~470MB copy — only the elected server does.
+# _get_model's lock makes eager loading race-safe against a real request
+# that beats the warmup.
+threading.Thread(target=diary_embed.warmup, daemon=True, name="embed-warmup").start()
 
 # Import for @mcp.tool() registration side effects.
 import diary_project_tools  # noqa: E402

@@ -18,6 +18,8 @@ import os
 import threading
 from pathlib import Path
 
+import diary_embed_ipc as _ipc
+
 _log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -37,14 +39,63 @@ _model = None
 _unavailable = False
 _load_lock = threading.Lock()
 
+# Shared-embedding IPC role: "server" (owns the model, serves others),
+# "client" (routes through another process's server), or "standalone"
+# (IPC disabled, always loads its own copy). See diary_embed_ipc.py.
+_role: str | None = None
+_role_lock = threading.Lock()
+_server: _ipc.EmbedServer | None = None
+
 
 def model_name() -> str:
     return os.environ.get("DIARY_EMBED_MODEL", DEFAULT_MODEL)
 
 
 def is_available() -> bool:
-    """True if embeddings can be produced (model loads). Cached after first check."""
+    """True if embeddings can be produced (model loads, or a remote server is
+    reachable)."""
+    role = _ensure_role()
+    if role == "client":
+        if _ipc.request_remote(["ping"], timeout=5.0) is not None:
+            return True
+        _downgrade_to_standalone()
     return _get_model() is not None
+
+
+def _ensure_role() -> str:
+    """Elect this process's role in the shared-embedding IPC scheme, once.
+
+    The first process on the machine to bind the shared socket becomes the
+    server and loads the model for everyone; later processes become clients
+    and never load their own copy unless the server later becomes
+    unreachable (see embed_many's fallback)."""
+    global _role, _server
+    if _role is not None:
+        return _role
+    with _role_lock:
+        if _role is not None:
+            return _role
+        if os.environ.get("DIARY_EMBED_NO_IPC"):
+            _role = "standalone"
+            return _role
+        server = _ipc.EmbedServer(_compute_local)
+        if server.try_start():
+            _server = server
+            _role = "server"
+            _log.info("Elected as shared-embedding server")
+        else:
+            _role = "client"
+            _log.info("Using shared-embedding server from another process")
+        return _role
+
+
+def _downgrade_to_standalone() -> None:
+    """Called when the elected remote server turns out to be unreachable
+    (e.g. it exited). Fall back to loading a local model for this process
+    from now on, rather than retrying a dead socket on every call."""
+    global _role
+    _log.warning("Shared-embedding server unreachable; loading local model instead")
+    _role = "standalone"
 
 
 def _get_model():
@@ -71,23 +122,12 @@ def _get_model():
             return None
 
 
-def embed(text: str) -> list[float] | None:
-    """Embed a single text. Returns None if embeddings are unavailable."""
-    if not text or not text.strip():
-        return None
-    model = _get_model()
-    if model is None:
-        return None
-    try:
-        vec = next(iter(model.embed([text])))
-        return [float(x) for x in vec]
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("Embedding failed: %s", exc)
-        return None
-
-
-def embed_many(texts: list[str]) -> list[list[float] | None]:
-    """Embed many texts in one batch. Returns a list aligned with the input."""
+def _compute_local(texts: list[str]) -> list[list[float] | None]:
+    """Embed texts using this process's own model (loading it if needed).
+    This is the function the IPC server runs to answer remote requests, and
+    what server/standalone roles fall through to locally."""
+    if not texts:
+        return []
     model = _get_model()
     if model is None:
         return [None] * len(texts)
@@ -96,6 +136,39 @@ def embed_many(texts: list[str]) -> list[list[float] | None]:
     except Exception as exc:  # noqa: BLE001
         _log.warning("Batch embedding failed: %s", exc)
         return [None] * len(texts)
+
+
+def embed(text: str) -> list[float] | None:
+    """Embed a single text. Returns None if embeddings are unavailable."""
+    if not text or not text.strip():
+        return None
+    return embed_many([text])[0]
+
+
+def embed_many(texts: list[str]) -> list[list[float] | None]:
+    """Embed many texts in one batch. Returns a list aligned with the input.
+
+    Routes through the shared-embedding server when this process is a client
+    (see _ensure_role); otherwise computes locally."""
+    if not texts:
+        return []
+    role = _ensure_role()
+    if role == "client":
+        vectors = _ipc.request_remote(texts)
+        if vectors is not None:
+            return vectors
+        _downgrade_to_standalone()
+    return _compute_local(texts)
+
+
+def warmup() -> None:
+    """Elect this process's IPC role and, only if it ends up owning the
+    model (server or standalone), load it eagerly in the background so it's
+    typically ready before the first real request. A client never loads its
+    own copy — that's the entire point of the shared server."""
+    role = _ensure_role()
+    if role in ("server", "standalone"):
+        _get_model()
 
 
 def cosine(a: list[float], b: list[float]) -> float:
