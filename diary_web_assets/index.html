@@ -83,7 +83,12 @@
       <div class="atlas-title">
         <h1>Sternkarte</h1>
         <p id="atlas-caption">Verknüpfte Erinnerungen bilden Sternbilder. Unverbundene treiben als Feldsterne am Rand.</p>
-        <button type="button" class="fresh-chip" id="atlas-fresh" hidden><span class="fc-star" aria-hidden="true">✦</span><b>0</b> neue Verbindungen seit deinem letzten Besuch <span class="fc-act">Nochmal abspielen</span></button>
+        <div class="fresh-bar" id="atlas-fresh-bar" hidden>
+          <button type="button" class="fresh-chip" id="atlas-fresh"><span class="fc-star" aria-hidden="true">✦</span><span class="fc-text"></span><span class="fc-act"></span></button>
+          <div class="speed" id="atlas-speed" role="radiogroup" aria-label="Tempo der Animation">
+            <button type="button" role="radio" data-speed="0.5">½×</button><button type="button" role="radio" data-speed="1">1×</button><button type="button" role="radio" data-speed="2">2×</button><button type="button" role="radio" data-speed="4">4×</button>
+          </div>
+        </div>
       </div>
       <div class="atlas-controls">
         <label class="switch"><input type="checkbox" id="atlas-extracted"><span>Extrahierte zeigen</span></label>

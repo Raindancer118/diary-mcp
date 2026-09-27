@@ -759,11 +759,16 @@ body[data-view="review"] .views a[data-view="review"]::after { transform: scaleX
 .autorun-actions { display: flex; gap: 10px; align-items: center; }
 .autorun-actions a { color: var(--accent); font-size: 13.5px; text-underline-offset: 3px; }
 
+.fresh-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; pointer-events: auto; animation: rise .5s 1.4s var(--ease-out) both; }
+.speed { display: inline-flex; padding: 3px; border: 1px solid var(--rule); border-radius: 999px; background: rgb(21 18 15 / .85); }
+.speed button { min-height: 28px; min-width: 38px; padding: 0 8px; border: 0; border-radius: 999px; background: none; color: var(--dust); font: 12px var(--mono); transition: background .25s, color .25s, scale .4s var(--spring); }
+.speed button:active { scale: .92; }
+.speed button[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); }
 .fresh-chip {
-  pointer-events: auto; margin-top: 14px;
+  pointer-events: auto;
   display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 14px 0 12px;
   border: 1px solid rgb(232 168 76 / .45); border-radius: 999px; background: rgb(21 18 15 / .85);
-  color: var(--ink-2); font-size: 13px; animation: rise .5s 1.4s var(--ease-out) both;
+  color: var(--ink-2); font-size: 13px;
 }
 .fresh-chip b { color: var(--accent); font-weight: 600; }
 .fresh-chip .fc-star { color: var(--accent); animation: pulse 2.4s ease-in-out infinite; }

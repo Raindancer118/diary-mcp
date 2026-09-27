@@ -99,6 +99,12 @@ bleiben ruhig, Charakter kommt aus Federn und einem kräftigen Einstieg.
   Heatmap blendet diagonal ein, Abschnitte erscheinen scroll-getrieben.
 - **Sternkarte:** Intro-Zoom, Sterne funkeln minimal, Hover dimmt alles außer
   dem Sternbild, Klick fliegt zum Stern.
+- **Neue Verbindungen (seit letztem Besuch):** eine nach der anderen zieht
+  sich eine dünne Bernstein-Linie langsam von Stern zu Stern (ease-in-out),
+  glüht beim Ankommen kurz nach und beruhigt sich; erst dann startet die
+  nächste. Keine Kometen, keine Ringe (Tom, 27.09.). Dauer je Linie 1,4 s,
+  bei vielen schneller (min. 0,45 s), Gesamtdeckel ~90 s, Rest blendet
+  gemeinsam ein. Chip zeigt Fortschritt + Überspringen / Nochmal abspielen.
 - **`prefers-reduced-motion: reduce`:** alles aus, Endzustände sofort. In
   verborgenen Tabs (kein rAF) wird ebenfalls sofort der Endzustand gezeichnet.
 

@@ -149,7 +149,7 @@ The model is refitted nightly on the **deliberate** links only (set by hand or a
 - Hand-set links are never touched; existing automatic links are re-scored, never deleted.
 - **Project spine:** inside every `/projects/<slug>/` the strongest pairs are linked until the project is connected (Kruskal on confidence, existing links count, rejected pairs are skipped): at most n−1 links, never a clique. A new project memory without a project link gets its nearest sibling at write time. Spine links carry `note = 'Projekt-Rückgrat'` and their honest (often low) confidence.
 - **Manual run:** diary-web → Vorschläge → *Auto-Connect*: preview (dry run with examples) first, then run. A Postgres advisory lock keeps the button and the nightly timer from running at the same time (`409` / "läuft bereits").
-- **Star map:** connections created since your last visit draw in as comets with a flare at the target; *Nochmal abspielen* replays them.
+- **Star map:** connections created since your last visit are drawn one after another: a line slowly pulls from star to star and glows once on arrival. Tempo ½×–4× (remembered, adjustable mid-playback), *Überspringen* / *Nochmal abspielen*.
 
 Runs at write time (`memory_upsert`, ~65 ms with a warm per-process cache, at most `AUTO_LINK_MAX_NEW` non-mention links per save) and nightly over the whole tree (`scripts/link_inference_cron.py`, systemd user timer `diary-link-inference.timer`, 04:30, log `~/.local/share/diary-link-inference.log`). `memory_stats` and diary-web show auto-link and suggestion counts. The admin tool `memory_infer_links(threshold)` is the older pure-cosine variant for manual use.
 

@@ -648,9 +648,13 @@ const atlas = (() => {
   let cam = { x: 0, y: 0, k: 1 }, tween = null;
   let alpha = 0, active = false, loaded = false, loading = false, raf = 0, introT0 = 0;
   let hover = null, drag = null, pan = null;
-  // new connections since the last visit: comet along the edge, flare at the target
-  const SEEN_KEY = 'diary.atlas.seenLinks', COMET_MS = 900, FLARE_MS = 700, GLOW_MS = 6000;
-  let fresh = [], freshUntil = 0;
+  // New connections since the last visit, drawn one after another: a line slowly
+  // pulls from star to star, glows once on arrival, then the next one starts.
+  const SEEN_KEY = 'diary.atlas.seenLinks';
+  const DRAW_MAX = 1400, DRAW_MIN = 450, GAP_MS = 120, AFTERGLOW_MS = 2200, SETTLE_MS = 3000, TOTAL_MS = 90000;
+  const SPEEDS = [0.5, 1, 2, 4];
+  let fresh = [], freshUntil = 0, freshShown = -1;
+  let speed = SPEEDS.includes(Number(localStorage.getItem('diary.atlas.speed'))) ? Number(localStorage.getItem('diary.atlas.speed')) : 1;
   const sprites = {};
 
   function sprite(type) {
@@ -822,69 +826,105 @@ const atlas = (() => {
     const seen = localStorage.getItem(SEEN_KEY);
     fresh = seen === null ? [] : edges.filter(e => e.created > Number(seen)).sort((x, y) => x.created - y.created);
     if (newest) localStorage.setItem(SEEN_KEY, String(Math.max(newest, Number(seen) || 0)));
-    const chip = $('#atlas-fresh');
-    chip.hidden = !fresh.length;
-    if (fresh.length) $('b', chip).textContent = fmt(fresh.length);
+    freshShown = -1;
+    $('#atlas-fresh-bar').hidden = !fresh.length;
+    updateChip(performance.now());
   }
 
   function scheduleFresh(t0) {
     if (!fresh.length) return;
-    const animated = Math.min(fresh.length, 120);
-    const stagger = Math.min(140, 4200 / animated);
-    fresh.forEach((e, i) => { e.anim = t0 + Math.min(i, animated - 1) * stagger; });
-    freshUntil = t0 + animated * stagger + COMET_MS + FLARE_MS + GLOW_MS;
+    const n = fresh.length;
+    const base = Math.max(DRAW_MIN, Math.min(DRAW_MAX, TOTAL_MS / n - GAP_MS));
+    const sequential = Math.min(n, Math.floor(TOTAL_MS / (base + GAP_MS)));
+    const dur = base / speed, gap = GAP_MS / speed;
+    const tail = t0 + sequential * (dur + gap);
+    fresh.forEach((e, i) => {
+      if (i < sequential) { e.anim = t0 + i * (dur + gap); e.dur = dur; }
+      else { e.anim = tail; e.dur = 1200 / speed; }  // whatever doesn't fit the budget draws in together at the end
+    });
+    const last = fresh[n - 1];
+    freshUntil = last.anim + last.dur + afterglow() + SETTLE_MS;
+    freshShown = -1;
     request();
   }
 
-  let comet = null;
-  function cometSprite() {
-    if (comet) return comet;
-    comet = document.createElement('canvas');
-    comet.width = comet.height = 32;
-    const g = comet.getContext('2d'), grd = g.createRadialGradient(16, 16, 0, 16, 16, 16);
-    grd.addColorStop(0, 'rgba(255,250,235,1)');
-    grd.addColorStop(.2, 'rgba(255,214,150,.95)');
-    grd.addColorStop(.5, 'rgba(232,168,76,.35)');
-    grd.addColorStop(1, 'rgba(232,168,76,0)');
-    g.fillStyle = grd;
-    g.fillRect(0, 0, 32, 32);
-    return comet;
+  const afterglow = () => AFTERGLOW_MS / speed;
+
+  // Changing the tempo mid-playback re-times everything around "now": no jump, no restart.
+  function setSpeed(next) {
+    if (!SPEEDS.includes(next) || next === speed) return;
+    const f = speed / next, now = performance.now();
+    speed = next;
+    localStorage.setItem('diary.atlas.speed', String(next));
+    for (const e of fresh) {
+      if (e.anim == null) continue;
+      e.anim = now + (e.anim - now) * f;
+      e.dur *= f;
+    }
+    if (freshUntil > now) freshUntil = now + (freshUntil - now) * f;
+    renderSpeed();
+    request();
+  }
+
+  function renderSpeed() {
+    $$('#atlas-speed button').forEach(b => b.setAttribute('aria-checked', String(Number(b.dataset.speed) === speed)));
+  }
+
+  function skipFresh() {
+    const now = performance.now();
+    for (const e of fresh) { e.anim = now - (e.dur || 0) - afterglow(); }
+    freshUntil = now + SETTLE_MS;
+    paintNow();
+    request();
+  }
+
+  function updateChip(t) {
+    if (!fresh.length) return;
+    const drawn = fresh.reduce((k, e) => k + (e.anim != null && t >= e.anim + e.dur ? 1 : 0), 0);
+    const playing = !REDUCED.matches && fresh.some(e => e.anim != null) && drawn < fresh.length;
+    const key = playing ? drawn : -2;
+    if (key === freshShown) return;
+    freshShown = key;
+    const chip = $('#atlas-fresh');
+    chip.dataset.mode = playing ? 'skip' : 'replay';
+    $('.fc-text', chip).innerHTML = playing
+      ? `<b>${fmt(drawn)} / ${fmt(fresh.length)}</b> neue Verbindungen`
+      : `<b>${fmt(fresh.length)}</b> neue Verbindungen seit deinem letzten Besuch`;
+    $('.fc-act', chip).textContent = playing ? 'Überspringen' : 'Nochmal abspielen';
+  }
+
+  function strokeLine(x1, y1, x2, y2, width, rgba) {
+    ctx.strokeStyle = rgba; ctx.lineWidth = width;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
   }
 
   function drawFresh(t) {
+    ctx.lineCap = 'round';
+    const settle = Math.max(0, Math.min(1, (freshUntil - t) / SETTLE_MS));
     for (const e of fresh) {
-      if (e.a.hidden || e.b.hidden || e.anim == null) continue;
+      if (e.a.hidden || e.b.hidden) continue;
       const [ax, ay] = toScreen(e.a), [bx, by] = toScreen(e.b);
-      if (REDUCED.matches) {
-        ctx.strokeStyle = 'rgba(232,168,76,.75)'; ctx.lineWidth = 1.4;
-        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      if (REDUCED.matches || e.anim == null) {
+        strokeLine(ax, ay, bx, by, 1.3, 'rgba(232,168,76,.7)');
         continue;
       }
       const since = t - e.anim;
       if (since < 0) continue;
-      const p = Math.min(1, since / COMET_MS), q = easeOut(p);
-      const hx = ax + (bx - ax) * q, hy = ay + (by - ay) * q;
-      if (p < 1) {
-        const grd = ctx.createLinearGradient(ax, ay, hx, hy);
-        grd.addColorStop(0, 'rgba(232,168,76,0)');
-        grd.addColorStop(1, 'rgba(255,214,150,.95)');
-        ctx.strokeStyle = grd; ctx.lineWidth = 1.8;
-        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(hx, hy); ctx.stroke();
-        ctx.drawImage(cometSprite(), hx - 10, hy - 10, 20, 20);
+      if (since < e.dur) {  // the line pulls from star to star
+        const q = easeInOut(since / e.dur);
+        const hx = ax + (bx - ax) * q, hy = ay + (by - ay) * q;
+        strokeLine(ax, ay, hx, hy, 4, 'rgba(232,168,76,.12)');
+        strokeLine(ax, ay, hx, hy, 1.3, 'rgba(255,214,150,.92)');
         continue;
       }
-      const glow = Math.max(0, 1 - (since - COMET_MS - FLARE_MS) / GLOW_MS);
-      if (glow > 0) {
-        ctx.strokeStyle = `rgba(232,168,76,${.12 + .6 * Math.min(1, glow)})`; ctx.lineWidth = 1.2;
-        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
-      }
-      const f = (since - COMET_MS) / FLARE_MS;
-      if (f < 1) {
-        ctx.strokeStyle = `rgba(255,214,150,${.7 * (1 - f)})`; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.arc(bx, by, 4 + 14 * easeOut(f), 0, Math.PI * 2); ctx.stroke();
-      }
+      const g = (since - e.dur) / afterglow();  // afterglow: quick swell, slow fade
+      const glow = g < 0 ? 0 : g < .15 ? g / .15 : Math.max(0, 1 - (g - .15) / .85);
+      if (glow > 0) strokeLine(ax, ay, bx, by, 2 + 5 * glow, `rgba(232,168,76,${.22 * glow})`);
+      const core = Math.max(.35 * settle, .35 + .55 * glow);
+      if (core > .01) strokeLine(ax, ay, bx, by, 1.2 + .4 * glow, `rgba(255,214,150,${core})`);
     }
     ctx.lineWidth = 1;
+    ctx.lineCap = 'butt';
   }
 
   // rAF never fires in hidden tabs; paint synchronously so the map is never blank.
@@ -923,7 +963,7 @@ const atlas = (() => {
     ctx.lineWidth = 1;
     for (const e of edges) {
       if (e.a.hidden || e.b.hidden) continue;
-      if (e.anim != null && !REDUCED.matches && t - e.anim < COMET_MS) continue;
+      if (e.anim != null && !REDUCED.matches && t < e.anim + e.dur) continue;  // still being drawn (or queued)
       const ap = Math.min(appear(e.a), appear(e.b));
       if (!ap) continue;
       const hot = hover && (e.a === hover || e.b === hover);
@@ -954,6 +994,7 @@ const atlas = (() => {
     }
     ctx.globalAlpha = 1;
     drawFresh(t);
+    updateChip(t);
 
     const labels = [];
     if (hover) { labels.push(hover, ...near); }
@@ -1067,10 +1108,16 @@ const atlas = (() => {
   }, { passive: false });
 
   $('#atlas-reset').addEventListener('click', () => tweenTo(fitCam(), 900));
-  $('#atlas-fresh').addEventListener('click', () => {
+  $('#atlas-speed').addEventListener('click', e => {
+    const b = e.target.closest('[data-speed]');
+    if (b) setSpeed(Number(b.dataset.speed));
+  });
+  renderSpeed();
+  $('#atlas-fresh').addEventListener('click', e => {
     if (!fresh.length) return;
-    if (fresh.length <= 12) tweenTo(fitCam([...new Set(fresh.flatMap(e => [e.a, e.b]))]), 900);
-    scheduleFresh(performance.now() + (fresh.length <= 12 ? 700 : 100));
+    if (e.currentTarget.dataset.mode === 'skip') { skipFresh(); return; }
+    if (fresh.length <= 12) tweenTo(fitCam([...new Set(fresh.flatMap(x => [x.a, x.b]))]), 900);
+    scheduleFresh(performance.now() + (fresh.length <= 12 ? 800 : 150));
   });
   $('#atlas-extracted').addEventListener('change', () => { loaded = false; load(); });
   $('#atlas-field').addEventListener('change', () => {
