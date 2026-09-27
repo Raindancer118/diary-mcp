@@ -24,7 +24,7 @@ def main() -> None:
         print(f"diary-link-inference-cron: import failed: {exc}", file=sys.stderr)
         sys.exit(1)
     try:
-        report = link_inference.run()
+        report = link_inference.run(trigger="nightly")
     except Exception as exc:  # noqa: BLE001
         print(f"diary-link-inference-cron: run failed: {exc}", file=sys.stderr)
         sys.exit(1)

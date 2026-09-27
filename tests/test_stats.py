@@ -185,9 +185,10 @@ def test_memory_quality_section():
 
 def test_graph_section_counts_links_orphans_contradictions():
     import diary_server
-    _upsert("/projects/g/a", "A", "a")
-    _upsert("/projects/g/b", "B", "b")
-    _upsert("/projects/g/lonely", "C", "c")
+    with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):  # counting, not linking, is under test
+        _upsert("/projects/g/a", "A", "a")
+        _upsert("/projects/g/b", "B", "b")
+        _upsert("/projects/g/lonely", "C", "c")
     diary_server.memory_link("/projects/g/a", "/projects/g/b", rel_type="contradicts")
     g = _stats()["graph"]
     assert g["links"] == 1

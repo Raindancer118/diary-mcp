@@ -196,9 +196,10 @@ def test_dry_run_writes_nothing():
 
 def test_explicit_links_untouched_and_inferred_links_backfilled():
     import diary_server, link_inference
-    _put("/projects/demo/m", "m")
-    _put("/projects/demo/n", "n")
-    _put("/projects/demo/o", "o")
+    with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):  # keep write-time linking out of the setup
+        _put("/projects/demo/m", "m")
+        _put("/projects/demo/n", "n")
+        _put("/projects/demo/o", "o")
     diary_server.memory_link("/projects/demo/m", "/projects/demo/n", "supports", "von Hand")
     with _conn() as c:
         c.execute("INSERT INTO memory_links (from_id, to_id, rel_type, link_origin) "
@@ -306,3 +307,126 @@ def test_stats_report_pending_suggestions(medium):
         g = memory_stats.collect_stats(conn)["graph"]
     assert g["suggestions_pending"] == 1
     assert "auto_links" in g
+
+
+# ── manual runs (v0.26.0) ────────────────────────────────────────────────
+
+def test_run_records_last_run_but_dry_run_does_not():
+    import link_inference
+    _put("/projects/demo/lr", "Ziel")
+    link_inference.run(dry_run=True, trigger="web")
+    assert link_inference.last_run() is None
+    link_inference.run(trigger="web")
+    last = link_inference.last_run()
+    assert last["trigger"] == "web" and "auto" in last
+    import re
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d", last["at"]), last["at"]  # JS Date.parse needs ±HH:MM
+
+
+def test_dry_run_can_preview_examples():
+    import link_inference
+    with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):
+        _put("/projects/demo/pv1", "siehe /projects/demo/pv2")
+        _put("/projects/demo/pv2", "Ziel")
+    report = link_inference.run(dry_run=True, examples=5)
+    ex = report["examples"]
+    assert any(e["action"] == "auto" and {e["a"], e["b"]} == {"/projects/demo/pv1", "/projects/demo/pv2"}
+               and e["confidence"] >= 0.9 and e["evidence"] for e in ex)
+
+
+def test_concurrent_run_reports_busy_instead_of_waiting():
+    import link_inference
+    with _conn() as other:
+        other.execute("BEGIN")
+        other.execute("SELECT pg_advisory_xact_lock(%s)", (link_inference.RUN_LOCK_KEY,))
+        report = link_inference.run()
+        other.execute("ROLLBACK")
+    assert report["busy"] is True
+    assert link_inference.run()["busy"] is False
+
+
+# ── project spine (v0.26.0) ──────────────────────────────────────────────
+
+def _project_links(slug):
+    with _conn() as c:
+        return c.execute(
+            "SELECT a.path AS a, b.path AS b, ml.link_origin, ml.note, ml.confidence FROM memory_links ml "
+            "JOIN memory_nodes a ON a.id = ml.from_id JOIN memory_nodes b ON b.id = ml.to_id "
+            "WHERE a.path LIKE %s AND b.path LIKE %s", (f"/projects/{slug}/%", f"/projects/{slug}/%")).fetchall()
+
+
+def _connected(paths, links):
+    parent = {p: p for p in paths}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for l in links:
+        parent[find(l["a"])] = find(l["b"])
+    return len({find(p) for p in paths}) == 1
+
+
+def _spine_setup(n, slug="sp"):
+    paths = [f"/projects/{slug}/n{k}" for k in range(n)]
+    with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):
+        for k, p in enumerate(paths):
+            _put(p, " ".join(f"wort{k}x{w}" for w in range(4)), vec=_vec(500 + k))  # no shared terms
+    return paths
+
+
+def test_spine_connects_a_project_with_n_minus_1_links():
+    import link_inference
+    paths = _spine_setup(5)
+    report = link_inference.run()
+    links = _project_links("sp")
+    assert report["spine"] == 4 and len(links) == 4
+    assert _connected(paths, links)
+    assert all(l["link_origin"] == "inferred" and l["note"] == "Projekt-Rückgrat" for l in links)
+    assert all(l["confidence"] is not None for l in links)
+
+
+def test_spine_counts_existing_links_and_is_idempotent():
+    import diary_server, link_inference
+    paths = _spine_setup(4)
+    diary_server.memory_link(paths[0], paths[1])
+    assert link_inference.run()["spine"] == 2
+    assert link_inference.run()["spine"] == 0
+    assert _connected(paths, _project_links("sp"))
+
+
+def test_spine_never_uses_rejected_pairs(monkeypatch):
+    import link_inference
+    paths = _spine_setup(2)
+    with _conn() as c:
+        c.execute("INSERT INTO link_suggestions (from_id, to_id, confidence, status) "
+                  "SELECT a.id, b.id, 0.5, 'rejected' FROM memory_nodes a, memory_nodes b "
+                  "WHERE a.path = %s AND b.path = %s", (paths[0], paths[1]))
+    assert link_inference.run()["spine"] == 0
+    assert not _project_links("sp")
+
+
+def test_spine_only_inside_projects():
+    import link_inference
+    with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):
+        _put("/feedback/f1", "Regel eins", vec=_vec(601))
+        _put("/feedback/f2", "Regel zwei", vec=_vec(602))
+        _put("/projects/one/x", "x", vec=_vec(603))
+        _put("/projects/two/y", "y", vec=_vec(604))
+    assert link_inference.run()["spine"] == 0
+
+
+def test_spine_dry_run_writes_nothing():
+    import link_inference
+    _spine_setup(3)
+    assert link_inference.run(dry_run=True)["spine"] == 2
+    assert not _project_links("sp")
+
+
+def test_new_project_memory_gets_its_nearest_sibling_at_write_time():
+    paths = _spine_setup(3)
+    v = _vec(500)  # same direction as n0 → n0 is the nearest sibling
+    _put("/projects/sp/new", "Frischer Eintrag", vec=[x + 0.3 * y for x, y in zip(v, _vec(777))])
+    links = [l for l in _project_links("sp") if "/projects/sp/new" in (l["a"], l["b"])]
+    assert len(links) == 1
+    assert {links[0]["a"], links[0]["b"]} == {"/projects/sp/new", "/projects/sp/n0"}

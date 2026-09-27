@@ -177,7 +177,8 @@ def api_graph(scope: str = "", include_extracted: bool = False):
         ],
         "edges": [
             {"from": str(l["from_id"]), "to": str(l["to_id"]), "rel_type": l["rel_type"], "origin": l["origin"],
-             "confidence": l.get("confidence")}
+             "confidence": l.get("confidence"),
+             "created_at": l["created_at"].isoformat() if l.get("created_at") else None}
             for l in links
         ],
     }
@@ -226,6 +227,29 @@ async def api_suggestions_decide(request: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"done": done, "missing": missing}
+
+
+@app.get("/api/links/auto")
+def api_links_auto_info():
+    import link_inference
+    return {"last_run": link_inference.last_run(),
+            "thresholds": {"auto": link_inference.AUTO_CONFIDENCE, "suggest": link_inference.SUGGEST_CONFIDENCE}}
+
+
+@app.post("/api/links/auto")
+async def api_links_auto_run(request: Request):
+    """Manual auto-connect run from diary-web; dry_run=true is the preview."""
+    import link_inference
+    _same_origin_json(request)
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(400, "invalid JSON")
+    dry_run = bool(payload.get("dry_run", True)) if isinstance(payload, dict) else True
+    report = await run_in_threadpool(link_inference.run, dry_run=dry_run, trigger="web", examples=8)
+    if report.get("busy"):
+        raise HTTPException(409, "Ein anderer Verknüpfungs-Lauf ist gerade aktiv.")
+    return report
 
 
 @app.get("/api/activity")

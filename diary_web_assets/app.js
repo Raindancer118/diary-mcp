@@ -648,6 +648,9 @@ const atlas = (() => {
   let cam = { x: 0, y: 0, k: 1 }, tween = null;
   let alpha = 0, active = false, loaded = false, loading = false, raf = 0, introT0 = 0;
   let hover = null, drag = null, pan = null;
+  // new connections since the last visit: comet along the edge, flare at the target
+  const SEEN_KEY = 'diary.atlas.seenLinks', COMET_MS = 900, FLARE_MS = 700, GLOW_MS = 6000;
+  let fresh = [], freshUntil = 0;
   const sprites = {};
 
   function sprite(type) {
@@ -751,8 +754,8 @@ const atlas = (() => {
     }
   }
 
-  function fitCam() {
-    const vis = nodes.filter(n => !n.hidden);
+  function fitCam(subset) {
+    const vis = (subset || nodes).filter(n => !n.hidden);
     if (!vis.length || !W) return { x: W / 2, y: H / 2, k: 1 };
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const n of vis) { x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y); x1 = Math.max(x1, n.x); y1 = Math.max(y1, n.y); }
@@ -784,7 +787,8 @@ const atlas = (() => {
       idx.set(n.id, o);
       return o;
     });
-    edges = data.edges.map(e => ({ a: idx.get(e.from), b: idx.get(e.to), rel: e.rel_type, origin: e.origin, conf: e.confidence })).filter(e => e.a && e.b);
+    edges = data.edges.map(e => ({ a: idx.get(e.from), b: idx.get(e.to), rel: e.rel_type, origin: e.origin, conf: e.confidence,
+      created: e.created_at ? Date.parse(e.created_at) : 0 })).filter(e => e.a && e.b);
     adj = new Map(nodes.map(n => [n, new Set()]));
     for (const e of edges) { adj.get(e.a).add(e.b); adj.get(e.b).add(e.a); }
     placeAnchors();
@@ -796,17 +800,91 @@ const atlas = (() => {
     for (const n of nodes) n.delay = (Math.hypot(n.x, n.y) / maxR) * 1100 + (n.field ? 250 : 0);
     loaded = true;
     $('#atlas-empty').hidden = edges.length > 0;
+    findFresh();
     renderLegend();
     const fit = fitCam();
     if (document.hidden || REDUCED.matches) {
       cam = fit;
       introT0 = -1e9;
+      scheduleFresh(performance.now());
       paintNow();
       return;
     }
     cam = { x: fit.x, y: fit.y, k: fit.k * .72 };
     introT0 = performance.now();
     tweenTo(fit, 1600);
+    scheduleFresh(introT0 + 1500);
+  }
+
+  // Server timestamps only (no client clock skew). First visit ever: nothing is "new".
+  function findFresh() {
+    const newest = edges.reduce((m, e) => Math.max(m, e.created), 0);
+    const seen = localStorage.getItem(SEEN_KEY);
+    fresh = seen === null ? [] : edges.filter(e => e.created > Number(seen)).sort((x, y) => x.created - y.created);
+    if (newest) localStorage.setItem(SEEN_KEY, String(Math.max(newest, Number(seen) || 0)));
+    const chip = $('#atlas-fresh');
+    chip.hidden = !fresh.length;
+    if (fresh.length) $('b', chip).textContent = fmt(fresh.length);
+  }
+
+  function scheduleFresh(t0) {
+    if (!fresh.length) return;
+    const animated = Math.min(fresh.length, 120);
+    const stagger = Math.min(140, 4200 / animated);
+    fresh.forEach((e, i) => { e.anim = t0 + Math.min(i, animated - 1) * stagger; });
+    freshUntil = t0 + animated * stagger + COMET_MS + FLARE_MS + GLOW_MS;
+    request();
+  }
+
+  let comet = null;
+  function cometSprite() {
+    if (comet) return comet;
+    comet = document.createElement('canvas');
+    comet.width = comet.height = 32;
+    const g = comet.getContext('2d'), grd = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+    grd.addColorStop(0, 'rgba(255,250,235,1)');
+    grd.addColorStop(.2, 'rgba(255,214,150,.95)');
+    grd.addColorStop(.5, 'rgba(232,168,76,.35)');
+    grd.addColorStop(1, 'rgba(232,168,76,0)');
+    g.fillStyle = grd;
+    g.fillRect(0, 0, 32, 32);
+    return comet;
+  }
+
+  function drawFresh(t) {
+    for (const e of fresh) {
+      if (e.a.hidden || e.b.hidden || e.anim == null) continue;
+      const [ax, ay] = toScreen(e.a), [bx, by] = toScreen(e.b);
+      if (REDUCED.matches) {
+        ctx.strokeStyle = 'rgba(232,168,76,.75)'; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+        continue;
+      }
+      const since = t - e.anim;
+      if (since < 0) continue;
+      const p = Math.min(1, since / COMET_MS), q = easeOut(p);
+      const hx = ax + (bx - ax) * q, hy = ay + (by - ay) * q;
+      if (p < 1) {
+        const grd = ctx.createLinearGradient(ax, ay, hx, hy);
+        grd.addColorStop(0, 'rgba(232,168,76,0)');
+        grd.addColorStop(1, 'rgba(255,214,150,.95)');
+        ctx.strokeStyle = grd; ctx.lineWidth = 1.8;
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(hx, hy); ctx.stroke();
+        ctx.drawImage(cometSprite(), hx - 10, hy - 10, 20, 20);
+        continue;
+      }
+      const glow = Math.max(0, 1 - (since - COMET_MS - FLARE_MS) / GLOW_MS);
+      if (glow > 0) {
+        ctx.strokeStyle = `rgba(232,168,76,${.12 + .6 * Math.min(1, glow)})`; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      }
+      const f = (since - COMET_MS) / FLARE_MS;
+      if (f < 1) {
+        ctx.strokeStyle = `rgba(255,214,150,${.7 * (1 - f)})`; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(bx, by, 4 + 14 * easeOut(f), 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+    ctx.lineWidth = 1;
   }
 
   // rAF never fires in hidden tabs; paint synchronously so the map is never blank.
@@ -825,7 +903,8 @@ const atlas = (() => {
       `<span><span class="sw dot-${t}"></span>${TYPE_LABEL[t]} <span class="n">${fmt(counts[t])}</span></span>`).join('')
       + `<span><span class="edge"></span>explizit</span>`
       + (inferred ? `<span><span class="edge dashed"></span>abgeleitet</span>` : '')
-      + (bad ? `<span><span class="edge bad"></span>▲ Widerspruch</span>` : '');
+      + (bad ? `<span><span class="edge bad"></span>▲ Widerspruch</span>` : '')
+      + (fresh.length ? `<span><span class="edge fresh"></span>neu</span>` : '');
     $('#atlas-caption').textContent = `${fmt(nodes.filter(n => !n.field).length)} Sterne in Sternbildern, ${fmt(edges.length)} Verbindungen`
       + ($('#atlas-field').checked ? `, ${fmt(nodes.filter(n => n.field).length)} Feldsterne ohne Verbindung.` : '.');
   }
@@ -844,6 +923,7 @@ const atlas = (() => {
     ctx.lineWidth = 1;
     for (const e of edges) {
       if (e.a.hidden || e.b.hidden) continue;
+      if (e.anim != null && !REDUCED.matches && t - e.anim < COMET_MS) continue;
       const ap = Math.min(appear(e.a), appear(e.b));
       if (!ap) continue;
       const hot = hover && (e.a === hover || e.b === hover);
@@ -873,6 +953,7 @@ const atlas = (() => {
       ctx.drawImage(sprite(n.type), sx - r * 4, sy - r * 4, r * 8, r * 8);
     }
     ctx.globalAlpha = 1;
+    drawFresh(t);
 
     const labels = [];
     if (hover) { labels.push(hover, ...near); }
@@ -902,7 +983,7 @@ const atlas = (() => {
     if (alpha > .004) simulate(1);
     draw(t);
     const introRunning = !REDUCED.matches && t - introT0 < 3000;
-    if (!REDUCED.matches || tween || alpha > .004 || introRunning) raf = requestAnimationFrame(frame);
+    if (!REDUCED.matches || tween || alpha > .004 || introRunning || t < freshUntil) raf = requestAnimationFrame(frame);
   }
   function request() { if (!raf && active) raf = requestAnimationFrame(frame); }
   document.addEventListener('visibilitychange', request);
@@ -986,6 +1067,11 @@ const atlas = (() => {
   }, { passive: false });
 
   $('#atlas-reset').addEventListener('click', () => tweenTo(fitCam(), 900));
+  $('#atlas-fresh').addEventListener('click', () => {
+    if (!fresh.length) return;
+    if (fresh.length <= 12) tweenTo(fitCam([...new Set(fresh.flatMap(e => [e.a, e.b]))]), 900);
+    scheduleFresh(performance.now() + (fresh.length <= 12 ? 700 : 100));
+  });
   $('#atlas-extracted').addEventListener('change', () => { loaded = false; load(); });
   $('#atlas-field').addEventListener('change', () => {
     applyFieldToggle();
@@ -1488,8 +1574,74 @@ const review = (() => {
     else if (k === 'k' || e.key === 'ArrowUp') { e.preventDefault(); focusCard(wrap.previousElementSibling?.querySelector('.sugg')); }
   });
 
+  // ── Auto-Connect: preview (dry run) first, then run on confirmation ──
+  const TRIGGER_LABEL = { nightly: 'nachts', web: 'von Hand', manual: 'von Hand' };
+  const ACTION_LABEL = { auto: 'verknüpfen', spine: 'Rückgrat', suggest: 'vormerken' };
+  const startBtn = $('#autorun-start'), result = $('#autorun-result');
+
+  async function loadInfo() {
+    try {
+      const { last_run: lr } = await api('/api/links/auto');
+      $('#autorun-last').textContent = lr
+        ? `Letzter Lauf ${relTime(lr.at)} · ${TRIGGER_LABEL[lr.trigger] || lr.trigger} · ${fmt(lr.auto)} verknüpft, `
+          + `${fmt(lr.spine || 0)} Rückgrat, ${fmt(lr.suggested)} vorgemerkt`
+        : 'Noch kein Lauf erfasst. Nachts um 04:30 läuft er automatisch.';
+    } catch { /* info line only */ }
+  }
+
+  function summary(r, preview) {
+    const parts = [];
+    if (r.auto) parts.push(`<b>${fmt(r.auto)}</b> Paare ${preview ? 'verknüpfen' : 'verknüpft'}`);
+    if (r.spine) parts.push(`<b>${fmt(r.spine)}</b> Projekt-Rückgrat-Links ${preview ? 'setzen' : 'gesetzt'}`);
+    if (r.suggested) parts.push(`<b>${fmt(r.suggested)}</b> ${preview ? 'vormerken' : 'vorgemerkt'}`);
+    if (!parts.length) return 'Alles verbunden, nichts zu tun.';
+    return (preview ? 'Würde ' : 'Fertig: ') + parts.join(', ') + '.';
+  }
+
+  async function runAuto(dryRun) {
+    startBtn.setAttribute('aria-busy', 'true');
+    $$('button', result).forEach(b => { b.disabled = true; });
+    try {
+      return await api('/api/links/auto', postJSON({ dry_run: dryRun }));
+    } catch (err) {
+      toast(err.message.startsWith('409') ? 'Ein Verknüpfungs-Lauf ist gerade aktiv. Versuch es gleich nochmal.'
+        : `Auto-Connect fehlgeschlagen: ${err.message}`, true);
+      return null;
+    } finally {
+      startBtn.removeAttribute('aria-busy');
+    }
+  }
+
+  startBtn.addEventListener('click', async () => {
+    const r = await runAuto(true);
+    if (!r) return;
+    const nothing = !(r.auto || r.spine || r.suggested);
+    result.hidden = false;
+    result.innerHTML = `<p class="ar-sum">${summary(r, true)}</p>
+      ${r.examples.length ? `<ul>${r.examples.map(e => `<li><span class="k">${esc(ACTION_LABEL[e.action] || e.action)}</span>
+        <span class="c">${esc(e.confidence.toFixed(2).replace('.', ','))}</span>
+        <span class="pp" title="${esc(e.evidence)}">${esc(e.a)} ↔ ${esc(e.b)}</span></li>`).join('')}</ul>` : ''}
+      <div class="autorun-actions">${nothing ? '<button type="button" class="act reject" data-ar="close">Schließen</button>'
+        : '<button type="button" class="act approve" data-ar="run">Jetzt ausführen</button><button type="button" class="act reject" data-ar="close">Abbrechen</button>'}</div>`;
+  });
+
+  result.addEventListener('click', async e => {
+    const b = e.target.closest('[data-ar]');
+    if (!b) return;
+    if (b.dataset.ar === 'close') { result.hidden = true; return; }
+    const r = await runAuto(false);
+    if (!r) { $$('button', result).forEach(x => { x.disabled = false; }); return; }
+    result.innerHTML = `<p class="ar-sum">${summary(r, false)}</p>
+      <div class="autorun-actions">${r.auto || r.spine ? '<a href="#/karte">In der Sternkarte ansehen →</a>' : ''}
+      <button type="button" class="act reject" data-ar="close">Schließen</button></div>`;
+    stats.invalidate();
+    atlas.invalidate();
+    loadInfo();
+    await load();
+  });
+
   return {
-    enter() { load().then(() => focusCard(list.querySelector('.sugg'))); },
+    enter() { loadInfo(); load().then(() => focusCard(list.querySelector('.sugg'))); },
     refreshBadge,
   };
 })();

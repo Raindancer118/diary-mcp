@@ -83,6 +83,7 @@
       <div class="atlas-title">
         <h1>Sternkarte</h1>
         <p id="atlas-caption">Verknüpfte Erinnerungen bilden Sternbilder. Unverbundene treiben als Feldsterne am Rand.</p>
+        <button type="button" class="fresh-chip" id="atlas-fresh" hidden><span class="fc-star" aria-hidden="true">✦</span><b>0</b> neue Verbindungen seit deinem letzten Besuch <span class="fc-act">Nochmal abspielen</span></button>
       </div>
       <div class="atlas-controls">
         <label class="switch"><input type="checkbox" id="atlas-extracted"><span>Extrahierte zeigen</span></label>
@@ -121,6 +122,13 @@
         <h1 class="review-title">Sollen diese Sterne ein Sternbild bilden?</h1>
         <p class="review-sub" id="review-sub"></p>
       </header>
+      <section class="autorun" id="autorun" aria-label="Auto-Connect">
+        <div class="autorun-row">
+          <div class="autorun-info"><b>Auto-Connect</b><span id="autorun-last">Noch kein Lauf erfasst.</span></div>
+          <button type="button" class="act approve" id="autorun-start"><span class="orbit" aria-hidden="true"></span>Jetzt prüfen</button>
+        </div>
+        <div class="autorun-result" id="autorun-result" hidden></div>
+      </section>
       <div class="review-list" id="review-list" aria-live="polite"></div>
     </div>
   </section>

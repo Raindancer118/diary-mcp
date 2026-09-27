@@ -52,12 +52,15 @@ K_LEXICAL = 10       # lexical neighbours per node that become candidates
 K_HUB = 10           # neighbourhood size for the CSLS hub correction
 LEX_MAX_POSTINGS = 80  # terms in more documents than this don't propose candidates
 MAX_AUTO_PER_RUN = 1000  # safety net against a bug flooding the graph
+SPINE_NOTE = "Projekt-Rückgrat"
 
 FEATURES = ("semantic", "mutual_rank", "terms", "project", "folder", "neighbours")
 DEFAULT_WEIGHTS = {"semantic": 0.588, "mutual_rank": 0.75, "terms": 9.212,
                    "project": 1.382, "folder": 0.397, "neighbours": 4.28}
 DEFAULT_BIAS = -5.96
 MODEL_META_KEY = "link_model"
+LAST_RUN_META_KEY = "link_last_run"
+RUN_LOCK_KEY = 0x6C696E6B  # pg advisory lock: one full run at a time (web button vs. nightly timer)
 
 _PATH_RE = re.compile(r"/(?:projects|user|feedback|references|notes|links)(?:/[\w.\-]+)+")
 _WIKI_RE = re.compile(r"\[\[([\w.\-/]+)\]\]")
@@ -417,7 +420,7 @@ def score(c: Corpus, model: Model, pairs) -> list[Scored]:
         source = mention_by if mention_by is not None else i
         out.append(Scored(i, j, round(conf, 4), "; ".join(_evidence(c, i, j, x, mention_by)) or "Modell",
                           source))
-    out.sort(key=lambda s: -s.confidence)
+    out.sort(key=lambda s: (-s.confidence, s.i, s.j))
     return out
 
 
@@ -427,12 +430,86 @@ def _canonical(a, b):
     return (a, b) if str(a) < str(b) else (b, a)
 
 
+def _suggestion_states(conn) -> dict:
+    return {_canonical(r["from_id"], r["to_id"]): (r["id"], r["status"])
+            for r in conn.execute("SELECT id, from_id, to_id, status FROM link_suggestions").fetchall()}
+
+
+def _spine(conn, c: Corpus, model: Model, *, dry_run: bool, focus: int | None = None, examples: int = 0) -> dict:
+    """Project spine: inside every /projects/<slug>/ the strongest pairs
+    (Kruskal on confidence) are linked until the project is connected — at
+    most n-1 links, never a clique. Existing links already count as
+    connections; rejected pairs are never used. With focus, only makes sure
+    that one memory has a link into its project (write time)."""
+    report = {"spine": 0, "pairs": [], "examples": []}
+    groups: dict[str, list[int]] = {}
+    for k, path in enumerate(c.paths):
+        slug = _project(path)
+        if slug:
+            groups.setdefault(slug, []).append(k)
+    if focus is not None:
+        slug = _project(c.paths[focus])
+        groups = {slug: groups[slug]} if slug else {}
+    states = _suggestion_states(conn)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        if focus is not None:
+            if any(_pair(focus, m) in c.links for m in members if m != focus):
+                continue
+            pairs = [_pair(focus, m) for m in members if m != focus]
+        else:
+            pairs = [(a, b) for x, a in enumerate(members) for b in members[x + 1:]]
+        parent = {m: m for m in members}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        member_set = set(members)
+        for (a, b) in c.links:
+            if a in member_set and b in member_set:
+                parent[find(a)] = find(b)
+        components = len({find(m) for m in members})
+        for s in score(c, model, pairs):
+            if components == 1 or (focus is not None and report["pairs"]):
+                break
+            pair = (s.i, s.j)
+            if pair in c.links or find(s.i) == find(s.j):
+                continue
+            a, b = c.ids[s.i], c.ids[s.j]
+            state = states.get(_canonical(a, b))
+            if state and state[1] == "rejected":
+                continue
+            if not dry_run:
+                conn.execute(
+                    "INSERT INTO memory_links (from_id, to_id, rel_type, note, link_origin, confidence, evidence) "
+                    "VALUES (%s, %s, 'related', %s, 'inferred', %s, %s) ON CONFLICT (from_id, to_id, rel_type) DO NOTHING",
+                    (a, b, SPINE_NOTE, s.confidence, s.evidence))
+                if state and state[1] == "pending":
+                    conn.execute("UPDATE link_suggestions SET status = 'auto', decided_at = now(), "
+                                 "updated_at = now() WHERE id = %s", (state[0],))
+            parent[find(s.i)] = find(s.j)
+            components -= 1
+            c.links.setdefault(pair, []).append("inferred")
+            report["spine"] += 1
+            report["pairs"].append(pair)
+            if len(report["examples"]) < examples:
+                report["examples"].append({"action": "spine", "a": c.paths[s.i], "b": c.paths[s.j],
+                                           "confidence": s.confidence, "evidence": s.evidence})
+    return report
+
+
 def _apply(conn, c: Corpus, scored: list[Scored], *, dry_run: bool, auto_threshold: float,
-           max_auto_non_mention: int | None = None) -> dict:
-    report = {"auto": 0, "suggested": 0, "backfilled": 0, "auto_pairs": []}
-    known = {}
-    for r in conn.execute("SELECT id, from_id, to_id, status FROM link_suggestions").fetchall():
-        known[_canonical(r["from_id"], r["to_id"])] = (r["id"], r["status"])
+           max_auto_non_mention: int | None = None, examples: int = 0) -> dict:
+    report = {"auto": 0, "suggested": 0, "backfilled": 0, "auto_pairs": [], "examples": []}
+    known = _suggestion_states(conn)
+
+    def example(action, s):
+        if sum(e["action"] == action for e in report["examples"]) < examples:
+            report["examples"].append({"action": action, "a": c.paths[s.i], "b": c.paths[s.j],
+                                       "confidence": s.confidence, "evidence": s.evidence})
     auto_non_mention = 0
     for s in scored:
         a, b = c.ids[s.i], c.ids[s.j]
@@ -471,6 +548,7 @@ def _apply(conn, c: Corpus, scored: list[Scored], *, dry_run: bool, auto_thresho
             report["auto"] += 1
             auto_non_mention += 0 if is_mention else 1
             report["auto_pairs"].append(pair)
+            example("auto", s)
         elif s.confidence >= SUGGEST_CONFIDENCE:
             if state:  # pending: keep it current, it was already counted when first suggested
                 if not dry_run:
@@ -485,26 +563,52 @@ def _apply(conn, c: Corpus, scored: list[Scored], *, dry_run: bool, auto_thresho
                     "INSERT INTO link_suggestions (from_id, to_id, confidence, evidence) VALUES (%s, %s, %s, %s) "
                     "ON CONFLICT (from_id, to_id) DO NOTHING", (lo, hi, s.confidence, s.evidence))
             report["suggested"] += 1
+            example("suggest", s)
     return report
 
 
 # ── entry points ───────────────────────────────────────────────────────────
 
-def run(dry_run: bool = False) -> dict:
-    """Full pass (nightly cron): refit the model, score every candidate pair,
-    link high confidence, queue medium confidence, re-score inferred links."""
+def run(dry_run: bool = False, trigger: str = "manual", examples: int = 0) -> dict:
+    """Full pass (nightly timer or the diary-web button): refit the model, score
+    every candidate pair, link high confidence, queue medium confidence,
+    re-score inferred links. Returns {"busy": True} if another run holds the lock."""
     with diary_db.get_db() as conn:
+        if not conn.execute("SELECT pg_try_advisory_xact_lock(%s) AS ok", (RUN_LOCK_KEY,)).fetchone()["ok"]:
+            return {"busy": True, "dry_run": dry_run}
         c = load_corpus(conn)
         model = fit(c)
         if not dry_run:
             _store_model(conn, model)
         pairs = candidates(c)
         scored = score(c, model, pairs)
-        report = _apply(conn, c, scored, dry_run=dry_run, auto_threshold=AUTO_CONFIDENCE)
-    report.pop("auto_pairs")
-    report.update(model=model.source, positives=model.positives, weights=model.weights,
-                  bias=model.bias, nodes=c.n, candidates=len(pairs), dry_run=dry_run)
+        report = _apply(conn, c, scored, dry_run=dry_run, auto_threshold=AUTO_CONFIDENCE, examples=examples)
+        report.pop("auto_pairs")
+        spine = _spine(conn, c, model, dry_run=dry_run, examples=examples)
+        report["spine"] = spine["spine"]
+        report["examples"] += spine["examples"]
+        report.update(busy=False, model=model.source, positives=model.positives, weights=model.weights,
+                      bias=model.bias, nodes=c.n, candidates=len(pairs), dry_run=dry_run, trigger=trigger)
+        if not dry_run:
+            summary = {k: report[k] for k in ("auto", "spine", "suggested", "backfilled", "model", "positives", "trigger")}
+            conn.execute(
+                "INSERT INTO diary_meta (key, value, updated_at) VALUES (%s, %s, now()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                (LAST_RUN_META_KEY, json.dumps({**summary, "at": _now_iso(conn)})))
     return report
+
+
+def _now_iso(conn) -> str:
+    return conn.execute("SELECT to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SSTZH:TZM') AS t").fetchone()["t"]
+
+
+def last_run() -> dict | None:
+    with diary_db.get_db() as conn:
+        row = conn.execute("SELECT value FROM diary_meta WHERE key = %s", (LAST_RUN_META_KEY,)).fetchone()
+    try:
+        return json.loads(row["value"]) if row else None
+    except ValueError:
+        return None
 
 
 def link_node(conn, node_id, auto_threshold: float | None = None, max_auto: int | None = None) -> list[str]:
@@ -520,14 +624,18 @@ def link_node(conn, node_id, auto_threshold: float | None = None, max_auto: int 
     report = _apply(conn, c, scored, dry_run=False,
                     auto_threshold=AUTO_CONFIDENCE if auto_threshold is None else auto_threshold,
                     max_auto_non_mention=max_auto)
-    return [c.paths[j if i == k else i] for i, j in report["auto_pairs"]]
+    spine = _spine(conn, c, model, dry_run=False, focus=k)
+    return [c.paths[j if i == k else i] for i, j in report["auto_pairs"] + spine["pairs"]]
 
 
 def format_report(r: dict) -> str:
+    if r.get("busy"):
+        return "Link-Inferenz: ein anderer Lauf ist gerade aktiv, übersprungen."
     mode = "Trockenlauf" if r.get("dry_run") else "Lauf"
     model = (f"Modell trainiert auf {r['positives']} bewussten Links" if r["model"] == "trained"
              else f"Standard-Gewichte (erst {r['positives']} von {MIN_POSITIVES} bewussten Links)")
-    return (f"Link-Inferenz ({mode}): {r['auto']} automatisch verlinkt, {r['suggested']} neu vorgemerkt, "
+    return (f"Link-Inferenz ({mode}): {r['auto']} automatisch verlinkt, {r.get('spine', 0)} Projekt-Rückgrat, "
+            f"{r['suggested']} neu vorgemerkt, "
             f"{r['backfilled']} bestehende auto-Links neu bewertet. {r['nodes']} Memories, "
             f"{r['candidates']} Kandidatenpaare. {model}.")
 

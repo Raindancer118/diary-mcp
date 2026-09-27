@@ -53,7 +53,7 @@ def _fetch_link_graph(conn, scope_path: str = "", include_extracted: bool = Fals
     if not nodes:
         return nodes, []
     link_rows = conn.execute(
-        "SELECT from_id, to_id, rel_type, link_origin AS origin, confidence FROM memory_links "
+        "SELECT from_id, to_id, rel_type, link_origin AS origin, confidence, created_at FROM memory_links "
         "WHERE from_id = ANY(%s) AND to_id = ANY(%s)",
         (list(nodes.keys()), list(nodes.keys())),
     ).fetchall()

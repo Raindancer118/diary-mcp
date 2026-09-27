@@ -229,3 +229,43 @@ def test_write_endpoints_block_cross_site_requests(client, path, body):
     # another website in the same browser: foreign Origin, or a form post (no JSON)
     assert client.post(path, json=body, headers={"Origin": "https://evil.example"}).status_code == 403
     assert client.post(path, content="ids=x", headers={**ORIGIN, "Content-Type": "application/x-www-form-urlencoded"}).status_code == 415
+
+
+# ── manual auto-connect runs (v0.26.0) ─────────────────────────────────────
+
+def test_auto_connect_preview_then_run(client):
+    import diary_server
+    with patch("memory_service.AUTO_LINK_THRESHOLD", 1.1):
+        for path, body in (("/projects/demo/w1", "siehe /projects/demo/w2"), ("/projects/demo/w2", "Ziel")):
+            with patch("diary_embed.embed", return_value=None):
+                diary_server.memory_upsert(path=path, title=path, body=body)
+    preview = client.post("/api/links/auto", json={"dry_run": True}, headers=ORIGIN).json()
+    assert preview["auto"] >= 1 and preview["dry_run"] is True and preview["examples"]
+    assert not client.get("/api/node", params={"path": "/projects/demo/w1"}).json()["links_out"]
+    done = client.post("/api/links/auto", json={"dry_run": False}, headers=ORIGIN).json()
+    assert done["auto"] >= 1 and done["dry_run"] is False
+    assert client.get("/api/node", params={"path": "/projects/demo/w1"}).json()["links_out"]
+    info = client.get("/api/links/auto").json()
+    assert info["last_run"]["trigger"] == "web"
+    assert info["thresholds"]["auto"] > info["thresholds"]["suggest"]
+
+
+def test_auto_connect_is_csrf_protected(client):
+    assert client.post("/api/links/auto", json={"dry_run": True},
+                       headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_auto_connect_busy_is_409(client):
+    import link_inference
+    with patch("link_inference.run", return_value={"busy": True}):
+        assert client.post("/api/links/auto", json={"dry_run": False}, headers=ORIGIN).status_code == 409
+
+
+def test_graph_edges_carry_creation_time(client):
+    import diary_server
+    _upsert("/projects/demo/e1")
+    _upsert("/projects/demo/e2")
+    diary_server.memory_link("/projects/demo/e1", "/projects/demo/e2", "supports")
+    edges = client.get("/api/graph").json()["edges"]
+    e = next(x for x in edges if x["rel_type"] == "supports")
+    assert e["created_at"] and e["created_at"][:4].isdigit()
