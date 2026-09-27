@@ -175,7 +175,8 @@ def api_graph(scope: str = "", include_extracted: bool = False):
             for nid, n in nodes.items()
         ],
         "edges": [
-            {"from": str(l["from_id"]), "to": str(l["to_id"]), "rel_type": l["rel_type"], "origin": l["origin"]}
+            {"from": str(l["from_id"]), "to": str(l["to_id"]), "rel_type": l["rel_type"], "origin": l["origin"],
+             "confidence": l.get("confidence")}
             for l in links
         ],
     }

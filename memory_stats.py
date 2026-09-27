@@ -255,12 +255,21 @@ def _graph_stats(conn) -> dict:
         "AND n.type <> 'category' AND NOT EXISTS (SELECT 1 FROM memory_links l "
         "WHERE l.from_id = n.id OR l.to_id = n.id)").fetchone()["n"]
     types = {r["rel_type"]: r["n"] for r in by_type}
+    sugg = {r["status"]: r["n"] for r in conn.execute(
+        "SELECT status, count(*) AS n FROM link_suggestions GROUP BY 1").fetchall()}
+    auto = conn.execute(
+        "SELECT count(*) AS n, avg(confidence) AS c FROM memory_links WHERE link_origin = 'inferred'").fetchone()
     return {
         "links": sum(types.values()),
         "by_type": types,
         "by_origin": {r["link_origin"]: r["n"] for r in by_origin},
         "contradictions": types.get("contradicts", 0),
         "orphans": orphans,
+        "auto_links": auto["n"],
+        "auto_avg_confidence": round(float(auto["c"]), 3) if auto["c"] is not None else None,
+        "suggestions_pending": sugg.get("pending", 0),
+        "suggestions_approved": sugg.get("approved", 0),
+        "suggestions_rejected": sugg.get("rejected", 0),
     }
 
 
@@ -573,6 +582,10 @@ def _quality_lines(q: dict, g: dict) -> list[str]:
         f"- {g['links']} Links (" + ", ".join(f"{t} {n}" for t, n in g["by_type"].items()) + ") · "
         + ", ".join(f"{o} {n}" for o, n in g["by_origin"].items())
         + f" · Widersprüche: {g['contradictions']} · Memories ohne Link: {g['orphans']}",
+        f"- Auto-Links: {g['auto_links']}"
+        + (f" (Ø Konfidenz {g['auto_avg_confidence']:.2f})" if g.get("auto_avg_confidence") is not None else "")
+        + f" · Vorschläge offen {g['suggestions_pending']}, freigegeben {g['suggestions_approved']}, "
+          f"abgelehnt {g['suggestions_rejected']}",
     ]
     return lines
 

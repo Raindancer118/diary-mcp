@@ -132,19 +132,23 @@ Memories should be small and specific: one fact per memory, no filler, bullet po
 
 Token counts are estimates (characters / 3.7).
 
-## Automatic linking (v0.13.0)
+## Automatic linking (v0.24.0)
 
-Two complementary mechanisms keep the knowledge graph populated without a manual `memory_infer_links()` call:
+Every candidate pair of curated memories gets a **confidence** (`link_inference.py`):
 
-- **Write-time (`memory_upsert`):** every curated save/edit compares the node's just-computed embedding against all other curated, embedded nodes and inserts `related`/`inferred` links above `AUTO_LINK_THRESHOLD` (0.82, `memory_service.py`) — capped at `AUTO_LINK_MAX_NEW` (3) per upsert to avoid graph spam. Nearly free (the embedding is already computed for the save itself); immediate.
-- **Periodic batch (`scripts/link_inference_cron.py`):** re-runs `memory_infer_links()` over the whole curated tree — catches pairs the per-upsert pass can't (e.g. after `memory_reembed_all`, or ones that exceeded the per-upsert cap). NOT a Claude Code hook — a plain script for a scheduler, run with the diary-mcp tool's own installed Python so `import graph_admin` resolves:
+| Signal | Effect |
+|---|---|
+| Text mentions the other memory (path or `[[slug]]`) | confidence 0.95 |
+| Near-identical content (cosine ≥ 0.9) | at least 0.9 |
+| Otherwise a logistic model over hub-corrected embedding similarity, mutual neighbour rank, shared rare terms (idf), same project, same folder and shared graph neighbours | 0 … 1 |
 
-  ```
-  DIARY_LINK_INFERENCE_THRESHOLD=0.82 DIARY_LINK_INFERENCE_MAX_NEW=50 \
-    ~/.local/share/uv/tools/diary-mcp/bin/python scripts/link_inference_cron.py
-  ```
+The model is refitted nightly on the **deliberate** links only (set by hand or approved suggestions), with non-negative weights; automatic links never train the next round. Below 40 deliberate links it uses built-in default weights.
 
-  Deployed locally as a systemd user timer (daily, 04:30): `~/.config/systemd/user/diary-link-inference.{service,timer}`, enabled via `systemctl --user enable --now diary-link-inference.timer`. Output/errors log to `~/.local/share/diary-link-inference.log`.
+- **≥ 0.7:** linked automatically (`link_origin = 'inferred'`, with `confidence` and a human-readable `evidence`).
+- **0.35–0.7:** stored in `link_suggestions`. This list is **only processed on explicit request** via `memory_link_suggestions()` and `memory_link_suggestions_decide(ids, 'approve'|'reject')`. Approved pairs become deliberate links; rejected pairs are never suggested or linked again.
+- Hand-set links are never touched; existing automatic links are re-scored, never deleted.
+
+Runs at write time (`memory_upsert`, ~65 ms with a warm per-process cache, at most `AUTO_LINK_MAX_NEW` non-mention links per save) and nightly over the whole tree (`scripts/link_inference_cron.py`, systemd user timer `diary-link-inference.timer`, 04:30, log `~/.local/share/diary-link-inference.log`). `memory_stats` and diary-web show auto-link and suggestion counts. The admin tool `memory_infer_links(threshold)` is the older pure-cosine variant for manual use.
 
 ## Backup export (v0.14.0)
 
@@ -192,7 +196,7 @@ URL as `relay_url` to `diary_link_init`.
 ### Automatic sync (v0.16.0)
 
 Opt-in, on top of the manual tool — same two-mechanism pattern as
-[Automatic linking](#automatic-linking-v0130) (write-time + periodic batch):
+[Automatic linking](#automatic-linking-v0240) (write-time + periodic batch):
 
 ```
 diary_link_set_sync_tags("bob", "share-with-bob,recipes")   # comma-separated; "" disables

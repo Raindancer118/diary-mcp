@@ -13,18 +13,17 @@ from psycopg.rows import dict_row
 
 import diary_db
 import diary_embed
+import link_inference
 import memory_injection
 from diary_bootstrap import mcp
 
 # Extracted memories auto-expire after this many days unless promoted to curated.
 EXTRACTED_TTL_DAYS = 90
 
-# Write-time auto-linking (v0.13.0): same similarity bar as memory_infer_links'
-# default, but capped much lower per call since this fires on every curated
-# upsert — a handful of new links per save is useful context, dozens would be
-# graph spam. The periodic batch job (scripts/link_inference_cron.py) uses the
-# higher max_new from memory_infer_links for its less-frequent, whole-tree pass.
-AUTO_LINK_THRESHOLD = 0.82
+# Write-time auto-linking (v0.24.0: confidence-scored, see link_inference.py).
+# None = link_inference.AUTO_CONFIDENCE; a value > 1 disables write-time linking.
+# The cap bounds non-mention links per save; explicit mentions are never capped.
+AUTO_LINK_THRESHOLD: float | None = None
 AUTO_LINK_MAX_NEW = 3
 
 # memory_context()/memory_project_context() output bounds. v0.18.0: no more
@@ -287,51 +286,6 @@ def _refresh_vector(conn, path: str, embedding) -> None:
     )
 
 
-def _auto_link_new_node(conn, node_id, embedding) -> list[str]:
-    """Compares a freshly upserted curated node against every other curated,
-    embedded node and inserts an inferred 'related' link for pairs above
-    AUTO_LINK_THRESHOLD — capped at AUTO_LINK_MAX_NEW (highest-similarity
-    first). Skips pairs that already have ANY link (explicit or inferred, any
-    rel_type) so it never overrides or duplicates one. Returns the paths of
-    newly-linked nodes for the caller's result message."""
-    if embedding is None:
-        return []
-    others = conn.execute(
-        "SELECT id, path, embedding FROM memory_nodes "
-        "WHERE deleted_at IS NULL AND origin = 'curated' AND embedding IS NOT NULL AND id != %s",
-        (node_id,),
-    ).fetchall()
-    if not others:
-        return []
-
-    unit_new = diary_embed.normalize(embedding)
-    scored = []
-    for o in others:
-        sim = diary_embed.dot(unit_new, diary_embed.normalize(o["embedding"]))
-        if sim >= AUTO_LINK_THRESHOLD:
-            scored.append((sim, o))
-    scored.sort(key=lambda s: s[0], reverse=True)
-
-    created = []
-    for sim, o in scored:
-        if len(created) >= AUTO_LINK_MAX_NEW:
-            break
-        existing = conn.execute(
-            "SELECT id FROM memory_links WHERE (from_id=%s AND to_id=%s) OR (from_id=%s AND to_id=%s)",
-            (node_id, o["id"], o["id"], node_id),
-        ).fetchone()
-        if existing:
-            continue
-        conn.execute(
-            "INSERT INTO memory_links (from_id, to_id, rel_type, link_origin) "
-            "VALUES (%s, %s, 'related', 'inferred') "
-            "ON CONFLICT (from_id, to_id, rel_type) DO NOTHING",
-            (node_id, o["id"]),
-        )
-        created.append(o["path"])
-    return created
-
-
 @mcp.tool()
 def memory_upsert(
     path: str,
@@ -391,13 +345,13 @@ def memory_upsert(
             node_id = inserted["id"]
             msg = f"Memory '{path}' erstellt."
 
-        # Auto-link at write time (v0.13.0): only for curated nodes — the
-        # embedding just computed above is reused here for free, so a fresh
-        # or edited memory picks up its strongest related links immediately
-        # instead of waiting for a manual memory_infer_links() call or the
-        # periodic batch cron (scripts/link_inference_cron.py).
-        if origin == "curated":
-            auto_linked = _auto_link_new_node(conn, node_id, embedding)
+        # Auto-link at write time: high confidence links now, medium confidence
+        # goes to the review list (deliberately not mentioned in the result so
+        # it is never processed without an explicit request).
+        threshold = link_inference.AUTO_CONFIDENCE if AUTO_LINK_THRESHOLD is None else AUTO_LINK_THRESHOLD
+        if origin == "curated" and threshold <= 1.0:
+            auto_linked = link_inference.link_node(conn, node_id, auto_threshold=threshold,
+                                                   max_auto=AUTO_LINK_MAX_NEW)
             if auto_linked:
                 msg += f" (+{len(auto_linked)} auto-verlinkt: {', '.join(auto_linked)})"
 

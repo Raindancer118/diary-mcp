@@ -53,7 +53,7 @@ def _fetch_link_graph(conn, scope_path: str = "", include_extracted: bool = Fals
     if not nodes:
         return nodes, []
     link_rows = conn.execute(
-        "SELECT from_id, to_id, rel_type, link_origin AS origin FROM memory_links "
+        "SELECT from_id, to_id, rel_type, link_origin AS origin, confidence FROM memory_links "
         "WHERE from_id = ANY(%s) AND to_id = ANY(%s)",
         (list(nodes.keys()), list(nodes.keys())),
     ).fetchall()
@@ -89,6 +89,9 @@ def _connected_components(nodes: dict, links: list) -> list[list]:
 @admin_mcp.tool()
 def memory_infer_links(scope_path: str = "", threshold: float = 0.82, max_new: int = 20) -> str:
     """Schlägt automatisch Links zwischen semantisch ähnlichen Memories vor (graphify-Stil: INFERRED-Edges).
+
+    Manuelle Variante mit reinem Cosinus-Schwellwert. Das automatische Verlinken
+    (Upsert + Nachtlauf) nutzt seit v0.24.0 die Konfidenz aus link_inference.py.
 
     Vergleicht paarweise Embeddings (Cosine-Similarity, brute-force) aller kuratierten
     Nodes unter scope_path (leer = ganzer Baum) und legt für Paare oberhalb von

@@ -132,16 +132,17 @@ def _format_conflicts(conflicts: list[dict], limit: int = 8) -> str:
 # on their own UNIQUE(from_id, to_id, rel_type). Instead they're matched via the
 # (from_path, to_path, rel_type) triple, resolved through memory_nodes.path on each
 # side. Requires memory_nodes to already be synced (this runs after node push/pull).
-_LINKS_SELECT = """SELECT ml.rel_type, ml.note, ml.link_origin, ml.updated_at,
+_LINKS_SELECT = """SELECT ml.rel_type, ml.note, ml.link_origin, ml.updated_at, ml.confidence, ml.evidence,
        fn.path AS from_path, tn.path AS to_path
        FROM memory_links ml
        JOIN memory_nodes fn ON ml.from_id = fn.id
        JOIN memory_nodes tn ON ml.to_id = tn.id"""
 
-_LINKS_UPSERT = """INSERT INTO memory_links (from_id, to_id, rel_type, note, link_origin, updated_at)
-       VALUES (%s, %s, %s, %s, %s, %s)
+_LINKS_UPSERT = """INSERT INTO memory_links (from_id, to_id, rel_type, note, link_origin, updated_at, confidence, evidence)
+       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
        ON CONFLICT (from_id, to_id, rel_type) DO UPDATE SET
-           note = EXCLUDED.note, link_origin = EXCLUDED.link_origin, updated_at = EXCLUDED.updated_at"""
+           note = EXCLUDED.note, link_origin = EXCLUDED.link_origin, updated_at = EXCLUDED.updated_at,
+           confidence = EXCLUDED.confidence, evidence = EXCLUDED.evidence"""
 
 
 def _link_key(link: dict) -> tuple:
@@ -160,7 +161,7 @@ def _sync_link(conn, link: dict) -> bool:
         return False
     conn.execute(_LINKS_UPSERT, (
         ids["from_id"], ids["to_id"], link["rel_type"], link["note"],
-        link["link_origin"], link["updated_at"],
+        link["link_origin"], link["updated_at"], link.get("confidence"), link.get("evidence"),
     ))
     return True
 
@@ -242,6 +243,8 @@ def _ensure_remote_schema(conn) -> None:
     """)
     conn.execute("ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS link_origin TEXT NOT NULL DEFAULT 'explicit'")
     conn.execute("ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()")
+    conn.execute("ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS confidence REAL")
+    conn.execute("ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS evidence TEXT")
 
 
 @mcp.tool()

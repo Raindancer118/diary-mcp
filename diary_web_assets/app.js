@@ -779,7 +779,7 @@ const atlas = (() => {
       idx.set(n.id, o);
       return o;
     });
-    edges = data.edges.map(e => ({ a: idx.get(e.from), b: idx.get(e.to), rel: e.rel_type, origin: e.origin })).filter(e => e.a && e.b);
+    edges = data.edges.map(e => ({ a: idx.get(e.from), b: idx.get(e.to), rel: e.rel_type, origin: e.origin, conf: e.confidence })).filter(e => e.a && e.b);
     adj = new Map(nodes.map(n => [n, new Set()]));
     for (const e of edges) { adj.get(e.a).add(e.b); adj.get(e.b).add(e.a); }
     placeAnchors();
@@ -843,7 +843,9 @@ const atlas = (() => {
       if (!ap) continue;
       const hot = hover && (e.a === hover || e.b === hover);
       const base = e.rel === 'contradicts' ? '224,108,90' : hot ? '232,168,76' : '201,191,173';
-      const a = e.rel === 'contradicts' ? .6 : hot ? .85 : hover ? .035 : .14;
+      // automatic edges fade with their confidence, deliberate ones stay at full strength
+      const weight = e.origin === 'inferred' && e.conf != null ? .35 + .65 * e.conf : 1;
+      const a = (e.rel === 'contradicts' ? .6 : hot ? .85 : hover ? .035 : .14) * (hot ? 1 : weight);
       ctx.strokeStyle = `rgba(${base},${a * ap})`;
       ctx.setLineDash(e.origin === 'inferred' ? [3, 4] : []);
       const [ax, ay] = toScreen(e.a), [bx, by] = toScreen(e.b);
@@ -1237,6 +1239,14 @@ const stats = (() => {
           ${ring(g.links ? (g.by_origin?.inferred || 0) / g.links : 0, 'automatisch abgeleitet', `${fmt(g.by_origin?.inferred || 0)} Links`, true)}
         </div>
         <div class="counters stack">${counter(g.contradictions || 0, 'Widersprüche', g.contradictions ? 'alert' : 'ok')}${counter(g.orphans || 0, 'Feldsterne')}</div></div>
+      </div>
+      <div class="grid-2 stack">
+        <div class="panel"><h3>Automatisch verknüpft <span>${g.auto_avg_confidence != null ? `Ø Konfidenz ${String(g.auto_avg_confidence.toFixed(2)).replace('.', ',')}` : ''}</span></h3>
+          <div class="counters">${counter(g.auto_links || 0, 'Auto-Links')}${counter(g.suggestions_approved || 0, 'Vorschläge freigegeben')}${counter(g.suggestions_rejected || 0, 'abgelehnt')}</div>
+          <p class="note">Ab Konfidenz 0,7 verknüpft diary-mcp selbst: bei Textverweisen, nahezu gleichem Inhalt oder wenn das Modell sicher ist.</p></div>
+        <div class="panel"><h3>Prüfliste</h3>
+          <div class="counters">${counter(g.suggestions_pending || 0, 'Vorschläge offen')}</div>
+          <p class="note">Mittlere Konfidenz (0,35–0,7). Wird nur bearbeitet, wenn du Claude ausdrücklich darum bittest, etwa mit „geh die Link-Vorschläge durch".</p></div>
       </div>`, '<a class="aside" href="#/karte">Zur Sternkarte →</a>');
 
     const maxTok = Math.max(1, dia.reachable_tokens || 0, van.approx_tokens || 0);

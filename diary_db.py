@@ -356,6 +356,22 @@ _SCHEMA = [
     # memory_links: needs updated_at so the (from_path,to_path,rel_type)-matched sync
     # in memory_sync() can LWW-merge note/link_origin edits, same rule as everywhere else.
     "ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+    # v0.24.0: confidence-scored linking. confidence/evidence stay NULL on hand-set links.
+    "ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS confidence REAL",
+    "ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS evidence TEXT",
+    """CREATE TABLE IF NOT EXISTS link_suggestions (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        from_id     UUID NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
+        to_id       UUID NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
+        confidence  REAL NOT NULL,
+        evidence    TEXT,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        created_at  TIMESTAMPTZ DEFAULT now(),
+        updated_at  TIMESTAMPTZ DEFAULT now(),
+        decided_at  TIMESTAMPTZ,
+        UNIQUE(from_id, to_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS link_suggestions_status_idx ON link_suggestions(status, confidence DESC)",
 
     # trigger_keywords: deterministic keyword-based auto-injection (v0.9.0). Distinct
     # from pin_triggers (session-start/compact lifecycle events) — these fire whenever
