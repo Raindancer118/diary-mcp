@@ -12,7 +12,7 @@ Provides Claude with a structured, searchable, cross-session memory system and a
 - **Hybrid search** — FTS ∪ semantic via Reciprocal Rank Fusion, ranked by importance + recency. `contradicts` links on a matched node are surfaced inline (also on `memory_get`), instead of only being visible via a manual `memory_health()` run.
 - **Session hooks** — SessionStart injects project-scoped and global memories; UserPromptSubmit runs an automatic FTS-only per-turn retrieval against curated memories (deterministic, no embeddings — see Architecture); SessionEnd optionally extracts structured memories from the conversation (per-project opt-in, off by default)
 - **Project diary** — log entries, milestones, tasks, wiki pages, reminders, error/solution pairs per project
-- **Web UI** — read-only FastAPI dashboard on `localhost:8765` (`diary-web`)
+- **Web UI** — „Observatorium“ on `localhost:8765` (`diary-web`): memory archive, knowledge graph as a star map, statistics dashboard
 - **Bidirectional sync** — `memory_sync()` opens an ephemeral SSH tunnel and syncs last-write-wins, including soft-deleted tombstones and embeddings
 - **Two entry points** — `diary-mcp` (day-to-day tool surface) and `diary-admin-mcp` (knowledge-graph introspection/maintenance: explain/path/stats/infer/report), kept separate so an ordinary session isn't shown audit-only tools it never needs
 
@@ -103,6 +103,16 @@ DIARY_REMOTE_URL=postgresql://localhost:54321/diary_mcp
 - **SessionEnd** optionally extracts structured memories from the conversation (per-project opt-in via `memory_set_project_config`, off by default).
 
 Pins (`memory_pin`) are only allowed inside a project (`/projects/<slug>/…`); global rules reach the model as one-liners in the digest instead. Every injected pin block carries the instruction to keep pins relevant and `memory_unpin` the ones without value.
+
+### Web UI (v0.23.0)
+
+`diary-web` serves three views, all offline (fonts are bundled, nothing is fetched from the internet):
+
+- **Archiv** (`#/`, `#/m/<path>`) — tree with path filter, rendered Markdown bodies (memory paths and `[[slug]]` links become clickable), metadata, incoming/outgoing links as a small constellation.
+- **Sternkarte** (`#/karte`) — knowledge graph; linked memories cluster per project, unlinked ones form the outer field. Hover highlights neighbours, click opens.
+- **Messwerte** (`#/messwerte`) — everything from `/api/stats` plus a one-year activity heatmap from `GET /api/activity?days=365` (per day: created, last-edited, project log entries).
+
+Keys: `Ctrl/⌘ K` or `/` search, `1`/`2`/`3` switch views, `Esc` closes. Assets live in `diary_web_assets/` (package data); design decisions in `Design.md`. Honours `prefers-reduced-motion`; strict CSP, no framing.
 
 ### Web UI autostart (v0.22.0)
 
@@ -284,7 +294,8 @@ graph_admin.py            — knowledge-graph introspection/maintenance tools (e
 
 diary_db.py       — PostgreSQL access layer (psycopg3)
 diary_embed.py    — fastembed wrapper, lazy-load, pgvector-aware
-diary_web.py      — FastAPI read-only dashboard
+diary_web.py      — FastAPI app for diary-web (JSON API + static assets)
+diary_web_assets/ — index.html, app.css, app.js, bundled woff2 fonts
 diary_config.py   — env config
 ```
 

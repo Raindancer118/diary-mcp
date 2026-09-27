@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>diary · Observatorium</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2l3 11 11 3-11 3-3 11-3-11-11-3 11-3z' fill='%23e8a84c'/%3E%3C/svg%3E">
+<link rel="preload" href="/assets/fonts/fraunces.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body data-view="archive" class="boot">
+
+<div class="sky" aria-hidden="true"><div class="sky-layer far"></div><div class="sky-layer near"></div></div>
+
+<header class="bar">
+  <a class="mark" href="#/" aria-label="diary, zur Übersicht"><span class="mark-star">✦</span><span class="mark-word">diary</span></a>
+  <nav class="views" aria-label="Ansichten">
+    <a href="#/" data-view="archive">Archiv<kbd>1</kbd></a>
+    <a href="#/karte" data-view="atlas">Sternkarte<kbd>2</kbd></a>
+    <a href="#/messwerte" data-view="stats">Messwerte<kbd>3</kbd></a>
+  </nav>
+  <button class="seek" id="open-search" type="button">
+    <span aria-hidden="true">⌕</span><span class="seek-label">Gedächtnis durchsuchen</span><kbd>Ctrl K</kbd>
+  </button>
+  <button class="sync" id="sync-btn" type="button" title="Mit Remote-Postgres synchronisieren">
+    <span class="orbit" aria-hidden="true"></span><span class="sync-label">Sync</span>
+  </button>
+</header>
+
+<main>
+  <!-- ── Archiv ─────────────────────────────────────────────── -->
+  <section class="view" id="view-archive" aria-label="Archiv">
+    <nav class="index" id="index" aria-label="Memory-Baum">
+      <div class="index-head">
+        <input id="tree-filter" type="search" placeholder="Pfade filtern" autocomplete="off" spellcheck="false" aria-label="Pfade filtern">
+        <span class="index-count" id="tree-count"></span>
+      </div>
+      <div class="tree" id="tree" role="tree"></div>
+    </nav>
+
+    <article class="reader" id="reader">
+      <div class="welcome" id="welcome">
+        <p class="eyebrow">Observatorium</p>
+        <h1 class="welcome-title"><span class="w" data-count="welcome-total">0</span> <span class="w">Erinnerungen</span> <span class="w dim">unter</span> <span class="w dim">diesem</span> <span class="w dim">Himmel.</span></h1>
+        <p class="welcome-sub" id="welcome-sub"></p>
+        <h2 class="list-head">Zuletzt bewegt</h2>
+        <ol class="recent" id="recent"></ol>
+      </div>
+      <div class="memory" id="memory" hidden>
+        <div class="crumbs" id="crumbs"></div>
+        <h1 class="memory-title" id="memory-title"></h1>
+        <div class="chips" id="chips"></div>
+        <div class="prose" id="prose"></div>
+      </div>
+    </article>
+
+    <aside class="margin" id="margin" aria-label="Details">
+      <div class="margin-empty" id="margin-empty">
+        <h2 class="side-head">Spektrum</h2>
+        <div id="spectrum-mini"></div>
+      </div>
+      <div id="margin-node" hidden>
+        <figure class="constellation" id="constellation" hidden>
+          <svg id="constellation-svg" viewBox="-138 -92 276 184" role="img" aria-label="Verknüpfte Memories"></svg>
+          <figcaption>Sternbild dieser Erinnerung</figcaption>
+        </figure>
+        <h2 class="side-head">Messdaten</h2>
+        <dl class="facts" id="facts"></dl>
+        <section id="links-out-wrap" hidden><h2 class="side-head">Verweist auf</h2><ul class="links" id="links-out"></ul></section>
+        <section id="links-in-wrap" hidden><h2 class="side-head">Wird zitiert von</h2><ul class="links" id="links-in"></ul></section>
+      </div>
+    </aside>
+  </section>
+
+  <!-- ── Sternkarte ─────────────────────────────────────────── -->
+  <section class="view" id="view-atlas" aria-label="Sternkarte">
+    <canvas id="atlas" aria-label="Knowledge-Graph als Sternkarte. Mausrad zoomt, Ziehen verschiebt, Klick öffnet."></canvas>
+    <div class="atlas-hud">
+      <div class="atlas-title">
+        <h1>Sternkarte</h1>
+        <p id="atlas-caption">Verknüpfte Erinnerungen bilden Sternbilder. Unverbundene treiben als Feldsterne am Rand.</p>
+      </div>
+      <div class="atlas-controls">
+        <label class="switch"><input type="checkbox" id="atlas-extracted"><span>Extrahierte zeigen</span></label>
+        <label class="switch"><input type="checkbox" id="atlas-field" checked><span>Feldsterne</span></label>
+        <button type="button" class="ghost" id="atlas-reset">Ansicht zurücksetzen</button>
+      </div>
+    </div>
+    <div class="atlas-legend" id="atlas-legend"></div>
+    <div class="atlas-card" id="atlas-card" hidden></div>
+    <p class="atlas-empty" id="atlas-empty" hidden>Noch keine Verknüpfungen. <code>memory_link()</code> zeichnet das erste Sternbild.</p>
+  </section>
+
+  <!-- ── Messwerte ──────────────────────────────────────────── -->
+  <section class="view" id="view-stats" aria-label="Messwerte">
+    <div class="stats" id="stats">
+      <header class="stats-head">
+        <div>
+          <p class="eyebrow">Messwerte</p>
+          <h1 class="stats-title">Was dieses Gedächtnis gerade weiß.</h1>
+        </div>
+        <div class="range" role="radiogroup" aria-label="Zeitraum">
+          <button type="button" data-days="7" role="radio">7 T</button>
+          <button type="button" data-days="30" role="radio" aria-checked="true">30 T</button>
+          <button type="button" data-days="90" role="radio">90 T</button>
+        </div>
+      </header>
+      <div id="stats-body" class="stats-body" aria-busy="true"></div>
+    </div>
+  </section>
+</main>
+
+<dialog class="palette" id="palette" aria-label="Suche">
+  <div class="palette-field">
+    <span aria-hidden="true">⌕</span>
+    <input id="palette-input" type="text" placeholder="Wonach suchst du?" autocomplete="off" spellcheck="false" aria-controls="palette-results">
+    <kbd>Esc</kbd>
+  </div>
+  <ul class="palette-results" id="palette-results" role="listbox"></ul>
+  <p class="palette-foot"><kbd>↑</kbd><kbd>↓</kbd> wählen · <kbd>↵</kbd> öffnen</p>
+</dialog>
+
+<div class="tip" id="tip" role="tooltip" hidden></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

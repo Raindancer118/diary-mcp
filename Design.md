@@ -1,88 +1,116 @@
-# Design.md — diary-web Memory Browser
+# Design.md — diary-web „Observatorium"
 
-Visuelle Design-Entscheidungen für das lokale Memory-Browser-Frontend (`diary-web`).
-Diese Datei wird **zuerst** aktualisiert, sobald sich Design-Entscheidungen ändern.
+Visuelle Entscheidungen für das lokale Frontend (`diary-web`). Wird **zuerst**
+aktualisiert, wenn sich Design-Entscheidungen ändern.
+(v0.23: löst den „Terminal-Kartograph" ab.)
 
-## Kontext & Subjekt
+## Kontext
 
-Ein **localhost-only Werkzeug** zum Durchstöbern des Claude-Memory-Trees. Kein
-Produkt-Frontend, sondern ein Entwickler-/Power-User-Instrument. Das Subjekt ist
-buchstäblich ein **Dateisystem für Gedanken**: pfad-basierte Hierarchie
-(`/user/...`, `/feedback/...`, `/projects/<slug>/...`, `/references/...`),
-Knowledge-Graph-Verknüpfungen, Volltextsuche.
+Localhost-only Werkzeug für eine Person (Tom), die ihr eigenes Gedächtnis-System
+inspiziert: navigieren, lesen, suchen, Zustand messen, syncen. Kein Produkt.
 
-Zielgruppe: eine Person (Tom), die ihr eigenes Gedächtnis-System inspiziert.
-Aufgabe der Seite: schnell navigieren, lesen, suchen, Health prüfen, syncen.
+## Idee
 
-## Kreative Richtung
+Das Gedächtnis als **Nachthimmel, beobachtet aus einer Sternwarte**. Jede Memory
+ist ein Stern, Links sind Sternbilder, die Stats sind die Messinstrumente.
+Die Metapher ist nicht Deko, sie trägt Entscheidungen:
 
-Gewählt: **„Terminal-Kartograph"** — eine ruhige, technische Oberfläche, die das
-Pfad-Motiv (`/`) zum visuellen Leitmotiv macht. Kein generisches Dashboard,
-sondern etwas zwischen einem File-Explorer und einem Knowledge-Graph-Inspektor.
+- **Typfarben = Spektralklassen.** Sterne werden nach Farbe klassifiziert,
+  Memories nach Typ. Deshalb ist Farbe hier Identität, nicht Schmuck.
+- **Wichtigkeit = Helligkeit (Magnitude).** Im Graph leuchten wichtige
+  Memories heller und größer, statt einer Prozentleiste.
+- **Nur Nacht.** Sternwarten arbeiten im Dunkeln; es gibt bewusst keinen
+  Hell-Modus. Die Oberfläche ist warm (Tinte, nicht Blau-Schwarz), damit sie
+  sich vom KI-Default „Cyan auf Dunkel" absetzt.
 
-Verworfen:
-- Heller Karten-Dashboard-Look (zu generisch, „KI-Standard").
-- Maximalistischer Graph-mit-Force-Layout (Überengineering für ein
-  Lese-Werkzeug; lenkt vom Inhalt ab).
+Verworfen: „Archiv/Editorial" (schön, aber zu ruhig für Graph + Stats),
+„Kartograph 2.0" (zu nah am alten Look).
 
-## Token-System
+## Tokens
 
-### Farben (`palette_commit`)
+### Flächen (warm)
 ```
-frame:    deep teal-black / cyan-green family
-ground:   #091918   (fast schwarzes Tannengrün)
-surface:  #0f2726   (Panels / Sidebar)
-border:   #1c3c3a
-text:     #c8dcdc   (entsättigtes Eisblau-Weiß)
-muted:    #5a7878
-accent:   #e8a84c   (Bernstein — der EINE Akzent, sparsam)
-teal:     #5aabb8   (sekundär, für Pfade/Links)
-```
-Der Bernstein-Akzent ist die einzige warme Farbe und wird nur für aktive
-Zustände, das Logo und Wichtigkeits-Punkte verwendet. Alles andere bleibt im
-kühlen Teal-Spektrum → ruhig, ein Fokuspunkt.
-
-### Typografie
-- **UI / Body:** Inter / system-ui — neutral, lesbar für Memory-Inhalte.
-- **Mono (Leitmotiv):** Cascadia Code / JetBrains Mono — für **alle Pfade**,
-  Slugs, Metadaten, Logo, Buttons. Die Monospace-Schrift trägt die Identität:
-  Pfade sehen aus wie im Terminal.
-- Das Logo ist schlicht `/ memory` — der Slash in Bernstein, „memory" gedämpft.
-
-### Layout
-Drei Spalten (260px Tree │ flex Content │ 240px Panel), 48px Topbar:
-```
-┌──────────────────────────────────────────────────────┐
-│ / memory   [ ⌕ search…            ]  health   sync     │
-├────────────┬─────────────────────────┬─────────────────┤
-│ tree       │ breadcrumb              │ metadata        │
-│  ▸ user    │ # Node Title            │  Pfad / Datum   │
-│  ▸ feedback│ [type] [tags] ●●●○○      │  Zugriffe / …   │
-│  ▾ projects│                         │                 │
-│    ▸ eduv. │ ┌─────────────────────┐ │ outgoing links  │
-│    · node  │ │  body (markdown-ish)│ │  [related] →    │
-│            │ └─────────────────────┘ │ referenced by   │
-└────────────┴─────────────────────────┴─────────────────┘
+--night   #0d0b09   Grund
+--vault   #15120f   Panels
+--vault-2 #1c1814   gehobene Flächen, Hover
+--rule    #2c261f   Linien
+--ink     #ece4d4   Text (Sternenlicht)
+--dust    #8f8472   Sekundärtext
+--faint   #5c5446   Tertiär, Achsen
+--accent  #e8a84c   Bernstein: aktive Zustände, Logo, Fokus — sparsam
 ```
 
-## Detail-Entscheidungen
+### Spektralklassen (Typfarben) — validiert
+Mit dem dataviz-Validator gegen `#15120f` geprüft (Lightness-Band, Chroma,
+CVD-Abstand, Kontrast: alle PASS). **Feste Reihenfolge, nie umsortieren.**
+```
+feedback   #cc7d1b  oklch(.66 .14 65)
+user       #3e8cc9  oklch(.62 .12 245)
+project    #819f47  oklch(.66 .12 125)
+reference  #7555a8  oklch(.52 .13 300)
+note       #ca5551  oklch(.60 .15 25)
+category   --faint (Struktur, keine Serie)
+```
+Sequenziell (Heatmap): ein Farbton, Bernstein, dunkel = wenig → hell = viel.
 
-- **Typ-Farbpunkte** im Tree statt Icons: user=hellblau, feedback=bernstein,
-  project=grün, reference=violett, note/category=gedämpft. Schnelle visuelle
-  Klassifikation ohne Icon-Rauschen.
-- **Wichtigkeit** als 5-Punkte-Leiste (Bernstein) — kompakt, kein Prozentbalken.
-- **Breadcrumb** mit klickbaren Pfad-Segmenten, Slash-Separatoren in Bernstein.
-- **Suche** mit `ts_headline`-Snippets, `«…»` als Highlight-Marker.
-- **Knowledge-Graph** als Listen (ein-/ausgehend) statt Force-Layout — Klick
-  navigiert zum verknüpften Node und expandiert den Tree-Pfad.
-- **Health-Overlay** und **Sync** als modale Overlays, kein Seitenwechsel.
+### Typografie (lokal ausgeliefert, OFL, `diary_web_assets/fonts/`)
+- **Fraunces** (variabel, opsz/wght) — Titel und große Messwerte. Hat den
+  Charakter alter Sternatlanten/Almanache. Tracking bei ≥ 48 px leicht
+  negativ. **opsz 144 nur für Ziffern:** bei Buchstaben verschwinden dort die
+  Haarlinien-Querstriche („H" → „I I", „+" → „|"). Titel: opsz 48–72, Gewicht
+  ≥ 400.
+- **Instrument Sans** — UI und Fließtext.
+- **JetBrains Mono** — alle Pfade/Slugs. Das Pfad-Motiv bleibt Identität.
+
+## Layout
+
+Topbar (Wortmarke `✦ diary` · Ansichten `Archiv / Sternkarte / Messwerte` ·
+Suche `⌘K` · Sync). Darunter wechselt die Ansicht:
+
+- **Archiv:** Tree │ Memory │ Metadaten + Links (wie bisher, drei Spalten).
+- **Sternkarte:** Vollflächiger Graph. Verknüpfte Memories ziehen zu einem
+  Anker pro Projekt (Goldener-Winkel-Spirale) → echte Sternbilder mit Lücken;
+  unverknüpfte bilden den Feldstern-Ring. Hover hebt das Sternbild hervor,
+  Klick fliegt zum Stern und öffnet ihn im Archiv.
+- **Messwerte:** Dashboard, vertikal scrollend, Abschnitte:
+  Überblick (Hero-Zahlen) → Aktivität (Heatmap 1 Jahr + Verlauf) → Verteilung
+  (Zweige, Spektralbalken, Wichtigkeit) → Qualität/Health → Graph →
+  Injection → Projekt-Journal → Ranglisten → Instanz/Föderation.
+
+Suche ist eine Befehls-Palette (Overlay), keine Dropdown-Liste.
 
 ## Motion
-Bewusst sparsam: nur Hover-/Focus-Transitions (.1–.15s) und das Aufklappen der
-Tree-Toggles (Rotation). `prefers-reduced-motion` wird respektiert (alle
-Transitions deaktiviert). Keine dekorative Animation.
+
+Leitlinie aus Toms Feedback (`/feedback/motion-design-subtle`): Arbeitsflächen
+bleiben ruhig, Charakter kommt aus Federn und einem kräftigen Einstieg.
+- **Einstieg (der eine laute Moment):** Himmel zoomt auf, Horizontlinie
+  zeichnet sich unter der Leiste, der Stern zündet, die Headline steigt Wort
+  für Wort aus der Unschärfe. Nur beim Laden (`body.boot`, 2,6 s).
+- **Federkurven** (`--spring`, `--spring-soft` als `linear()`) für kleine
+  Zustandswechsel: Tab-Unterstrich, Tree-Pfeil, Schalter, Dialog, Sterne der
+  Wichtigkeit.
+- **Wege kurz:** Aufstiege 6 px, Hover-Lift höchstens 1 px. Keine Bewegung an
+  Navigations-Icons, kein Lichtfleck am Cursor, kein Glanz-Sweep.
+- **Laufende Vorgänge pulsieren deutlich** (Sync-Knopf).
+- **Hintergrund:** zwei Sternfeld-Ebenen driften extrem langsam (nur
+  `transform`).
+- **Ansichtswechsel:** View Transitions API, Fallback sofort.
+- **Messwerte:** Zahlen zählen hoch, Balken wachsen, Linien zeichnen sich,
+  Heatmap blendet diagonal ein, Abschnitte erscheinen scroll-getrieben.
+- **Sternkarte:** Intro-Zoom, Sterne funkeln minimal, Hover dimmt alles außer
+  dem Sternbild, Klick fliegt zum Stern.
+- **`prefers-reduced-motion: reduce`:** alles aus, Endzustände sofort. In
+  verborgenen Tabs (kein rAF) wird ebenfalls sofort der Endzustand gezeichnet.
+
+## Charts (dataviz-Regeln)
+Dünne Marken, 4px gerundete Datenenden an der Grundlinie, 2px Lücke
+zwischen gestapelten Segmenten, zurückhaltende Achsen. Jede Chart-Marke hat
+einen Hover-Tooltip; Text trägt nie die Serienfarbe; Legende ab 2 Serien.
 
 ## Barrierefreiheit
-- Sichtbarer Keyboard-Focus auf Suche (Teal-Border).
-- `Cmd/Ctrl+K` fokussiert Suche, `Esc` schließt Overlays.
-- Kontrast: text #c8dcdc auf ground #091918 → hoher Kontrast.
+- Sichtbarer Fokus (Bernstein-Ring), alle Aktionen per Tastatur.
+- `⌘/Ctrl+K` Suche, `1/2/3` Ansichten, `Esc` schließt Overlays.
+- Touch-Targets ≥ 44 px in der Topbar.
+- Alle aus der DB kommenden Strings werden escaped (kein `innerHTML` mit
+  Rohdaten); Markdown wird erst escaped, dann in ein festes Tag-Set übersetzt.
+- Ein Stylesheet (`app.css`), inline nur datengetriebene Custom Properties.

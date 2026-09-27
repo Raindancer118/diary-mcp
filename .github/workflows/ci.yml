@@ -50,6 +50,9 @@ jobs:
         run: |
           uv sync --extra dev
 
+      - name: Check web UI script syntax
+        run: node --check diary_web_assets/app.js
+
       - name: Run pytest
         run: |
           uv run pytest tests/ -v --timeout=300

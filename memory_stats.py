@@ -437,6 +437,48 @@ def _vanilla_stats(conn, slug: str | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Activity over time (diary-web heatmap / trend)
+# ---------------------------------------------------------------------------
+
+ACTIVITY_MAX_DAYS = 400
+
+
+def activity_series(conn, days: int = 365) -> dict:
+    """Per-day counts of curated memories created, memories edited on a later day
+    than their creation, and project log entries. updated_at only holds the *last*
+    edit, so "updated" means "last touched that day", not every edit."""
+    days = max(1, min(int(days), ACTIVITY_MAX_DAYS))
+    rows = conn.execute(
+        """
+        WITH d AS (
+            SELECT generate_series(current_date - (%(n)s - 1), current_date, interval '1 day')::date AS day
+        ), n AS (
+            SELECT created_at::date AS c, updated_at::date AS u FROM memory_nodes
+            WHERE deleted_at IS NULL AND origin = 'curated' AND type <> 'category'
+              AND (created_at >= current_date - (%(n)s - 1) OR updated_at >= current_date - (%(n)s - 1))
+        ), l AS (
+            SELECT l.timestamp::date AS t FROM logs l JOIN projects p ON p.id = l.project_id
+            WHERE l.deleted_at IS NULL AND p.deleted_at IS NULL
+              AND l.timestamp >= current_date - (%(n)s - 1)
+        )
+        SELECT d.day,
+               (SELECT count(*) FROM n WHERE n.c = d.day) AS created,
+               (SELECT count(*) FROM n WHERE n.u = d.day AND n.u > n.c) AS updated,
+               (SELECT count(*) FROM l WHERE l.t = d.day) AS logs
+        FROM d ORDER BY d.day
+        """,
+        {"n": days},
+    ).fetchall()
+    series = [{"date": r["day"].isoformat(), "created": r["created"],
+               "updated": r["updated"], "logs": r["logs"]} for r in rows]
+    return {
+        "days": days,
+        "series": series,
+        "totals": {k: sum(s[k] for s in series) for k in ("created", "updated", "logs")},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 [project]
 name = "diary-mcp"
-version = "0.22.1"
+version = "0.23.0"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,6 +35,10 @@ py-modules = [
     "diary_embed_ipc", "memory_injection", "memory_stats",
     "diary_web_autostart",
 ]
+packages = ["diary_web_assets"]
+
+[tool.setuptools.package-data]
+diary_web_assets = ["*.html", "*.css", "*.js", "fonts/*.woff2", "fonts/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
