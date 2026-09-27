@@ -264,6 +264,16 @@ def test_trained_runs_are_stable():
     assert second["weights"] == first["weights"]
 
 
+def test_evidence_order_does_not_depend_on_hash_seed():
+    """Equally rare shared terms are listed alphabetically; set iteration order
+    changes per process (PYTHONHASHSEED) and made every nightly run rewrite links."""
+    _put("/projects/demo/t1", "zebrafisch apfelbaum mondrakete", vec=_vec(11))
+    _put("/projects/demo/t2", "mondrakete zebrafisch apfelbaum", vec=_vec(12))
+    row = _link_row("/projects/demo/t1", "/projects/demo/t2") or \
+        _pair(_suggestions(), "/projects/demo/t1", "/projects/demo/t2")[0]
+    assert "gemeinsame Begriffe: apfelbaum, mondrake" in row["evidence"]
+
+
 # ── plumbing ─────────────────────────────────────────────────────────────
 
 def test_link_confidence_is_synced(test_databases):

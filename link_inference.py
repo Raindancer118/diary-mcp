@@ -272,7 +272,7 @@ def candidates(c: Corpus, focus: list[int] | None = None, include_inferred: bool
             for j in c.postings(lx):
                 if j != i:
                     scores[j] = scores.get(j, 0.0) + w * w
-        for j, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:K_LEXICAL]:
+        for j, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:K_LEXICAL]:
             add(i, j)
         for z in c.explicit_adj[i]:
             for j in c.explicit_adj[z]:
@@ -387,7 +387,7 @@ def _evidence(c: Corpus, i: int, j: int, x: np.ndarray, mention_by: int | None) 
     if c.has_vec[i] and c.has_vec[j]:
         if cos >= DUPLICATE_COSINE:
             reasons.append(f"nahezu gleicher Inhalt (cos {cos:.2f})")
-        elif max(c.rank(i, j), c.rank(j, i)) <= 5:
+        elif cos >= 0.5 and max(c.rank(i, j), c.rank(j, i)) <= 5:
             reasons.append(f"semantisch nah (cos {cos:.2f}, gegenseitig unter den Top 5)")
     if x[3]:
         reasons.append(f"gleiches Projekt ({_project(c.paths[i])})")
@@ -398,7 +398,7 @@ def _evidence(c: Corpus, i: int, j: int, x: np.ndarray, mention_by: int | None) 
         reasons.append(f"{common} gemeinsame{'r' if common == 1 else ''} Nachbar{'n' if common > 1 else ''}")
     if x[2] >= 0.05:
         ti, tj = c.terms(i), c.terms(j)
-        shared = sorted((lx for lx in ti if lx in tj and _READABLE.match(lx)), key=lambda lx: -ti[lx])[:3]
+        shared = sorted((lx for lx in ti if lx in tj and _READABLE.match(lx)), key=lambda lx: (-ti[lx], lx))[:3]
         if shared:
             reasons.append("gemeinsame Begriffe: " + ", ".join(shared))
     return reasons
