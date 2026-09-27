@@ -22,6 +22,9 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 
+# Importing diary_server would otherwise start diary-web and open a browser.
+os.environ["DIARY_WEB_AUTOSTART"] = "0"
+
 _MAINTENANCE_DSN = os.environ.get(
     "DIARY_MAINTENANCE_URL",
     "postgresql://localhost/postgres",

@@ -212,3 +212,28 @@ def test_tool_output_has_new_sections():
     out = diary_server.memory_stats()
     for heading in ("## Instanz", "## Qualität", "## Graph", "## Projekt-Diary"):
         assert heading in out, heading
+
+
+# ---------------------------------------------------------------------------
+# Small, specific memories (Tom 2026-09-27)
+# ---------------------------------------------------------------------------
+
+def test_upsert_warns_on_oversized_curated_memory():
+    import memory_service
+    out = _upsert("/projects/demo/big", "Groß", "x " * memory_service.MEMORY_SOFT_MAX_CHARS)
+    assert "aufteilen" in out
+    assert "aufteilen" not in _upsert("/projects/demo/small", "Klein", "rsync nur mit --exclude .env.")
+
+
+def test_upsert_docstring_states_style_rule():
+    import memory_service
+    doc = memory_service.memory_upsert.__doc__
+    assert "klein" in doc and "Füllwörter" in doc
+
+
+def test_quality_counts_oversized_memories():
+    import memory_service
+    _upsert("/projects/demo/big", "Groß", "y" * (memory_service.MEMORY_SOFT_MAX_CHARS + 1))
+    _upsert("/projects/demo/small", "Klein", "kurz")
+    q = _stats()["quality"]
+    assert q["oversized"] == 1

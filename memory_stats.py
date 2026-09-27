@@ -20,6 +20,7 @@ from pathlib import Path
 
 import diary_db
 import memory_injection
+import memory_service
 from diary_bootstrap import mcp
 
 CHARS_PER_TOKEN = 3.7  # mixed German/English prose
@@ -200,6 +201,7 @@ def _quality_stats(conn) -> dict:
         f"       count(*) FILTER (WHERE coalesce(accessed_at, created_at) < now() - interval '180 days') AS stale, "
         f"       count(*) FILTER (WHERE valid_until IS NOT NULL AND valid_until < now()) AS expired, "
         f"       count(*) FILTER (WHERE embedding IS NULL) AS no_embedding, "
+        f"       count(*) FILTER (WHERE length(coalesce(body,'')) > {memory_service.MEMORY_SOFT_MAX_CHARS}) AS oversized, "
         f"       coalesce(avg(length(coalesce(body,''))), 0) AS avg_chars "
         f"FROM memory_nodes WHERE {live}"
     ).fetchone()
@@ -232,6 +234,7 @@ def _quality_stats(conn) -> dict:
         "stale_180d": row["stale"],
         "expired": row["expired"],
         "no_embedding": row["no_embedding"],
+        "oversized": row["oversized"],
         "tombstones": tomb,
         "extracted_expiring_14d": expiring,
         "avg_tokens": approx_tokens(float(row["avg_chars"])),
@@ -511,6 +514,7 @@ def _quality_lines(q: dict, g: dict) -> list[str]:
         f"- Neu: {q['created_7d']} (7 T.) / {q['created_30d']} (30 T.) · geändert: {q['updated_7d']} / {q['updated_30d']}",
         f"- Nie abgerufen: {q['never_accessed']} · seit 180 T. ungenutzt: {q['stale_180d']} · abgelaufen: {q['expired']} · "
         f"ohne Embedding: {q['no_embedding']} · Tombstones: {q['tombstones']} · extrahierte laufen in 14 T. ab: {q['extracted_expiring_14d']}",
+        f"- Zu groß (> {memory_service.MEMORY_SOFT_MAX_CHARS} Zeichen, Kandidaten zum Aufteilen): {q['oversized']}",
     ]
     if q["growth"]:
         lines.append("- Wachstum (neu/Monat): " + ", ".join(f"{m} {n}" for m, n in q["growth"].items()))

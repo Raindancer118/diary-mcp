@@ -43,6 +43,10 @@ init_db()
 # that beats the warmup.
 threading.Thread(target=diary_embed.warmup, daemon=True, name="embed-warmup").start()
 
+import diary_web_autostart  # noqa: E402
+
+diary_web_autostart.start_in_background()
+
 # Import for @mcp.tool() registration side effects.
 import diary_project_tools  # noqa: E402
 import memory_service  # noqa: E402

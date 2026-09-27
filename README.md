@@ -104,6 +104,14 @@ DIARY_REMOTE_URL=postgresql://localhost:54321/diary_mcp
 
 Pins (`memory_pin`) are only allowed inside a project (`/projects/<slug>/…`); global rules reach the model as one-liners in the digest instead. Every injected pin block carries the instruction to keep pins relevant and `memory_unpin` the ones without value.
 
+### Web UI autostart (v0.22.0)
+
+Every diary-mcp server checks at startup whether diary-web is listening on `127.0.0.1:8765` (`DIARY_WEB_PORT`). If it isn't, the server starts diary-web detached (it outlives the MCP process; log: `~/.cache/diary-mcp/diary-web.log`) and opens it in the browser. An already running UI is left alone, so new Claude sessions don't open more tabs. A file lock ensures only one of several concurrently starting sessions does this. Skipped without `WAYLAND_DISPLAY`/`DISPLAY`, over SSH (e.g. the Dorn instance) and with `DIARY_WEB_AUTOSTART=0`.
+
+### Memory style
+
+Memories should be small and specific: one fact per memory, no filler, bullet points; they only need to be readable for Claude. `memory_upsert` still saves bodies over 1200 characters but asks to split them, and `memory_stats` counts them as cleanup candidates.
+
 ### Statistics (v0.19.0)
 
 `memory_stats(days=30, project_slug="")` (MCP tool) and `GET /api/stats?days=30&project=<slug>` (diary-web, JSON) report:

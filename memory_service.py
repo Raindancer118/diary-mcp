@@ -31,6 +31,11 @@ AUTO_LINK_MAX_NEW = 3
 # full-tree dump (883 nodes ≈ 25k tokens) — one-liners + budgets; full content
 # is always available via memory_get(path).
 CONTEXT_RECENT_LIMIT = 15
+
+# Memories should be small and specific (Tom 2026-09-27). Soft limit: saving
+# still works (sync/federation imports must never fail), the result just asks
+# to split.
+MEMORY_SOFT_MAX_CHARS = 1200
 CONTEXT_BRANCH_LIMIT = 40
 CONTEXT_GLOBAL_BUDGET = 4000
 PROJECT_CONTEXT_BUDGET_CHARS = 24000
@@ -340,6 +345,10 @@ def memory_upsert(
 ) -> str:
     """Erstellt oder aktualisiert einen Memory-Node.
 
+    STIL: Memories klein und spezifisch — ein Fakt/eine Entscheidung pro Memory,
+    Füllwörter weglassen, Stichpunkte statt Prosa. Muss nur für Claude lesbar sein.
+    Richtwert: < 1200 Zeichen; Größeres in mehrere Memories aufteilen und verlinken.
+
     path:        z.B. '/feedback/commit-style' oder '/projects/eduvault4/status'
     type:        user | feedback | project | reference | note | category
     tags:        kommagetrennte Tags, optional
@@ -405,6 +414,9 @@ def memory_upsert(
         if pushed_to:
             msg += f" (an {len(pushed_to)} Diary-Link(s) auto-gesynct: {', '.join(pushed_to)})"
 
+    if origin == "curated" and len(body or "") > MEMORY_SOFT_MAX_CHARS:
+        msg += (f" Hinweis: groß (~{len(body) // 4} Tokens). Klein & spezifisch halten: "
+                f"ein Fakt pro Memory, Füllwörter weglassen — ggf. aufteilen.")
     return msg
 
 
