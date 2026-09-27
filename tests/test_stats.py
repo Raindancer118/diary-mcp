@@ -128,3 +128,87 @@ def test_web_stats_endpoint_returns_json(_dirs):
     assert resp.status_code == 200
     data = resp.json()
     assert {"corpus", "injection", "vanilla", "diary"} <= data.keys()
+
+
+# ---------------------------------------------------------------------------
+# v0.20.0: instance, memory quality, graph and project-journal statistics
+# ---------------------------------------------------------------------------
+
+def _stats(**kw):
+    import diary_db
+    import memory_stats as ms
+    with diary_db.get_db() as conn:
+        return ms.collect_stats(conn, **kw)
+
+
+def test_instance_section_describes_this_installation():
+    inst = _stats()["instance"]
+    assert inst["version"]
+    assert inst["hostname"]
+    assert inst["postgres_version"].split(".")[0].isdigit()
+    assert inst["db_name"] == "diary_mcp_pytest"
+    assert "password" not in json.dumps(inst).lower()
+    assert inst["db_size_bytes"] > 0
+    assert isinstance(inst["pgvector"], bool)
+    assert inst["embed_model"]
+    assert isinstance(inst["embed_server_alive"], bool)
+    assert "federation" in inst and "remote_sync" in inst
+
+
+def test_memory_quality_section():
+    import diary_server
+    _upsert("/projects/q/high", "H", "x" * 400, 0.9)
+    _upsert("/projects/q/low", "L", "y", 0.2)
+    _upsert("/user/expired", "E", "z", 0.5)
+    _upsert("/projects/q/gone", "G", "g")
+    diary_server.memory_delete("/projects/q/gone")
+    import diary_db
+    with diary_db.get_db() as conn:
+        conn.execute("UPDATE memory_nodes SET valid_until = now() - interval '1 day' WHERE path = '/user/expired'")
+        conn.execute("UPDATE memory_nodes SET access_count = 7 WHERE path = '/projects/q/high'")
+    q = _stats()["quality"]
+    assert q["importance"]["high"] >= 1 and q["importance"]["low"] >= 1
+    assert q["expired"] == 1
+    assert q["tombstones"] == 1
+    assert q["created_7d"] >= 3
+    assert q["never_accessed"] >= 1
+    assert q["most_accessed"][0] == ["/projects/q/high", 7]
+    assert q["largest"][0][0] == "/projects/q/high"
+    assert q["top_projects"][0][0] == "q"
+    assert q["types"]
+
+
+def test_graph_section_counts_links_orphans_contradictions():
+    import diary_server
+    _upsert("/projects/g/a", "A", "a")
+    _upsert("/projects/g/b", "B", "b")
+    _upsert("/projects/g/lonely", "C", "c")
+    diary_server.memory_link("/projects/g/a", "/projects/g/b", rel_type="contradicts")
+    g = _stats()["graph"]
+    assert g["links"] == 1
+    assert g["by_type"] == {"contradicts": 1}
+    assert g["contradictions"] == 1
+    assert g["orphans"] >= 1
+
+
+def test_journal_section_counts_project_diary():
+    import diary_server
+    diary_server.add_project("stats-journal-proj")
+    diary_server.add_milestone("stats-journal-proj", "M1")
+    diary_server.add_log_entry("stats-journal-proj", "log eintrag")
+    diary_server.add_error_solution("stats-journal-proj", "fehler", "lösung")
+    diary_server.add_reminder("stats-journal-proj", "2000-01-01", "überfällig")
+    j = _stats()["journal"]
+    assert j["projects_active"] >= 1
+    assert j["milestones_total"] >= 1
+    assert j["logs_30d"] >= 1
+    assert j["errors_solutions"] >= 1
+    assert j["reminders_overdue"] >= 1
+
+
+def test_tool_output_has_new_sections():
+    import diary_server
+    _upsert("/projects/demo/n", "N", "Body")
+    out = diary_server.memory_stats()
+    for heading in ("## Instanz", "## Qualität", "## Graph", "## Projekt-Diary"):
+        assert heading in out, heading
