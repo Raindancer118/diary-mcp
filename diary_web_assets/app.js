@@ -42,6 +42,8 @@ const fmtBytes = n => n >= 1 << 30 ? (n / (1 << 30)).toFixed(1).replace('.', ','
 const easeOut = t => 1 - Math.pow(1 - t, 4);
 const easeInOut = t => (t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
 
+const postJSON = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
 async function api(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) {
@@ -136,6 +138,7 @@ function parseHash() {
   if (h.startsWith('/m/')) return { view: 'archive', path: h.slice(2) };
   if (h === '/karte') return { view: 'atlas' };
   if (h === '/messwerte') return { view: 'stats' };
+  if (h === '/vorschlaege') return { view: 'review' };
   return { view: 'archive', path: null };
 }
 function go(path) { location.hash = memHash(path); }
@@ -152,6 +155,7 @@ function route() {
       else showWelcome();
     }
     if (r.view === 'stats') stats.enter();
+    if (r.view === 'review') review.enter();
   };
   if (changed) withTransition(apply); else apply();
 }
@@ -611,6 +615,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === '1') location.hash = state.current ? memHash(state.current) : '#/';
   else if (e.key === '2') location.hash = '#/karte';
   else if (e.key === '3') location.hash = '#/messwerte';
+  else if (e.key === '4') location.hash = '#/vorschlaege';
 });
 
 // ── sync ─────────────────────────────────────────────────────────────────
@@ -619,7 +624,7 @@ $('#sync-btn').addEventListener('click', async () => {
   btn.setAttribute('aria-busy', 'true');
   $('.sync-label', btn).textContent = 'Synct …';
   try {
-    const res = await api('/api/sync', { method: 'POST' });
+    const res = await api('/api/sync', postJSON({}));
     toast(res.message || 'Sync abgeschlossen.', /fehl|error|fail/i.test(res.message || ''), 10000);
     await loadTree();
     stats.invalidate();
@@ -1246,7 +1251,7 @@ const stats = (() => {
           <p class="note">Ab Konfidenz 0,7 verknüpft diary-mcp selbst: bei Textverweisen, nahezu gleichem Inhalt oder wenn das Modell sicher ist.</p></div>
         <div class="panel"><h3>Prüfliste</h3>
           <div class="counters">${counter(g.suggestions_pending || 0, 'Vorschläge offen')}</div>
-          <p class="note">Mittlere Konfidenz (0,35–0,7). Wird nur bearbeitet, wenn du Claude ausdrücklich darum bittest, etwa mit „geh die Link-Vorschläge durch".</p></div>
+          <p class="note">Mittlere Konfidenz (0,35–0,7). Du entscheidest unter <a href="#/vorschlaege">Vorschläge</a>; Claude fasst die Liste nur an, wenn du ausdrücklich darum bittest.</p></div>
       </div>`, '<a class="aside" href="#/karte">Zur Sternkarte →</a>');
 
     const maxTok = Math.max(1, dia.reachable_tokens || 0, van.approx_tokens || 0);
@@ -1364,6 +1369,131 @@ const stats = (() => {
   };
 })();
 
+// ═════════════════════════════════════════════════════════════════════════
+// Vorschläge — medium-confidence link suggestions, decided by hand
+// ═════════════════════════════════════════════════════════════════════════
+const review = (() => {
+  const list = $('#review-list');
+  let items = [], relTypes = ['related'], thresholds = { auto: .7, suggest: .35 }, busy = false;
+
+  function setBadge(n, bump = false) {
+    const b = $('#review-badge');
+    b.hidden = !n;
+    b.textContent = n > 99 ? '99+' : String(n);
+    if (bump && !REDUCED.matches) { b.classList.remove('bump'); void b.offsetWidth; b.classList.add('bump'); }
+  }
+
+  async function refreshBadge() {
+    try { setBadge((await api('/api/suggestions?limit=1')).pending); } catch { /* badge is decoration */ }
+  }
+
+  async function load() {
+    list.innerHTML = '<p class="loading">Lade Vorschläge …</p>';
+    let data;
+    try { data = await api('/api/suggestions?limit=200'); }
+    catch (err) { list.innerHTML = `<p class="loading">Konnte Vorschläge nicht laden: ${esc(err.message)}</p>`; return; }
+    items = data.items; relTypes = data.rel_types; thresholds = data.thresholds;
+    setBadge(data.pending);
+    const pct = v => String(v).replace('.', ',');
+    $('#review-sub').textContent = `Paare mit mittlerer Konfidenz (${pct(thresholds.suggest)} bis ${pct(thresholds.auto)}). `
+      + 'Ab ' + pct(thresholds.auto) + ' verknüpft diary-mcp selbst, darunter entscheidest du. Abgelehnte Paare kommen nie wieder.';
+    render();
+  }
+
+  const side = s => `<a class="sugg-side" href="${esc(memHash(s.path))}">
+      <span class="s-type"><span class="sw dot-${esc(s.type)}"></span>${esc(TYPE_LABEL[s.type] || s.type)}</span>
+      <h2>${esc(s.title || s.path)}</h2><span class="s-path">${esc(s.path)}</span>
+      ${s.hook ? `<p class="s-hook">${esc(s.hook)}</p>` : ''}</a>`;
+
+  function render() {
+    if (!items.length) {
+      list.innerHTML = '<p class="review-empty"><b>Keine offenen Vorschläge.</b> Neue kommen beim nächsten Nachtlauf (04:30) oder beim Speichern von Memories dazu.</p>';
+      return;
+    }
+    list.innerHTML = items.map((it, i) => `
+      <div class="sugg-wrap" data-id="${esc(it.id)}">
+        <article class="sugg" tabindex="0" style="--i:${Math.min(i, 12)}" aria-label="Vorschlag: ${esc(it.a.title)} und ${esc(it.b.title)}">
+          <div class="sugg-top">
+            <span class="conf" title="Konfidenz; der Strich markiert die Schwelle für automatisches Verknüpfen">
+              <span class="conf-track" style="--v:${it.confidence};--auto:${thresholds.auto}"><i></i></span>${esc(it.confidence.toFixed(2).replace('.', ','))}</span>
+            <span class="sugg-why">${it.evidence.split('; ').filter(Boolean).map(r => `<span>${esc(r)}</span>`).join('')}</span>
+          </div>
+          <div class="sugg-pair">${side(it.a)}
+            <svg class="bridge" viewBox="0 0 96 24" aria-hidden="true"><line x1="8" y1="12" x2="88" y2="12"/><line class="solid" x1="8" y1="12" x2="88" y2="12"/>
+              <circle cx="6" cy="12" r="3.5"/><circle cx="90" cy="12" r="3.5"/></svg>
+            ${side(it.b)}</div>
+          <div class="sugg-actions">
+            <label class="sr" for="rel-${esc(it.id)}">Beziehung</label>
+            <select id="rel-${esc(it.id)}">${relTypes.map(t => `<option value="${esc(t)}">${esc(REL_LABEL[t] || t)}</option>`).join('')}</select>
+            <span class="spacer"></span>
+            <button type="button" class="act reject" data-act="reject">Ablehnen <kbd>R</kbd></button>
+            <button type="button" class="act approve" data-act="approve">Verknüpfen <kbd>A</kbd></button>
+          </div>
+        </article>
+      </div>`).join('');
+    const first = list.querySelector('.sugg');
+    if (first) first.classList.add('current');
+  }
+
+  function focusCard(card) {
+    if (!card) return;
+    $$('.sugg.current', list).forEach(c => c.classList.remove('current'));
+    card.classList.add('current');
+    card.focus({ preventScroll: true });
+    card.scrollIntoView({ block: 'nearest', behavior: REDUCED.matches ? 'auto' : 'smooth' });
+  }
+
+  async function act(wrap, decision) {
+    if (busy || !wrap || wrap.classList.contains('gone')) return;
+    const card = wrap.querySelector('.sugg');
+    const rel = card.querySelector('select').value;
+    busy = true;
+    card.querySelectorAll('.act').forEach(b => { b.disabled = true; });
+    try {
+      const res = await api('/api/suggestions/decide', postJSON({ ids: [wrap.dataset.id], decision, rel_type: rel }));
+      if (!res.done) throw new Error('bereits entschieden');
+    } catch (err) {
+      card.querySelectorAll('.act').forEach(b => { b.disabled = false; });
+      busy = false;
+      toast(`Konnte nicht speichern: ${err.message}`, true);
+      return;
+    }
+    card.classList.add(decision === 'approve' ? 'linked' : 'rejected');
+    const next = wrap.nextElementSibling?.querySelector('.sugg') || wrap.previousElementSibling?.querySelector('.sugg');
+    items = items.filter(it => it.id !== wrap.dataset.id);
+    setBadge(items.length, true);
+    stats.invalidate();
+    atlas.invalidate();
+    setTimeout(() => {
+      wrap.classList.add('gone');
+      focusCard(next);
+      setTimeout(() => { wrap.remove(); if (!items.length) render(); }, REDUCED.matches ? 0 : 700);
+      busy = false;
+    }, REDUCED.matches ? 0 : 520);
+  }
+
+  list.addEventListener('click', e => {
+    const b = e.target.closest('[data-act]');
+    if (b) act(b.closest('.sugg-wrap'), b.dataset.act);
+    else if (!e.target.closest('a, select')) focusCard(e.target.closest('.sugg'));
+  });
+  list.addEventListener('keydown', e => {
+    const card = e.target.closest('.sugg');
+    if (!card || e.target.closest('select') || e.metaKey || e.ctrlKey || e.altKey) return;
+    const wrap = card.closest('.sugg-wrap');
+    const k = e.key.toLowerCase();
+    if (k === 'a') { e.preventDefault(); act(wrap, 'approve'); }
+    else if (k === 'r') { e.preventDefault(); act(wrap, 'reject'); }
+    else if (k === 'j' || e.key === 'ArrowDown') { e.preventDefault(); focusCard(wrap.nextElementSibling?.querySelector('.sugg')); }
+    else if (k === 'k' || e.key === 'ArrowUp') { e.preventDefault(); focusCard(wrap.previousElementSibling?.querySelector('.sugg')); }
+  });
+
+  return {
+    enter() { load().then(() => focusCard(list.querySelector('.sugg'))); },
+    refreshBadge,
+  };
+})();
+
 // ── boot ─────────────────────────────────────────────────────────────────
 async function loadTree() {
   const nodes = await api('/api/tree');
@@ -1384,4 +1514,5 @@ async function loadTree() {
   try { await loadTree(); }
   catch (err) { toast(`Baum konnte nicht geladen werden: ${err.message}`, true, 15000); }
   route();
+  review.refreshBadge();
 })();

@@ -21,6 +21,7 @@
     <a href="#/" data-view="archive">Archiv<kbd>1</kbd></a>
     <a href="#/karte" data-view="atlas">Sternkarte<kbd>2</kbd></a>
     <a href="#/messwerte" data-view="stats">Messwerte<kbd>3</kbd></a>
+    <a href="#/vorschlaege" data-view="review">Vorschläge<span class="badge" id="review-badge" hidden></span><kbd>4</kbd></a>
   </nav>
   <button class="seek" id="open-search" type="button">
     <span aria-hidden="true">⌕</span><span class="seek-label">Gedächtnis durchsuchen</span><kbd>Ctrl K</kbd>
@@ -109,6 +110,18 @@
         </div>
       </header>
       <div id="stats-body" class="stats-body" aria-busy="true"></div>
+    </div>
+  </section>
+
+  <!-- ── Vorschläge ─────────────────────────────────────────── -->
+  <section class="view" id="view-review" aria-label="Verknüpfungs-Vorschläge">
+    <div class="review">
+      <header class="review-head">
+        <p class="eyebrow">Vorschläge</p>
+        <h1 class="review-title">Sollen diese Sterne ein Sternbild bilden?</h1>
+        <p class="review-sub" id="review-sub"></p>
+      </header>
+      <div class="review-list" id="review-list" aria-live="polite"></div>
     </div>
   </section>
 </main>

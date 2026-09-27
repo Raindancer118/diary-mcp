@@ -532,61 +532,50 @@ def format_report(r: dict) -> str:
             f"{r['candidates']} Kandidatenpaare. {model}.")
 
 
-# ── review list (explicit request only) ────────────────────────────────────
+# ── review list ────────────────────────────────────────────────────────────
+# Processed by the user in diary-web, or by Claude — but only on explicit request.
 
-@mcp.tool()
-def memory_link_suggestions(limit: int = 20, min_confidence: float = 0.0) -> str:
-    """Listet offene Verknüpfungs-Vorschläge mittlerer Konfidenz (höchste zuerst).
+REL_TYPES = ("related", "supports", "contradicts", "requires", "derived_from")
 
-    NUR verwenden, wenn der User ausdrücklich darum bittet, die Vorschlagsliste
-    anzusehen oder abzuarbeiten. Nie proaktiv, nie nebenbei, nie als
-    Aufräum-Schritt anderer Aufgaben. Freigeben/Ablehnen über
-    memory_link_suggestions_decide — ebenfalls nur auf ausdrückliche Anfrage.
-    """
-    limit = max(1, min(int(limit), 200))
+
+def list_pending(limit: int = 20, min_confidence: float = 0.0) -> tuple[int, list[dict]]:
+    """(total pending, highest-confidence suggestions with both memories)."""
+    limit = max(1, min(int(limit), 500))
     with diary_db.get_db() as conn:
         rows = conn.execute(
-            "SELECT s.id, s.confidence, s.evidence, a.path AS a, a.title AS at, b.path AS b, b.title AS bt "
+            "SELECT s.id, s.confidence, s.evidence, s.created_at, "
+            "a.path AS a_path, a.title AS a_title, a.type AS a_type, a.body AS a_body, "
+            "b.path AS b_path, b.title AS b_title, b.type AS b_type, b.body AS b_body "
             "FROM link_suggestions s JOIN memory_nodes a ON a.id = s.from_id JOIN memory_nodes b ON b.id = s.to_id "
-            "WHERE s.status = 'pending' AND s.confidence >= %s "
-            "AND a.deleted_at IS NULL AND b.deleted_at IS NULL "
+            "WHERE s.status = 'pending' AND s.confidence >= %s AND a.deleted_at IS NULL AND b.deleted_at IS NULL "
             "ORDER BY s.confidence DESC, s.created_at LIMIT %s", (min_confidence, limit)).fetchall()
-        total = conn.execute("SELECT count(*) AS n FROM link_suggestions WHERE status = 'pending'").fetchone()["n"]
-    if not rows:
-        return "Keine offenen Verknüpfungs-Vorschläge."
-    lines = [f"{total} offene Vorschläge (zeige {len(rows)}):"]
-    for r in rows:
-        lines.append(f"\n[{r['id']}] Konfidenz {r['confidence']:.2f}\n  {r['a']} — {r['at']}\n  {r['b']} — {r['bt']}\n"
-                     f"  Grund: {r['evidence']}")
-    lines.append("\nEntscheiden: memory_link_suggestions_decide(ids='id1,id2', decision='approve'|'reject')")
-    return "\n".join(lines)
+        total = conn.execute(
+            "SELECT count(*) AS n FROM link_suggestions s JOIN memory_nodes a ON a.id = s.from_id "
+            "JOIN memory_nodes b ON b.id = s.to_id "
+            "WHERE s.status = 'pending' AND a.deleted_at IS NULL AND b.deleted_at IS NULL").fetchone()["n"]
+
+    def side(r, k):
+        return {"path": r[f"{k}_path"], "title": r[f"{k}_title"], "type": r[f"{k}_type"],
+                "hook": memory_injection.node_hook(r[f"{k}_body"])}
+    return total, [{"id": str(r["id"]), "confidence": round(float(r["confidence"]), 4),
+                    "evidence": r["evidence"] or "", "a": side(r, "a"), "b": side(r, "b")} for r in rows]
 
 
-@mcp.tool()
-def memory_link_suggestions_decide(ids: str, decision: str, rel_type: str = "related", note: str = "") -> str:
-    """Gibt Verknüpfungs-Vorschläge frei oder lehnt sie ab.
-
-    NUR verwenden, wenn der User ausdrücklich darum bittet, bestimmte
-    Vorschläge freizugeben oder abzulehnen (oder die Liste gemeinsam mit ihm
-    durchzugehen). Nie eigenständig entscheiden.
-
-    ids:      kommagetrennte Vorschlags-IDs aus memory_link_suggestions
-    decision: 'approve' (legt einen bewussten Link an) oder 'reject'
-              (das Paar wird nie wieder vorgeschlagen oder automatisch verlinkt)
-    rel_type: related | supports | contradicts | requires | derived_from
-    """
+def decide(ids, decision: str, rel_type: str = "related", note: str = "") -> tuple[int, int]:
+    """Approve (→ deliberate link) or reject pending suggestions. Returns (done, not found).
+    Raises ValueError for an unknown decision or rel_type."""
     decision = decision.strip().lower()
     if decision not in ("approve", "reject"):
-        return "Fehler: decision muss 'approve' oder 'reject' sein."
-    if rel_type not in ("related", "supports", "contradicts", "requires", "derived_from"):
-        return "Fehler: ungültiger rel_type."
-    wanted = []
-    for raw in ids.split(","):
+        raise ValueError("decision muss 'approve' oder 'reject' sein")
+    if rel_type not in REL_TYPES:
+        raise ValueError(f"rel_type muss einer von {', '.join(REL_TYPES)} sein")
+    wanted, missing = [], 0
+    for raw in ids:
         try:
-            wanted.append(uuid.UUID(raw.strip()))
+            wanted.append(uuid.UUID(str(raw).strip()))
         except ValueError:
-            continue
-    done, missing = 0, len(ids.split(",")) - len(wanted)
+            missing += 1
+    done = 0
     with diary_db.get_db() as conn:
         for sid in wanted:
             row = conn.execute("SELECT * FROM link_suggestions WHERE id = %s AND status = 'pending'",
@@ -604,5 +593,47 @@ def memory_link_suggestions_decide(ids: str, decision: str, rel_type: str = "rel
             conn.execute("UPDATE link_suggestions SET status = %s, decided_at = now(), updated_at = now() "
                          "WHERE id = %s", ("approved" if decision == "approve" else "rejected", sid))
             done += 1
-    verb = "freigegeben" if decision == "approve" else "abgelehnt"
+    return done, missing
+
+
+@mcp.tool()
+def memory_link_suggestions(limit: int = 20, min_confidence: float = 0.0) -> str:
+    """Listet offene Verknüpfungs-Vorschläge mittlerer Konfidenz (höchste zuerst).
+
+    NUR verwenden, wenn der User ausdrücklich darum bittet, die Vorschlagsliste
+    anzusehen oder abzuarbeiten. Nie proaktiv, nie nebenbei, nie als
+    Aufräum-Schritt anderer Aufgaben. Freigeben/Ablehnen über
+    memory_link_suggestions_decide — ebenfalls nur auf ausdrückliche Anfrage.
+    (Der User kann die Liste auch selbst in diary-web unter „Vorschläge" bearbeiten.)
+    """
+    total, items = list_pending(min(int(limit), 200), min_confidence)
+    if not items:
+        return "Keine offenen Verknüpfungs-Vorschläge."
+    lines = [f"{total} offene Vorschläge (zeige {len(items)}):"]
+    for it in items:
+        lines.append(f"\n[{it['id']}] Konfidenz {it['confidence']:.2f}\n"
+                     f"  {it['a']['path']} — {it['a']['title']}\n  {it['b']['path']} — {it['b']['title']}\n"
+                     f"  Grund: {it['evidence']}")
+    lines.append("\nEntscheiden: memory_link_suggestions_decide(ids='id1,id2', decision='approve'|'reject')")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def memory_link_suggestions_decide(ids: str, decision: str, rel_type: str = "related", note: str = "") -> str:
+    """Gibt Verknüpfungs-Vorschläge frei oder lehnt sie ab.
+
+    NUR verwenden, wenn der User ausdrücklich darum bittet, bestimmte
+    Vorschläge freizugeben oder abzulehnen (oder die Liste gemeinsam mit ihm
+    durchzugehen). Nie eigenständig entscheiden.
+
+    ids:      kommagetrennte Vorschlags-IDs aus memory_link_suggestions
+    decision: 'approve' (legt einen bewussten Link an) oder 'reject'
+              (das Paar wird nie wieder vorgeschlagen oder automatisch verlinkt)
+    rel_type: related | supports | contradicts | requires | derived_from
+    """
+    try:
+        done, missing = decide(ids.split(","), decision, rel_type, note)
+    except ValueError as exc:
+        return f"Fehler: {exc}."
+    verb = "freigegeben" if decision.strip().lower() == "approve" else "abgelehnt"
     return f"{done} Vorschläge {verb}." + (f" {missing} nicht gefunden oder bereits entschieden." if missing else "")

@@ -34,7 +34,7 @@ def client():
     import importlib
     import diary_web
     importlib.reload(diary_web)
-    return TestClient(diary_web.app)
+    return TestClient(diary_web.app, base_url="http://127.0.0.1:8765")
 
 
 # ── shell + assets ──────────────────────────────────────────────────────────
@@ -159,3 +159,73 @@ def test_stats_and_health_endpoints(client):
     assert "issues" in h and "stats" in h
     g = client.get("/api/graph").json()
     assert "nodes" in g and "edges" in g
+
+
+# ── link suggestions (v0.25.0) ─────────────────────────────────────────────
+
+ORIGIN = {"Origin": "http://127.0.0.1:8765"}
+
+
+def _suggest_pair(monkeypatch):
+    """Two near-duplicates with AUTO raised above the duplicate rule → one pending suggestion."""
+    import random
+    import link_inference
+    monkeypatch.setattr(link_inference, "AUTO_CONFIDENCE", 0.99)
+    rnd = random.Random(5)
+    v = [rnd.gauss(0, 1) for _ in range(384)]
+    import diary_server
+    for path, vec in (("/projects/a/alpha", v), ("/projects/b/beta", [x * 1.001 for x in v])):
+        with patch("diary_embed.embed", return_value=vec):
+            diary_server.memory_upsert(path=path, title=path.rsplit("/", 1)[1].title(),
+                                       body=f"Erste Zeile von {path}.\nMehr Text.")
+
+
+def test_suggestions_endpoint_lists_pending_with_both_sides(client, monkeypatch):
+    _suggest_pair(monkeypatch)
+    data = client.get("/api/suggestions").json()
+    assert data["pending"] == 1
+    s = data["items"][0]
+    assert {s["a"]["path"], s["b"]["path"]} == {"/projects/a/alpha", "/projects/b/beta"}
+    assert s["a"]["hook"].startswith("Erste Zeile")
+    assert 0.35 <= s["confidence"] < 0.99 and s["evidence"]
+
+
+def test_approve_via_web_creates_explicit_link(client, monkeypatch):
+    _suggest_pair(monkeypatch)
+    sid = client.get("/api/suggestions").json()["items"][0]["id"]
+    r = client.post("/api/suggestions/decide", json={"ids": [sid], "decision": "approve",
+                                                      "rel_type": "supports"}, headers=ORIGIN)
+    assert r.status_code == 200 and r.json()["done"] == 1
+    node = client.get("/api/node", params={"path": "/projects/a/alpha"}).json()
+    rels = [l["rel_type"] for l in node["links_out"]] + [l["rel_type"] for l in node["links_in"]]
+    assert "supports" in rels
+    assert client.get("/api/suggestions").json()["pending"] == 0
+
+
+def test_reject_via_web(client, monkeypatch):
+    _suggest_pair(monkeypatch)
+    sid = client.get("/api/suggestions").json()["items"][0]["id"]
+    r = client.post("/api/suggestions/decide", json={"ids": [sid], "decision": "reject"}, headers=ORIGIN)
+    assert r.json()["done"] == 1
+    assert client.get("/api/suggestions").json()["pending"] == 0
+    node = client.get("/api/node", params={"path": "/projects/a/alpha"}).json()
+    assert not node["links_out"] and not node["links_in"]
+
+
+def test_decide_rejects_bad_input(client, monkeypatch):
+    _suggest_pair(monkeypatch)
+    sid = client.get("/api/suggestions").json()["items"][0]["id"]
+    assert client.post("/api/suggestions/decide", json={"ids": [sid], "decision": "maybe"},
+                       headers=ORIGIN).status_code == 400
+    assert client.post("/api/suggestions/decide", json={"ids": [sid], "decision": "approve",
+                                                         "rel_type": "hates"}, headers=ORIGIN).status_code == 400
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/api/suggestions/decide", {"ids": [], "decision": "reject"}),
+    ("/api/sync", {}),
+])
+def test_write_endpoints_block_cross_site_requests(client, path, body):
+    # another website in the same browser: foreign Origin, or a form post (no JSON)
+    assert client.post(path, json=body, headers={"Origin": "https://evil.example"}).status_code == 403
+    assert client.post(path, content="ids=x", headers={**ORIGIN, "Content-Type": "application/x-www-form-urlencoded"}).status_code == 415

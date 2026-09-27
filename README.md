@@ -112,7 +112,7 @@ Pins (`memory_pin`) are only allowed inside a project (`/projects/<slug>/…`); 
 - **Sternkarte** (`#/karte`) — knowledge graph; linked memories cluster per project, unlinked ones form the outer field. Hover highlights neighbours, click opens.
 - **Messwerte** (`#/messwerte`) — everything from `/api/stats` plus a one-year activity heatmap from `GET /api/activity?days=365` (per day: created, last-edited, project log entries).
 
-Keys: `Ctrl/⌘ K` or `/` search, `1`/`2`/`3` switch views, `Esc` closes. Assets live in `diary_web_assets/` (package data); design decisions in `Design.md`. Honours `prefers-reduced-motion`; strict CSP, no framing.
+Keys: `Ctrl/⌘ K` or `/` search, `1`–`4` switch views, `Esc` closes. Write endpoints (`/api/sync`, `/api/suggestions/decide`) require JSON and a same-origin `Origin` header (CSRF guard). Assets live in `diary_web_assets/` (package data); design decisions in `Design.md`. Honours `prefers-reduced-motion`; strict CSP, no framing.
 
 ### Web UI autostart (v0.22.0)
 
@@ -145,7 +145,7 @@ Every candidate pair of curated memories gets a **confidence** (`link_inference.
 The model is refitted nightly on the **deliberate** links only (set by hand or approved suggestions), with non-negative weights; automatic links never train the next round. Below 40 deliberate links it uses built-in default weights.
 
 - **≥ 0.7:** linked automatically (`link_origin = 'inferred'`, with `confidence` and a human-readable `evidence`).
-- **0.35–0.7:** stored in `link_suggestions`. This list is **only processed on explicit request** via `memory_link_suggestions()` and `memory_link_suggestions_decide(ids, 'approve'|'reject')`. Approved pairs become deliberate links; rejected pairs are never suggested or linked again.
+- **0.35–0.7:** stored in `link_suggestions`. You decide in diary-web (**Vorschläge**, `#/vorschlaege`; keys `A` approve, `R` reject, `J`/`K` move) or ask Claude, which uses `memory_link_suggestions()` / `memory_link_suggestions_decide(ids, 'approve'|'reject')` **only on explicit request**. Approved pairs become deliberate links; rejected pairs are never suggested or linked again.
 - Hand-set links are never touched; existing automatic links are re-scored, never deleted.
 
 Runs at write time (`memory_upsert`, ~65 ms with a warm per-process cache, at most `AUTO_LINK_MAX_NEW` non-mention links per save) and nightly over the whole tree (`scripts/link_inference_cron.py`, systemd user timer `diary-link-inference.timer`, 04:30, log `~/.local/share/diary-link-inference.log`). `memory_stats` and diary-web show auto-link and suggestion counts. The admin tool `memory_infer_links(threshold)` is the older pure-cosine variant for manual use.

@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -182,6 +183,51 @@ def api_graph(scope: str = "", include_extracted: bool = False):
     }
 
 
+def _same_origin_json(request: Request) -> None:
+    """Guard for state-changing endpoints: the server only binds to localhost,
+    but any website open in the same browser could still POST to it. Browsers
+    always send Origin on such requests, and a JSON body can't be sent
+    cross-site without a CORS preflight this app never answers."""
+    origin = request.headers.get("origin")
+    if origin:
+        host = request.headers.get("host", "")
+        if origin not in (f"http://{host}", f"https://{host}"):
+            raise HTTPException(403, "cross-site request blocked")
+    if not request.headers.get("content-type", "").startswith("application/json"):
+        raise HTTPException(415, "JSON required")
+
+
+@app.get("/api/suggestions")
+def api_suggestions(limit: int = 100, min_confidence: float = 0.0):
+    import link_inference
+    total, items = link_inference.list_pending(limit, min_confidence)
+    return {"pending": total, "items": items,
+            "rel_types": list(link_inference.REL_TYPES),
+            "thresholds": {"auto": link_inference.AUTO_CONFIDENCE, "suggest": link_inference.SUGGEST_CONFIDENCE}}
+
+
+@app.post("/api/suggestions/decide")
+async def api_suggestions_decide(request: Request):
+    import link_inference
+    _same_origin_json(request)  # before parsing, so a cross-site form never reaches the body
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(400, "invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "JSON object expected")
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list):
+        raise HTTPException(400, "ids must be a list")
+    try:
+        done, missing = await run_in_threadpool(
+            link_inference.decide, ids, str(payload.get("decision", "")),
+            str(payload.get("rel_type", "related")), str(payload.get("note", "")))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"done": done, "missing": missing}
+
+
 @app.get("/api/activity")
 def api_activity(days: int = 365):
     import memory_stats
@@ -217,8 +263,9 @@ def index():
 # ── sync endpoint ─────────────────────────────────────────────────────────────
 
 @app.post("/api/sync")
-def api_sync():
+def api_sync(request: Request):
     """Trigger memory sync with remote Postgres (DIARY_REMOTE_URL)."""
+    _same_origin_json(request)
     from diary_server import memory_sync
     result = memory_sync()
     return {"message": result}
