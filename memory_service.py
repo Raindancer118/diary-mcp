@@ -13,6 +13,7 @@ from psycopg.rows import dict_row
 
 import diary_db
 import diary_embed
+import memory_injection
 from diary_bootstrap import mcp
 
 # Extracted memories auto-expire after this many days unless promoted to curated.
@@ -26,12 +27,14 @@ EXTRACTED_TTL_DAYS = 90
 AUTO_LINK_THRESHOLD = 0.82
 AUTO_LINK_MAX_NEW = 3
 
-# memory_context() session snapshot bounds. The "recently updated" section dumps
-# full bodies; without caps it can exceed the MCP client's token limit when many
-# nodes were touched recently (e.g. right after seeding the DB). Cap node count
-# and per-body length; full content is always available via memory_get(path).
+# memory_context()/memory_project_context() output bounds. v0.18.0: no more
+# full-tree dump (883 nodes ≈ 25k tokens) — one-liners + budgets; full content
+# is always available via memory_get(path).
 CONTEXT_RECENT_LIMIT = 15
-CONTEXT_BODY_MAX_CHARS = 1200
+CONTEXT_BRANCH_LIMIT = 40
+CONTEXT_GLOBAL_BUDGET = 4000
+PROJECT_CONTEXT_BUDGET_CHARS = 24000
+PROJECT_CONTEXT_BODY_MAX_CHARS = 3000
 
 
 def _ensure_memory_parent(conn, path: str):
@@ -91,64 +94,50 @@ def _contradiction_warnings(conn, node_ids: list) -> dict:
 
 @mcp.tool()
 def memory_context() -> str:
-    """Session-Start-Snapshot: liefert den kompletten Memory-Tree als Übersicht + kürzlich geänderte Nodes mit vollem Inhalt."""
+    """Session-Start-Snapshot, token-budgetiert: Branch-Übersicht (Projekte mit Anzahl),
+    globale Regeln/Präferenzen, zuletzt geänderte Nodes als Einzeiler.
+    Kein Volltext-Dump — Details via memory_get(path) / memory_tree(path)."""
     with diary_db.get_db() as conn:
-        nodes = conn.execute(
-            "SELECT path, type, title, updated_at FROM memory_nodes "
-            "WHERE origin = 'curated' AND deleted_at IS NULL ORDER BY path"
+        branches = conn.execute(
+            "SELECT CASE WHEN path LIKE '/projects/%%/%%' OR path ~ '^/projects/[^/]+$' "
+            "            THEN '/projects/' || split_part(path, '/', 3) "
+            "            ELSE '/' || split_part(path, '/', 2) END AS branch, "
+            "       count(*) AS n, max(updated_at) AS last "
+            "FROM memory_nodes WHERE origin = 'curated' AND deleted_at IS NULL AND type <> 'category' "
+            "GROUP BY 1 ORDER BY max(updated_at) DESC"
         ).fetchall()
-        recent_cutoff = datetime.now() - timedelta(days=14)
         recent = conn.execute(
             "SELECT path, title, body, updated_at FROM memory_nodes "
-            "WHERE origin = 'curated' AND deleted_at IS NULL "
-            "AND body IS NOT NULL AND body != '' AND updated_at > %s "
-            "ORDER BY updated_at DESC LIMIT %s",
-            (recent_cutoff, CONTEXT_RECENT_LIMIT + 1),
+            "WHERE origin = 'curated' AND deleted_at IS NULL AND type <> 'category' "
+            "AND path NOT LIKE '%%/auto/%%' ORDER BY updated_at DESC LIMIT %s",
+            (CONTEXT_RECENT_LIMIT,),
         ).fetchall()
-        # Keep one extra to detect (but not render) overflow.
-        recent_overflow = len(recent) > CONTEXT_RECENT_LIMIT
-        recent = recent[:CONTEXT_RECENT_LIMIT]
+        global_part = memory_injection.build_session_digest(conn, None, budget_chars=CONTEXT_GLOBAL_BUDGET)
         extracted_count = conn.execute(
             "SELECT COUNT(*) AS c FROM memory_nodes WHERE origin = 'extracted' AND deleted_at IS NULL"
         ).fetchone()["c"]
 
-    lines = ["=== Claude Memory Context ===\n", "MEMORY TREE:"]
-    for node in nodes:
-        depth = node["path"].count("/") - 1
-        indent = "  " * max(0, depth)
-        updated = str(node["updated_at"])[:10]
-        lines.append(f"{indent}[{node['type']}] {node['path']} — {node['title']} ({updated})")
+    total = sum(b["n"] for b in branches)
+    lines = [f"=== Claude Memory Context ({total} kuratierte Memories) ===", "", "BRANCHES (zuletzt aktiv zuerst):"]
+    for b in branches[:CONTEXT_BRANCH_LIMIT]:
+        lines.append(f"  {b['branch']} ({b['n']}, {str(b['last'])[:10]})")
+    if len(branches) > CONTEXT_BRANCH_LIMIT:
+        rest = branches[CONTEXT_BRANCH_LIMIT:]
+        lines.append(f"  … + {len(rest)} weitere Branches ({sum(b['n'] for b in rest)} Memories) — memory_tree('/projects')")
 
-    if recent:
-        lines.append(
-            f"\n\nRECENTLY UPDATED (last 14 days, {len(recent)} most recent):"
-        )
-        for node in recent:
-            lines.append(f"\n--- {node['path']} ---")
-            lines.append(f"Titel: {node['title']}")
-            lines.append(f"Geändert: {str(node['updated_at'])[:10]}")
-            body = node["body"] or ""
-            if len(body) > CONTEXT_BODY_MAX_CHARS:
-                body = (
-                    body[:CONTEXT_BODY_MAX_CHARS].rstrip()
-                    + f"\n… [gekürzt — vollständig via memory_get(\"{node['path']}\")]"
-                )
-            lines.append(body)
-            lines.append("---")
-        if recent_overflow:
-            lines.append(
-                f"\n(+ weitere kürzlich geänderte Nodes nicht gezeigt — nur die "
-                f"{CONTEXT_RECENT_LIMIT} neuesten. Tree oben listet alle; "
-                f"Details via memory_get(path).)"
-            )
+    lines += ["", "ZULETZT GEÄNDERT:"]
+    for r in recent:
+        hook = memory_injection.node_hook(r["body"])
+        lines.append(f"  {str(r['updated_at'])[:10]} {r['path']} — {r['title']}" + (f": {hook}" if hook else ""))
+
+    lines += ["", global_part.split("\n", 1)[1].strip() if "\n" in global_part else global_part]
 
     if extracted_count:
         lines.append(
-            f"\n\n(+ {extracted_count} auto-extrahierte Memories aus Chat-Transkripten — "
+            f"\n(+ {extracted_count} auto-extrahierte Memories aus Chat-Transkripten — "
             f"standardmäßig NICHT geladen/durchsucht, da kostspieliger. "
             f"Bei Bedarf gezielt via memory_search(query, include_extracted=True).)"
         )
-
     return "\n".join(lines)
 
 
@@ -782,42 +771,48 @@ def memory_unpin(path: str) -> str:
 
 @mcp.tool()
 def memory_project_context(project_slug: str, only_pinned: bool = True) -> str:
-    """Liefert den Memory-Kontext für ein Projekt — gedacht zum automatischen Injizieren beim Projektstart.
+    """Projekt-Kontext, token-budgetiert.
 
-    project_slug: z.B. 'eduvault4' (ohne /projects/-Präfix) — wird auf /projects/<slug>/... gematcht.
-    only_pinned:  wenn True (default), nur Memories mit 'start' in pin_triggers; sonst alle.
-
-    Gibt die vollständigen Inhalte zurück, sodass Claude sie direkt verwenden kann.
-    Globale /user- und /feedback-Memories mit 'start' in pin_triggers werden immer mitgeliefert.
+    only_pinned=True (default): derselbe Digest, den der SessionStart-Hook injiziert —
+      gepinnte Memories im Volltext + Projekt-Index (Pfad — Titel: Einzeiler, nach
+      Wichtigkeit/Nutzung/Aktualität) + globale Regeln. Günstig, für den Überblick.
+    only_pinned=False: Volltexte aller kuratierten Projekt-Memories (ohne /auto/-,
+      extrahierte und abgelaufene), wichtigste zuerst, bis zum Budget; der Rest als Index.
     """
-    base = f"/projects/{project_slug.strip('/')}"
+    slug = project_slug.strip("/")
+    base = f"/projects/{slug}"
     with diary_db.get_db() as conn:
         if only_pinned:
-            rows = conn.execute(
-                "SELECT path, type, title, body, importance FROM memory_nodes "
-                "WHERE 'start' = ANY(pin_triggers) AND deleted_at IS NULL AND (path = %s OR path LIKE %s "
-                "  OR ((path LIKE '/user/%%' OR path LIKE '/feedback/%%'))) "
-                "ORDER BY (path LIKE %s) DESC, importance DESC, path",
-                (base, f"{base}/%", f"{base}%"),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT path, type, title, body, importance FROM memory_nodes "
-                "WHERE (path = %s OR path LIKE %s) AND type != 'category' AND deleted_at IS NULL "
-                "ORDER BY importance DESC, path",
-                (base, f"{base}/%"),
-            ).fetchall()
+            return memory_injection.build_session_digest(conn, slug)
+        rows = conn.execute(
+            "SELECT path, type, title, body, importance, access_count, updated_at FROM memory_nodes "
+            "WHERE (path = %s OR path LIKE %s) AND type <> 'category' AND deleted_at IS NULL "
+            "AND origin = 'curated' AND path NOT LIKE '%%/auto/%%' "
+            "AND (valid_until IS NULL OR valid_until >= now())",
+            (base, f"{base}/%"),
+        ).fetchall()
 
     if not rows:
-        scope = "gepinnten " if only_pinned else ""
-        return f"Keine {scope}Memories für Projekt '{project_slug}' gefunden."
+        return f"Keine Memories für Projekt '{slug}' gefunden."
+    rows.sort(key=lambda r: (-memory_injection._rank_score(r), r["path"]))
 
-    lines = [f"=== Gepinnte Memory-Kontext: {project_slug} ===",
-             f"({len(rows)} Memories automatisch geladen)\n"]
+    lines = [f"=== Memory-Kontext: {slug} ({len(rows)} Memories, wichtigste zuerst) ===", ""]
+    used = 0
+    rest = []
     for r in rows:
-        lines.append(f"--- [{r['type']}] {r['path']} — {r['title']} (Wichtigkeit {r['importance']:.1f}) ---")
-        lines.append(r["body"] or "(kein Inhalt)")
-        lines.append("")
+        body = (r["body"] or "(kein Inhalt)").strip()
+        if len(body) > PROJECT_CONTEXT_BODY_MAX_CHARS:
+            body = body[:PROJECT_CONTEXT_BODY_MAX_CHARS].rstrip() + f"\n… [gekürzt → memory_get(\"{r['path']}\")]"
+        block = f"--- [{r['type']}] {r['path']} — {r['title']} (Wichtigkeit {r['importance']:.1f}) ---\n{body}\n"
+        if used + len(block) > PROJECT_CONTEXT_BUDGET_CHARS:
+            rest.append(r)
+            continue
+        lines.append(block)
+        used += len(block)
+    if rest:
+        lines.append(f"Weitere {len(rest)} Memories (nur Index, Volltext via memory_get):")
+        for r in rest:
+            lines.append(f"- {r['path']} — {r['title']}")
     return "\n".join(lines)
 
 

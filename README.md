@@ -83,20 +83,23 @@ DIARY_REMOTE_URL=postgresql://localhost:54321/diary_mcp
 
 ### Session hooks
 
-Register in `settings.json` (see `~/.claude/hooks/` for the actual scripts):
+`uv tool install .` also installs `diary-hook`. Register it in `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/diary_session_start.py" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/diary_prompt_retrieval.py" }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "diary-hook session-start", "timeout": 10 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "diary-hook prompt", "timeout": 10 }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/diary_session_end.py" }] }]
-  }
+  },
+  "autoMemoryEnabled": false
 }
 ```
 
-- **SessionStart** injects memories pinned (`pin_triggers`) for `start`/`compact`, scoped to the project (via `cwd` → slug resolution) plus global `/user`, `/feedback`.
-- **UserPromptSubmit** (`diary_prompt_retrieval.py`) runs the current prompt through Postgres FTS (the same tsvector index `memory_search` uses) against curated memories, scoped the same way, and silently injects the top matches. Deliberately FTS-only, not semantic — loading the embedding model fresh on every single prompt would reintroduce the cold-start stall documented in `Project.md`'s v0.8.1 postmortem. This replaced the old `trigger_keywords`/`memory_set_keywords` mechanism (retired in v0.10.0), which required maintaining an exact keyword list per memory by hand.
+`autoMemoryEnabled: false` turns off Claude Code's built-in file memory, whose system-prompt section otherwise contradicts "diary is the memory".
+
+- **SessionStart** (`startup`/`resume`/`clear`/`compact`) injects a token-budgeted digest (~8k chars): pinned nodes in full, then a ranked project index (`path — title: first sentence`, by importance/usage/recency) and global `/feedback` + `/user` rules ranked by relevance to the project (cosine against the project's stored embeddings, no model load). `/auto/`, extracted and expired nodes are never included. Project = cwd via `memory_set_project_dir` aliases, else basename.
+- **UserPromptSubmit** retrieves up to 3 curated memories per prompt, across all projects (current project boosted): OR query over the prompt's lexemes, BM25-style scoring with corpus document frequencies (cached for 6h in `~/.cache/diary-mcp/`), at least 2 matched terms, relative cutoff against the best hit. If a diary-mcp process already runs the shared embedding server, the prompt is also embedded over that socket and fused via RRF; the hook never loads a model itself. Each memory is injected at most once per session (reset on compaction). Trivial prompts (< 2 content words, bare slash commands) are skipped.
 - **SessionEnd** optionally extracts structured memories from the conversation (per-project opt-in via `memory_set_project_config`, off by default).
 
 ## Automatic linking (v0.13.0)
