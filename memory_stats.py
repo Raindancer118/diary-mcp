@@ -332,7 +332,7 @@ def _injection_stats(days: int) -> dict:
         "prompts_with_hits": len(with_hits),
         "hit_rate": round(len(with_hits) / len(prompts), 3) if prompts else 0.0,
         "semantic_share": round(sum(1 for e in prompts if e.get("semantic")) / len(prompts), 3) if prompts else 0.0,
-        "avg_digest_tokens": approx_tokens(avg(e.get("chars", 0) for e in starts)),
+        "avg_session_start_tokens": approx_tokens(avg(e.get("chars", 0) for e in starts)),
         "avg_tokens_per_hit_prompt": approx_tokens(avg(e.get("chars", 0) for e in with_hits)),
         "avg_tokens_per_session": approx_tokens(total_chars / len(per_session)) if per_session else 0,
         "total_injected_tokens": approx_tokens(total_chars),
@@ -443,9 +443,10 @@ def _vanilla_stats(conn, slug: str | None) -> dict:
 def collect_stats(conn, days: int = 30, project_slug: str = "") -> dict:
     slug = project_slug.strip("/") or None
     corpus = _corpus_stats(conn)
-    digest = memory_injection.build_session_digest(conn, slug)
     diary = {
-        "project_digest_tokens": approx_tokens(len(digest)),
+        # What the SessionStart hook injects vs. the index Claude can pull on demand.
+        "session_start_tokens": approx_tokens(len(memory_injection.build_session_hint(conn, slug))),
+        "index_tokens": approx_tokens(len(memory_injection.build_session_digest(conn, slug))),
         "reachable_tokens": corpus["approx_tokens"],
     }
     if slug:
@@ -568,7 +569,7 @@ def format_stats(st: dict) -> str:
     ]
     if inj["sessions"] or inj["prompts"]:
         lines += [
-            f"- Sessions: {inj['sessions']} · Ø Session-Digest {_fmt_int(inj['avg_digest_tokens'])} Tokens "
+            f"- Sessions: {inj['sessions']} · Ø Session-Start {_fmt_int(inj['avg_session_start_tokens'])} Tokens "
             f"({inj['avg_latency_ms']['session-start']} ms)",
             f"- Prompts: {inj['prompts']} · mit Treffer {inj['prompts_with_hits']} ({inj['hit_rate']:.0%}) · "
             f"Ø {_fmt_int(inj['avg_tokens_per_hit_prompt'])} Tokens pro Treffer-Prompt · "
@@ -598,12 +599,13 @@ def format_stats(st: dict) -> str:
             f"- Projekt '{p['slug']}': file-based lädt pro Session {_fmt_int(p['always_loaded_tokens'])} Tokens "
             f"(MEMORY.md-Index) und erreicht {p['files']} Dateien (~{_fmt_int(p['approx_tokens'])} Tokens) "
             f"— nur dieses Projekt, ohne Suche.",
-            f"- Projekt '{p['slug']}': Diary lädt {_fmt_int(d['project_digest_tokens'])} Tokens (Digest) und erreicht "
+            f"- Projekt '{p['slug']}': Diary lädt pro Session {_fmt_int(d['session_start_tokens'])} Tokens "
+            f"(Pins + Hinweis; Index mit {_fmt_int(d['index_tokens'])} Tokens nur bei Bedarf) und erreicht "
             f"{d.get('project_memories', 0)} Projekt-Memories (~{_fmt_int(d.get('project_tokens', 0))} Tokens) plus "
             f"das gesamte Korpus (~{_fmt_int(d['reachable_tokens'])} Tokens) per Auto-Retrieval und Suche.",
         ]
     else:
-        lines.append(f"- Diary: globaler Digest {_fmt_int(d['project_digest_tokens'])} Tokens, "
+        lines.append(f"- Diary: Übersicht bei Bedarf {_fmt_int(d['index_tokens'])} Tokens, "
                      f"erreichbar ~{_fmt_int(d['reachable_tokens'])} Tokens projektübergreifend.")
     lines += [
         "- Fähigkeiten: Diary hat Hybrid-Suche (FTS+semantisch), Auto-Retrieval pro Prompt, projektübergreifenden "

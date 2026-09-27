@@ -100,7 +100,12 @@ def test_vanilla_comparison_counts_files_and_import_coverage(_dirs):
     assert v["project"]["slug"] == "demo" and v["project"]["files"] == 2
     assert v["project"]["always_loaded_tokens"] == ms.approx_tokens(
         len("- [Deploy](deploy.md) — rsync mit exclude\n- [Style](style.md) — kurz\n"))
-    assert st["diary"]["project_digest_tokens"] > 0
+    import memory_injection as mi
+    with diary_db.get_db() as conn:
+        hint = mi.build_session_hint(conn, "demo")
+    # what the SessionStart hook really injects, not the on-demand index
+    assert st["diary"]["session_start_tokens"] == ms.approx_tokens(len(hint))
+    assert st["diary"]["index_tokens"] > st["diary"]["session_start_tokens"]
 
 
 def test_vanilla_comparison_without_files(_dirs):
