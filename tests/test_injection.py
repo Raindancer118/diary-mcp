@@ -179,13 +179,6 @@ def test_retrieval_matches_natural_language_prompt_with_or_semantics():
     assert hits and hits[0]["path"] == "/projects/demo/rsync-regel"
 
 
-def test_relative_cutoff_drops_hits_far_weaker_than_the_best():
-    import memory_injection as mi
-    hits = [{"path": "a", "score": 20.0}, {"path": "b", "score": 11.0}, {"path": "c", "score": 7.5}]
-    assert [h["path"] for h in mi._relative_cutoff(hits)] == ["a", "b"]
-    assert mi._relative_cutoff([]) == []
-
-
 def test_retrieval_ignores_matches_on_common_words_only():
     import memory_injection as mi
     _seed_retrieval_corpus()
@@ -260,7 +253,8 @@ def test_prompt_hook_injects_once_per_session():
     assert second == ""
 
 
-def test_session_start_hook_outputs_digest_and_compact_resets_dedupe():
+def test_session_start_hook_is_lean_and_compact_resets_dedupe():
+    """Tom 2026-09-27: don't preload project memories — Claude fetches them when needed."""
     import memory_injection as mi
     _seed_retrieval_corpus()
     prompt = {"session_id": "s2", "cwd": "/x/demo", "prompt": "rsync Deployment Dorn"}
@@ -268,8 +262,97 @@ def test_session_start_hook_outputs_digest_and_compact_resets_dedupe():
         assert mi.run_hook("prompt", prompt)
         assert mi.run_hook("prompt", prompt) == ""
         out = mi.run_hook("session-start", {"session_id": "s2", "cwd": "/x/demo", "source": "compact"})
-        assert "rsync-regel" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "rsync-regel" not in ctx and "Projekt-Index" not in ctx
+        assert "13 Memories" in ctx and "memory_project_context" in ctx
+        assert len(ctx) < 600
         assert mi.run_hook("prompt", prompt)  # context was summarized → may inject again
+
+
+def test_session_start_hook_still_injects_project_pins():
+    import diary_server
+    import memory_injection as mi
+    _upsert("/projects/demo/critical", "Kritisch", "Nie ohne Backup migrieren.", 0.9)
+    diary_server.memory_pin("/projects/demo/critical", on_start=True)
+    out = mi.run_hook("session-start", {"session_id": "s3", "cwd": "/x/demo"})
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "Nie ohne Backup migrieren." in ctx and mi.PIN_INSTRUCTION in ctx
+
+
+def test_session_start_hook_silent_without_project_memories():
+    import memory_injection as mi
+    assert mi.run_hook("session-start", {"session_id": "s4", "cwd": "/x/empty-proj"}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Per-prompt confidence gate (Tom 2026-09-27: only ≥ 90 % confidence, only
+# important memories — no wasted tokens).
+# ---------------------------------------------------------------------------
+
+def test_prompt_hits_carry_confidence_at_least_threshold():
+    import memory_injection as mi
+    _seed_retrieval_corpus()
+    with _conn() as conn:
+        hits = mi.retrieve_for_prompt(conn, "rsync Deployment auf Dorn", "demo")
+    assert hits and all(h["confidence"] >= mi.MIN_CONFIDENCE for h in hits)
+    assert mi.MIN_CONFIDENCE == 0.9
+
+
+def test_partial_lexical_match_is_not_confident_enough():
+    import memory_injection as mi
+    _seed_retrieval_corpus()
+    with _conn() as conn:
+        # memory covers rsync/Dorn/Deployment but not Kubernetes/Helm/Ingress
+        hits = mi.retrieve_for_prompt(
+            conn, "rsync Deployment auf Dorn und danach Kubernetes Helm Ingress Chart konfigurieren", "demo")
+    assert hits == []
+
+
+def test_long_generic_memory_mentioning_all_terms_is_not_confident():
+    """Live 2026-09-27: 'Deploy das bitte auf Dorn per rsync' injected a long
+    EduVault staging log (mentions deploy, Dorn and rsync somewhere) instead of
+    the memory that is actually about it. The topic has to show in the title."""
+    import memory_injection as mi
+    _seed_retrieval_corpus()
+    _upsert("/projects/other/staging-log", "EduVault Staging öffentlich + Prod-Mirror",
+            "Lange Notiz. Der Mirror läuft auf Dorn, Deploy per rsync, dazu Cron, Nginx, "
+            "Zertifikate und vieles mehr.", 0.8)
+    with _conn() as conn:
+        hits = mi.retrieve_for_prompt(conn, "Deploy das bitte auf Dorn per rsync", "demo")
+    assert "/projects/other/staging-log" not in [h["path"] for h in hits]
+
+
+def test_unimportant_memories_are_never_injected():
+    import memory_injection as mi
+    _upsert("/projects/demo/trivia", "Kaffeemaschine Wartung",
+            "Kaffeemaschine Wartung Entkalken monatlich.", 0.3)
+    for i in range(6):
+        _upsert(f"/projects/demo/f{i}", f"Notiz {i}", f"Thema {i}.")
+    with _conn() as conn:
+        assert mi.retrieve_for_prompt(conn, "Kaffeemaschine Wartung Entkalken", "demo") == []
+
+
+def test_semantic_confidence_threshold():
+    import memory_injection as mi
+    vec = [1.0] + [0.0] * 383
+    near = [0.99, 0.141] + [0.0] * 382   # cosine ≈ 0.99
+    far = [0.6, 0.8] + [0.0] * 382       # cosine 0.6
+    _upsert("/projects/demo/sem", "Fahrzeugpflege", "Winterreifen im Oktober wechseln.", 0.7, embedding=vec)
+    with _conn() as conn:
+        assert [h["path"] for h in mi.retrieve_for_prompt(conn, "Pneus tauschen?", "demo", qvec=near)] \
+            == ["/projects/demo/sem"]
+        assert mi.retrieve_for_prompt(conn, "Pneus tauschen?", "demo", qvec=far) == []
+
+
+def test_at_most_two_prompt_hits():
+    import memory_injection as mi
+    for i in range(4):
+        _upsert(f"/projects/demo/dup{i}", f"Backup Strategie Restic {i}", "Backup Strategie Restic Hetzner Storagebox.", 0.9)
+    for i in range(30):
+        _upsert(f"/projects/demo/f{i}", f"Notiz {i}", f"Thema {i}.")
+    with _conn() as conn:
+        hits = mi.retrieve_for_prompt(conn, "Backup Strategie Restic Hetzner Storagebox", "demo")
+    assert len(hits) == 2
 
 
 def test_hook_fails_silent_on_db_error(monkeypatch):

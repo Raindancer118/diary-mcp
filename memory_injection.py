@@ -3,16 +3,15 @@ Automatic context injection — the part that makes diary knowledge reach the
 model without it having to remember a tool call.
 
 Three consumers share this module:
-  • SessionStart hook  → build_session_digest(): a token-budgeted index of the
-    current project (path — title — one-line hook, ranked) + global rules +
-    full bodies of pinned nodes. The diary equivalent of Claude Code's
-    always-loaded MEMORY.md, but ranked, scoped and budgeted.
-  • UserPromptSubmit hook → retrieve_for_prompt(): per-turn retrieval.
-    Lexical part is an OR query over the prompt's lexemes, scored BM25-style
-    with corpus document frequencies (so "projekt" alone never triggers), plus
-    an optional semantic part when the shared embedding server
-    (diary_embed_ipc) is already running — never loads a model in the hook.
-  • memory_context / memory_project_context tools (budgeted output).
+  • SessionStart hook  → build_session_hint(): project pins + one line on
+    what exists and how to fetch it. Nothing else is preloaded.
+  • UserPromptSubmit hook → retrieve_for_prompt(): at most two memories, only
+    with ≥ 90 % confidence and importance ≥ 0.5. Lexical confidence = share of
+    the prompt's idf-weighted content a memory covers; semantic confidence
+    from cosine similarity via the already-running shared embedding server
+    (diary_embed_ipc) — the hook never loads a model itself.
+  • memory_project_context / memory_context tools → build_session_digest():
+    the token-budgeted project index Claude pulls on demand.
 
 Hooks run as `diary-hook <event>` (console script → main()). Every error path
 returns empty output: a hook must never block or break a session.
@@ -33,15 +32,15 @@ PINNED_BODY_MAX_CHARS = 2500
 GLOBAL_MIN_IMPORTANCE = 0.7
 GLOBAL_MAX_LINES = 20
 
-PROMPT_MAX_HITS = 3
+# Per-prompt injection is deliberately conservative (Tom 2026-09-27): nothing
+# is better than a wrong memory — Claude can always search itself.
+PROMPT_MAX_HITS = 2
 PROMPT_SNIPPET_CHARS = 600
 PROMPT_MIN_LEXEMES = 2
+MIN_CONFIDENCE = 0.9
+MIN_IMPORTANCE = 0.5
 LEX_MIN_MATCHES = 2
-LEX_MIN_SCORE = 7.0
-LEX_RELATIVE_CUTOFF = 0.5  # drop hits scoring below this share of the best one
-# A hit must explain this share of the prompt's matchable idf mass. Long prompts
-# otherwise match on a handful of generic terms scattered across a memory.
-LEX_MIN_COVERAGE = 0.35
+LEX_MIN_SCORE = 7.0  # summed idf of matched terms: two generic words never qualify
 
 # Stemmed conversational filler that Postgres' german stopword list keeps.
 # Memories quoting the user contain the same filler, which made it look
@@ -53,7 +52,11 @@ _FILLER = frozenset("""
     besteht jetzt dann denn also doch noch immer ganz bisschen klar okay hallo danke
     brauch brauchst woll wollt will hatt hast habe gut neu
 """.split())
-SEM_MIN_SIM = 0.55
+# Confidence from cosine similarity of the multilingual MiniLM model, linear
+# between these points: 0.50 → 0, 0.80 → 1 (0.77 ≈ 90 %). A heuristic
+# calibration, not a probability.
+SEM_SIM_ZERO = 0.50
+SEM_SIM_FULL = 0.80
 SEM_TIMEOUT_S = 1.0
 DF_CACHE_TTL_S = 6 * 3600
 LOG_MAX_BYTES = 2_000_000
@@ -250,6 +253,40 @@ def build_session_digest(conn, slug: str | None, trigger: str = "start",
     return "\n".join(out).strip()
 
 
+def build_session_hint(conn, slug: str | None, trigger: str = "start") -> str:
+    """What the SessionStart hook injects: project pins in full plus one line
+    saying what exists and how to fetch it. The project index itself is not
+    preloaded (Tom 2026-09-27) — many sessions never need it; Claude pulls it
+    via memory_project_context / memory_recall when it does."""
+    base = _project_base(slug)
+    if not base:
+        return ""
+    triggers = ["start", "compact"] if trigger == "compact" else ["start"]
+    pinned = conn.execute(
+        f"SELECT path, title, body FROM memory_nodes WHERE {_LIVE} AND pin_triggers && %s::text[] "
+        f"AND path LIKE %s ORDER BY importance DESC, path",
+        (triggers, f"{base}/%"),
+    ).fetchall()
+    row = conn.execute(
+        f"SELECT count(*) AS n, max(updated_at) AS last FROM memory_nodes "
+        f"WHERE {_LIVE} AND {_NOT_AUTO} AND type <> 'category' AND path LIKE %s",
+        (f"{base}/%",),
+    ).fetchone()
+    if not pinned and not row["n"]:
+        return ""
+    lines = [f"diary-mcp: Projekt '{slug}' hat {row['n']} Memories "
+             f"(zuletzt geändert {str(row['last'])[:10]}). Bei Bedarf selbst laden: "
+             f"memory_project_context('{slug}') für den Index, memory_recall(query) für gezielte Suche."]
+    if pinned:
+        lines.append(f"\n## Gepinnt\n({PIN_INSTRUCTION})")
+        for r in pinned:
+            body = (r["body"] or "").strip()
+            if len(body) > PINNED_BODY_MAX_CHARS:
+                body = body[:PINNED_BODY_MAX_CHARS].rstrip() + f"\n… [gekürzt → memory_get(\"{r['path']}\")]"
+            lines.append(f"### {r['title']} ⟨{r['path']}⟩\n{body}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Per-prompt retrieval
 # ---------------------------------------------------------------------------
@@ -315,9 +352,9 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str])
     n, df = _doc_freqs(conn)
     n = max(n, len(rows))
     qset = set(lexemes)
-    # Terms absent from the corpus can't be matched by anything — leave them
-    # out of the coverage denominator.
-    query_mass = sum(_idf(n, df[lx]) for lx in qset if df.get(lx)) or 1.0
+    # Terms no memory contains still count: a prompt about "rsync + Kubernetes"
+    # is not answered by a memory that only knows rsync.
+    query_mass = sum(_idf(n, df.get(lx, 0)) for lx in qset) or 1.0
     hits = []
     for r in rows:
         if r["path"] in exclude:
@@ -325,28 +362,20 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str])
         matched = qset & set(r["dlx"])
         if len(matched) < LEX_MIN_MATCHES:
             continue
-        title_matched = qset & set(r["tlx"])
         matched_mass = sum(_idf(n, df.get(lx, 1)) for lx in matched)
-        if matched_mass / query_mass < LEX_MIN_COVERAGE:
+        if matched_mass < LEX_MIN_SCORE:
             continue
-        score = matched_mass
-        score += 0.5 * sum(_idf(n, df.get(lx, 1)) for lx in title_matched)
-        if score < LEX_MIN_SCORE:
-            continue
-        if base and (r["path"] == base or r["path"].startswith(base + "/")):
-            score *= 1.3
-        score *= 0.5 + 0.5 * float(r["importance"] or 0.5)
-        hits.append({"path": r["path"], "title": r["title"], "body": r["body"], "score": score})
-    hits.sort(key=lambda h: -h["score"])
-    return _relative_cutoff(hits)
-
-
-def _relative_cutoff(hits: list[dict]) -> list[dict]:
-    """Expects hits sorted by score desc."""
-    if not hits:
-        return hits
-    floor = hits[0]["score"] * LEX_RELATIVE_CUTOFF
-    return [h for h in hits if h["score"] >= floor]
+        # Confidence: the memory must cover the prompt's (idf-weighted) content
+        # AND be about it — long logs mention everything somewhere, so the
+        # title has to carry a good part of the query too.
+        title_mass = sum(_idf(n, df.get(lx, 1)) for lx in qset & set(r["tlx"]))
+        confidence = min(1.0, matched_mass / query_mass, 0.5 + title_mass / query_mass)
+        title_bonus = 0.5 * title_mass
+        in_project = bool(base) and (r["path"] == base or r["path"].startswith(base + "/"))
+        hits.append({"path": r["path"], "title": r["title"], "body": r["body"],
+                     "importance": float(r["importance"] or 0.5), "confidence": confidence,
+                     "score": (matched_mass + title_bonus) * (1.3 if in_project else 1.0)})
+    return hits
 
 
 def _has_pgvector(conn) -> bool:
@@ -361,7 +390,7 @@ def _semantic_hits(conn, qvec: list[float], exclude: set[str]) -> list[dict]:
     if _has_pgvector(conn):
         vec = "[" + ",".join(f"{x:.6f}" for x in qvec) + "]"
         rows = conn.execute(
-            f"SELECT path, title, body, 1 - (embedding_v <=> %s::vector) AS sim FROM memory_nodes "
+            f"SELECT path, title, body, importance, 1 - (embedding_v <=> %s::vector) AS sim FROM memory_nodes "
             f"WHERE {_LIVE} AND {_NOT_AUTO} AND embedding_v IS NOT NULL AND type <> 'category' "
             f"ORDER BY embedding_v <=> %s::vector LIMIT 10",
             (vec, vec),
@@ -369,13 +398,16 @@ def _semantic_hits(conn, qvec: list[float], exclude: set[str]) -> list[dict]:
     else:
         import diary_embed
         cand = conn.execute(
-            f"SELECT path, title, body, embedding FROM memory_nodes "
+            f"SELECT path, title, body, importance, embedding FROM memory_nodes "
             f"WHERE {_LIVE} AND {_NOT_AUTO} AND embedding IS NOT NULL AND type <> 'category'"
         ).fetchall()
         rows = sorted(({**r, "sim": diary_embed.cosine(qvec, r["embedding"])} for r in cand),
                       key=lambda r: -r["sim"])[:10]
-    return [{"path": r["path"], "title": r["title"], "body": r["body"], "score": float(r["sim"])}
-            for r in rows if r["sim"] >= SEM_MIN_SIM and r["path"] not in exclude]
+    span = SEM_SIM_FULL - SEM_SIM_ZERO
+    return [{"path": r["path"], "title": r["title"], "body": r["body"],
+             "importance": float(r["importance"] or 0.5), "score": float(r["sim"]),
+             "confidence": max(0.0, min(1.0, (float(r["sim"]) - SEM_SIM_ZERO) / span))}
+            for r in rows if r["path"] not in exclude]
 
 
 def retrieve_for_prompt(conn, prompt: str, slug: str | None, qvec: list[float] | None = None,
@@ -387,17 +419,18 @@ def retrieve_for_prompt(conn, prompt: str, slug: str | None, qvec: list[float] |
     base = _project_base(slug)
     lex = _lexical_hits(conn, lexemes, base, exclude) if len(lexemes) >= PROMPT_MIN_LEXEMES else []
     sem = _semantic_hits(conn, qvec, exclude) if qvec else []
-    if not sem:
-        return lex[:limit]
-    # Reciprocal rank fusion — scores of both lists live on different scales.
-    fused: dict[str, float] = {}
-    by_path: dict[str, dict] = {}
-    for hits in (lex, sem):
-        for rank, h in enumerate(hits):
-            fused[h["path"]] = fused.get(h["path"], 0.0) + 1.0 / (60 + rank)
-            by_path.setdefault(h["path"], h)
-    order = sorted(fused, key=lambda p: -fused[p])
-    return [by_path[p] for p in order[:limit]]
+    # Independent evidence from both signals: 1 - (1 - a)(1 - b).
+    merged: dict[str, dict] = {}
+    for h in lex + sem:
+        prev = merged.get(h["path"])
+        if prev is None:
+            merged[h["path"]] = dict(h)
+        else:
+            prev["confidence"] = 1 - (1 - prev["confidence"]) * (1 - h["confidence"])
+    hits = [h for h in merged.values()
+            if h["confidence"] >= MIN_CONFIDENCE and h["importance"] >= MIN_IMPORTANCE]
+    hits.sort(key=lambda h: (-h["confidence"], -h["importance"], h["path"]))
+    return hits[:limit]
 
 
 def _query_vector(prompt: str) -> list[float] | None:
@@ -546,11 +579,11 @@ def _run_hook(event: str, payload: dict, record: dict) -> str:
             with psycopg.connect(_database_url(), row_factory=dict_row, connect_timeout=3) as conn:
                 slug = slug_from_cwd(conn, cwd)
                 trigger = "compact" if payload.get("source") == "compact" else "start"
-                digest = build_session_digest(conn, slug, trigger=trigger)
+                hint = build_session_hint(conn, slug, trigger=trigger)
             # Fresh or summarized context → earlier per-prompt injections are gone.
             reset_session(session_id)
-            record.update(slug=slug, source=payload.get("source") or "startup", chars=len(digest))
-            return _hook_output("SessionStart", digest)
+            record.update(slug=slug, source=payload.get("source") or "startup", chars=len(hint))
+            return _hook_output("SessionStart", hint) if hint else ""
         if event == "prompt":
             prompt = (payload.get("prompt") or "").strip()
             if not prompt or prompt.startswith("/") and " " not in prompt:

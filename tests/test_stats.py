@@ -36,7 +36,7 @@ def test_injection_log_records_hook_events_without_content():
     import memory_stats as ms
     _upsert("/projects/demo/rsync-regel", "Deployment per rsync",
             "Beim rsync auf Dorn immer --exclude .env setzen, sonst Secrets weg.", 0.9)
-    for i in range(8):
+    for i in range(25):
         _upsert(f"/projects/demo/f{i}", f"Notiz {i}", f"Allgemeines Thema {i}.")
     with patch("memory_injection._query_vector", return_value=None):
         mi.run_hook("session-start", {"session_id": "s", "cwd": "/x/demo"})
