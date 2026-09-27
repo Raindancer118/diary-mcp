@@ -21,14 +21,23 @@ TRIPWIRE_MAX_HITS = 3
 
 
 def _apply_ranking(rows: list[dict], sim_key: str = "sim") -> list[dict]:
-    """Blendet Importance und Recency als Tiebreaker in den Similarity-Score ein.
+    """Blendet Importance und Recency als Tiebreaker in den Similarity-/Retrieval-Score ein.
 
     Formel:
-        final_score = similarity * (0.5 + 0.5 * importance)
+        final_score = retrieval_score * (0.5 + 0.5 * importance)
                       + 1e-6 * recency_days_ago_inv
 
+    WICHTIG: `sim_key` muss auf einen Score zeigen, der für ALLE Rows auf derselben
+    Skala liegt — bei Einzelquelle (reines FTS, reine Semantik, LIKE-Fallback) ist das
+    weiterhin der rohe `sim`-Wert; bei fusionierten Hybrid-Treffern MUSS es der von
+    `_fuse_hybrid_rows` gesetzte `retrieval_score` (RRF, rangbasiert) sein — niemals
+    der rohe ts_rank bzw. die rohe Cosine-Similarity, die aus zwei verschiedenen
+    Quellen stammen und nicht vergleichbar sind (Postmortem: RRF-Ranking-Bug,
+    2026-09-13 — sim*importance hat die RRF-Fusion nach dem Fusionieren wieder
+    zerstört, weil ts_rank und Cosine-Similarity gemischt wurden).
+
     Erklärung:
-      • Similarity (FTS-rank oder Cosine) wird mit einem Faktor (0.5–1.0) skaliert,
+      • Score wird mit einem Faktor (0.5–1.0) skaliert,
         der linear von importance abhängt. importance=0 → Faktor 0.5 (halbiert nur),
         importance=1 → Faktor 1.0 (unveränderter Score). Similarity dominiert stets.
       • Recency-Term: 1/(1+days_since_update) — winzig (1e-6 * max ~1), dient nur
@@ -56,12 +65,15 @@ def _apply_ranking(rows: list[dict], sim_key: str = "sim") -> list[dict]:
     return result
 
 
-def _rrf_fuse(
+def _rrf_scores(
     fts_paths: list[str],
     vec_paths: list[str],
     k: int = 60,
-) -> list[str]:
-    """Reciprocal Rank Fusion der FTS- und Vektor-Ranglisten.
+) -> dict[str, float]:
+    """Reciprocal Rank Fusion der FTS- und Vektor-Ranglisten — liefert den RRF-Score
+    pro Pfad (nicht nur die Reihenfolge), damit er als expliziter, skalenunabhängiger
+    `retrieval_score` weitergereicht werden kann statt der rohen, nicht vergleichbaren
+    ts_rank-/Cosine-Werte (siehe _fuse_hybrid_rows).
 
     Formel: RRF_score(d) = 1/(k + rank_fts(d)) + 1/(k + rank_vec(d))
     k=60 (Standard nach Cormack et al. 2009). Fehlende Einträge zählen als
@@ -72,11 +84,51 @@ def _rrf_fuse(
     all_paths = set(fts_paths) | set(vec_paths)
     fts_missing = len(fts_paths) + 1
     vec_missing = len(vec_paths) + 1
-    scores = {
+    return {
         p: 1.0 / (k + fts_rank.get(p, fts_missing)) + 1.0 / (k + vec_rank.get(p, vec_missing))
         for p in all_paths
     }
-    return sorted(all_paths, key=lambda p: scores[p], reverse=True)
+
+
+def _rrf_fuse(
+    fts_paths: list[str],
+    vec_paths: list[str],
+    k: int = 60,
+) -> list[str]:
+    """Reihenfolge der Pfade nach RRF-Score (siehe _rrf_scores), absteigend."""
+    scores = _rrf_scores(fts_paths, vec_paths, k=k)
+    return sorted(scores, key=lambda p: scores[p], reverse=True)
+
+
+def _fuse_hybrid_rows(fts_rows: list[dict], vec_rows: list[dict], k: int = 60) -> list[dict]:
+    """Fusioniert FTS- und Vektor-Trefferzeilen per RRF zu einer einzigen, geordneten
+    Liste — jede Row trägt danach einen expliziten `retrieval_score` (reiner RRF-Score
+    aus den Rangpositionen), NICHT die rohe `sim` (ts_rank bzw. Cosine-Similarity).
+
+    Grund: ts_rank und Cosine-Similarity liegen auf komplett verschiedenen Skalen.
+    Würde man nach dem Fusionieren wieder mit der rohen `sim` weiterranken (der Bug,
+    den dies ersetzt), dominiert de facto wieder nur die Quelle mit den größeren
+    Rohwerten — die eigentliche RRF-Fusion wird dadurch zunichtegemacht. Zusätzlich
+    verlor der alte Merge ({**vec_by_path, **fts_by_path}) bei einem Pfad, der in
+    BEIDEN Listen vorkommt, die tatsächliche Vektor-Similarity zugunsten der (oft viel
+    kleineren) FTS-Row.
+
+    Bei nur einer vorhandenen Quelle (Single-Signal) bleibt `retrieval_score` schlicht
+    die rohe `sim` dieser Quelle — dort gibt es kein Skalenmisch-Problem, weil alle
+    Rows aus derselben Quelle stammen.
+    """
+    fts_by_path = {r["path"]: r for r in fts_rows}
+    vec_by_path = {r["path"]: r for r in vec_rows}
+    if fts_rows and vec_rows:
+        scores = _rrf_scores([r["path"] for r in fts_rows], [r["path"] for r in vec_rows], k=k)
+        all_meta = {**vec_by_path, **fts_by_path}
+        fused_paths = sorted(scores, key=lambda p: scores[p], reverse=True)
+        return [{**all_meta[p], "retrieval_score": scores[p]} for p in fused_paths if p in all_meta]
+    if fts_rows:
+        return [{**r, "retrieval_score": float(r["sim"])} for r in fts_rows]
+    if vec_rows:
+        return [{**r, "retrieval_score": float(r["sim"])} for r in vec_rows]
+    return []
 
 
 def _extracted_tripwire_hits(conn, qvec, expiry_clause: str) -> list[dict]:
@@ -171,31 +223,17 @@ def _hybrid_retrieve(
         scored.sort(key=lambda r: r["sim"], reverse=True)
         vec_rows = scored[:30]
 
-    fts_by_path = {r["path"]: r for r in fts_rows}
-    vec_by_path = {r["path"]: r for r in vec_rows}
-
     if fts_rows and vec_rows:
-        fused_paths = _rrf_fuse(
-            [r["path"] for r in fts_rows],
-            [r["path"] for r in vec_rows],
-        )
-        # Merge metadata: prefer FTS row (has snippet from ts_headline), fall back to vec
-        all_meta = {**vec_by_path, **fts_by_path}
-        merged = [all_meta[p] for p in fused_paths if p in all_meta]
-        for i, row in enumerate(merged):
-            if "sim" not in row or row.get("sim") is None:
-                row = dict(row)
-                merged[i] = {**row, "sim": 1.0 / (i + 1)}
         mode = "Hybrid/RRF"
-        results = merged
+        results = _fuse_hybrid_rows(fts_rows, vec_rows)
     elif fts_rows:
         mode = "FTS"
-        results = list(fts_rows)
+        results = _fuse_hybrid_rows(fts_rows, [])
     elif vec_rows:
         mode = "Semantisch"
-        results = list(vec_rows)
+        results = _fuse_hybrid_rows([], vec_rows)
     else:
-        results = conn.execute(
+        like_rows = conn.execute(
             f"""SELECT id, path, title, type, origin, importance, updated_at,
                        0.1 AS sim,
                        substr(coalesce(body,''), 1, 200) AS snippet
@@ -203,9 +241,10 @@ def _hybrid_retrieve(
                  AND (title ILIKE %s OR body ILIKE %s) {origin_clause} LIMIT 30""",
             (f"%{query}%", f"%{query}%"),
         ).fetchall()
+        results = [{**r, "retrieval_score": float(r["sim"])} for r in like_rows]
         mode = "LIKE"
 
-    results = _apply_ranking(results, sim_key="sim")[:limit]
+    results = _apply_ranking(results, sim_key="retrieval_score")[:limit]
     return results, mode
 
 

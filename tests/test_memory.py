@@ -6,6 +6,7 @@ hybrid search, sync round-trip, extracted lifecycle, project config.
 """
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import os
@@ -372,6 +373,76 @@ class TestHybridSearch:
         with patch("diary_embed.embed", return_value=None):
             result = diary_server.memory_search("TermThatDefinitelyDoesNotExist99999")
         assert isinstance(result, str)
+
+
+class TestRRFFusion:
+    """RRF-Ranking-Bug (gefundenes Review, 2026-09-13): _hybrid_retrieve fusionierte
+    FTS + Vector korrekt per RRF zu `fused_paths`, holte danach aber die ORIGINALEN
+    Rows (mit rohem ts_rank bzw. roher Cosine-Similarity als `sim`) wieder heraus und
+    ließ `_apply_ranking` erneut nach `sim * importance` sortieren — das zerstört die
+    RRF-Reihenfolge, weil ts_rank und Cosine-Similarity nicht auf derselben Skala
+    liegen. Schlimmer: bei einem Pfad, der in BEIDEN Ranglisten vorkommt, gewann beim
+    Merge `{**vec_by_path, **fts_by_path}` immer die FTS-Row — die tatsächlich hohe
+    Vector-Similarity ging komplett verloren.
+
+    Fix: `_rrf_scores`/`_fuse_hybrid_rows` liefern einen expliziten `retrieval_score`
+    (reiner RRF-Score aus den Rangpositionen) statt der rohen `sim`-Werte; nur dieser
+    normierte Score fließt in `_apply_ranking` ein."""
+
+    def test_rrf_scores_favor_path_present_in_both_lists(self):
+        from search_engine import _rrf_scores
+
+        fts_paths = ["A", "C", "D"]   # A rank1, C rank2, D rank3
+        vec_paths = ["C", "B", "D"]   # C rank1, B rank2, D rank3
+        scores = _rrf_scores(fts_paths, vec_paths)
+
+        # C is present in both lists (rank 2 + rank 1) — classic RRF property:
+        # that beats A (rank 1 in FTS only) and B (rank 2 in vector only).
+        assert scores["C"] > scores["A"] > scores["B"]
+
+    def test_fuse_hybrid_rows_ignores_raw_sim_scale_mismatch(self):
+        """Construct FTS rows with a huge raw ts_rank for 'A' and vector rows with a
+        huge raw cosine similarity for 'B', while 'C' only ranks moderately in EACH
+        list individually but appears in both. A naive sim*importance re-sort (the
+        bug) would rank A or B first purely because of their raw score magnitude;
+        correct RRF fusion ranks C first because it is the only path confirmed by
+        both retrieval signals."""
+        from search_engine import _fuse_hybrid_rows, _apply_ranking
+
+        fts_rows = [
+            {"path": "A", "sim": 0.9, "importance": 0.5, "updated_at": None},
+            {"path": "C", "sim": 0.05, "importance": 0.5, "updated_at": None},
+            {"path": "D", "sim": 0.01, "importance": 0.5, "updated_at": None},
+        ]
+        vec_rows = [
+            {"path": "C", "sim": 0.99, "importance": 0.5, "updated_at": None},
+            {"path": "B", "sim": 0.5, "importance": 0.5, "updated_at": None},
+            {"path": "D", "sim": 0.1, "importance": 0.5, "updated_at": None},
+        ]
+
+        fused = _fuse_hybrid_rows(fts_rows, vec_rows)
+        ranked = _apply_ranking(fused, sim_key="retrieval_score")
+
+        order = [r["path"] for r in ranked]
+        assert order[0] == "C", f"expected 'C' (confirmed by both signals) to rank first, got order {order}"
+        assert order.index("C") < order.index("A") < len(order)
+        assert order.index("C") < order.index("B") < len(order)
+
+    def test_fuse_hybrid_rows_keeps_vector_similarity_for_overlapping_path(self):
+        """A path present in both FTS and vector results must not silently lose its
+        (real, high) vector similarity just because the FTS row happened to win the
+        naive dict-merge — retrieval_score must reflect BOTH signals via RRF, not
+        whichever raw `sim` the merge order picked."""
+        from search_engine import _fuse_hybrid_rows
+
+        fts_rows = [{"path": "C", "sim": 0.01, "importance": 0.5, "updated_at": None}]
+        vec_rows = [{"path": "C", "sim": 0.99, "importance": 0.5, "updated_at": None}]
+        fused = _fuse_hybrid_rows(fts_rows, vec_rows)
+        assert len(fused) == 1
+        # retrieval_score must be the RRF score (rank-based), not the raw FTS sim
+        # that a naive {**vec_by_path, **fts_by_path} merge would have kept.
+        assert fused[0]["retrieval_score"] != fts_rows[0]["sim"]
+        assert fused[0]["retrieval_score"] == pytest.approx(1.0 / 61 + 1.0 / 61)
 
 
 # ===========================================================================
@@ -2115,6 +2186,141 @@ class TestDiaryLink:
         result = self._sync_with_incoming_path("/notes/ok")
         assert "1 empfangen" in result
         assert _get_node("/links/bob/notes/ok") is not None
+
+
+class TestDiaryLinkNoOpenTransactionDuringNetworkIO:
+    """Postmortem v0.8.1 (see search_engine's memory_search fix, and this module's
+    own docstring): a network call made while a Postgres transaction is open can
+    block for a long time (relay hiccup, slow DNS, ...) and leave that transaction
+    "idle in transaction", starving any concurrent DDL (schema migration) of a
+    freshly-starting diary-mcp process indefinitely — a real 46-minute hang was
+    observed live. diary_link.py's own comments warn about exactly this, but several
+    of its @mcp.tool() functions did the relay HTTP call INSIDE an open `with
+    diary_db.get_db()` block anyway (redeem/check_pairing_code, the sync-tags
+    catch-up push, push_node_on_upsert, diary_link_sync's push+pull, unlink's
+    delete). This asserts the local Postgres connection is never mid-transaction
+    (transaction_status == IDLE) at the moment any relay call fires."""
+
+    def _assert_no_open_transaction(self, *_args, **_kwargs):
+        import diary_db
+        from psycopg import pq
+        conn = getattr(diary_db._local, "conn", None)
+        if conn is not None and not conn.closed:
+            assert conn.info.transaction_status == pq.TransactionStatus.IDLE, (
+                "relay call fired while a local DB transaction was open — see "
+                "v0.8.1 postmortem (46-minute idle-in-transaction hang)"
+            )
+
+    def _insert_link(self, alias, peer_public_key_bytes, peer_display_name="Peer",
+                      relay_link_id="relay-link-1", sync_tags=None, last_synced_at=None):
+        conn = _local_conn()
+        try:
+            conn.execute(
+                "INSERT INTO diary_links (relay_link_id, peer_alias, peer_display_name, "
+                "peer_public_key, sync_tags, last_synced_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                (relay_link_id, alias, peer_display_name, peer_public_key_bytes,
+                 sync_tags or [], last_synced_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_init_relay_call_has_no_open_transaction(self):
+        import diary_link
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            self._assert_no_open_transaction()
+            return {"diary_id": "d1", "auth_token": "tok1"}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+
+    def test_redeem_relay_call_has_no_open_transaction(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            self._assert_no_open_transaction()
+            return {"link_id": "l1", "peer_display_name": "Bob", "peer_public_key": base64.b64encode(b"\x01" * 32).decode()}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post):
+            diary_link.diary_link_redeem_pairing_code("SOMECODE", "bob")
+
+    def test_check_pairing_code_relay_call_has_no_open_transaction(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+
+        def fake_relay_get(relay_url, path, token, params=None):
+            self._assert_no_open_transaction()
+            return {"redeemed": True, "link_id": "l1", "peer_display_name": "Bob",
+                    "peer_public_key": base64.b64encode(b"\x01" * 32).decode()}
+
+        with patch("diary_link._relay_get", side_effect=fake_relay_get):
+            diary_link.diary_link_check_pairing_code("SOMECODE", "bob")
+
+    def test_set_sync_tags_catchup_push_has_no_open_transaction(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        self._insert_link("bob", b"\x01" * 32)
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/existing-node", title="Existing", body="pre-existing content", tags="team-x")
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            self._assert_no_open_transaction()
+            return {"message_id": "m", "created_at": "x"}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post):
+            diary_link.diary_link_set_sync_tags("bob", "team-x")
+
+    def test_push_node_on_upsert_has_no_open_transaction(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        self._insert_link("bob", b"\x01" * 32, sync_tags=["team-x"])
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            self._assert_no_open_transaction()
+            return {"message_id": "m", "created_at": "x"}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post):
+            diary_link.push_node_on_upsert("/user/x", "X", "body", "note", ["team-x"])
+
+    def test_sync_push_and_pull_have_no_open_transaction(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        self._insert_link("bob", b"\x01" * 32)
+        with patch("diary_embed.embed", return_value=None):
+            _upsert("/user/share-me", title="ShareMe", body="body", tags="share-with-bob")
+
+        def fake_relay_post(relay_url, path, token=None, json_body=None):
+            self._assert_no_open_transaction()
+            return {"message_id": "m", "created_at": "x"}
+
+        def fake_relay_get(relay_url, path, token, params=None):
+            self._assert_no_open_transaction()
+            return {"messages": []}
+
+        with patch("diary_link._relay_post", side_effect=fake_relay_post), \
+             patch("diary_link._relay_get", side_effect=fake_relay_get), \
+             patch("diary_embed.embed", return_value=None):
+            diary_link.diary_link_sync("bob", "share-with-bob")
+
+    def test_unlink_relay_call_has_no_open_transaction(self):
+        import diary_link
+        with patch("diary_link._relay_post", return_value={"diary_id": "d1", "auth_token": "tok1"}):
+            diary_link.diary_link_init("Alice", "http://relay.test")
+        self._insert_link("bob", b"\x01" * 32, relay_link_id="relay-link-9")
+
+        def fake_relay_delete(relay_url, path, token):
+            self._assert_no_open_transaction()
+            return {"status": "unlinked"}
+
+        with patch("diary_link._relay_delete", side_effect=fake_relay_delete):
+            diary_link.diary_link_unlink("bob")
 
 
 # ===========================================================================

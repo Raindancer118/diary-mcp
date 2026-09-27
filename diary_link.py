@@ -27,7 +27,7 @@ touched by the cron job.
 """
 import base64
 import json
-from datetime import timezone
+from datetime import datetime, timezone
 
 import httpx
 from nacl.public import Box, PrivateKey, PublicKey
@@ -106,16 +106,17 @@ def diary_link_init(display_name: str, relay_url: str) -> str:
     relay_url = relay_url.rstrip("/")
     with diary_db.get_db() as conn:
         existing = _get_identity(conn)
-        if existing:
-            return (f"Diary-Identity existiert bereits ('{existing['display_name']}', "
-                    f"Relay {existing['relay_url']}) — nur eine Identity pro Instanz.")
+    if existing:
+        return (f"Diary-Identity existiert bereits ('{existing['display_name']}', "
+                f"Relay {existing['relay_url']}) — nur eine Identity pro Instanz.")
 
-        priv = PrivateKey.generate()
-        pub = priv.public_key
-        result = _relay_post(relay_url, "/diaries/register", json_body={
-            "display_name": display_name,
-            "public_key": _b64(bytes(pub)),
-        })
+    priv = PrivateKey.generate()
+    pub = priv.public_key
+    result = _relay_post(relay_url, "/diaries/register", json_body={
+        "display_name": display_name,
+        "public_key": _b64(bytes(pub)),
+    })
+    with diary_db.get_db() as conn:
         conn.execute(
             "INSERT INTO diary_identity "
             "(display_name, private_key, public_key, relay_url, relay_diary_id, relay_token) "
@@ -156,8 +157,9 @@ def diary_link_redeem_pairing_code(code: str, alias: str) -> str:
         if existing:
             return f"Alias '{alias}' ist schon vergeben — anderen Alias wählen."
 
-        result = _relay_post(identity["relay_url"], "/pairing/redeem",
-                              token=identity["relay_token"], json_body={"code": code})
+    result = _relay_post(identity["relay_url"], "/pairing/redeem",
+                          token=identity["relay_token"], json_body={"code": code})
+    with diary_db.get_db() as conn:
         conn.execute(
             "INSERT INTO diary_links (relay_link_id, peer_alias, peer_display_name, peer_public_key) "
             "VALUES (%s,%s,%s,%s)",
@@ -183,10 +185,11 @@ def diary_link_check_pairing_code(code: str, alias: str) -> str:
         if existing:
             return f"Alias '{alias}' ist schon vergeben — anderen Alias wählen."
 
-        status = _relay_get(identity["relay_url"], f"/pairing/{code}", token=identity["relay_token"])
-        if not status.get("redeemed"):
-            return f"Pairing-Code '{code}' wurde noch nicht eingelöst — später erneut prüfen."
+    status = _relay_get(identity["relay_url"], f"/pairing/{code}", token=identity["relay_token"])
+    if not status.get("redeemed"):
+        return f"Pairing-Code '{code}' wurde noch nicht eingelöst — später erneut prüfen."
 
+    with diary_db.get_db() as conn:
         conn.execute(
             "INSERT INTO diary_links (relay_link_id, peer_alias, peer_display_name, peer_public_key) "
             "VALUES (%s,%s,%s,%s)",
@@ -258,18 +261,17 @@ def diary_link_set_sync_tags(alias: str, tags: str) -> str:
     if newly_added and identity:
         own_priv = PrivateKey(bytes(identity["private_key"]))
         pushed_total = 0
-        with diary_db.get_db() as conn:
-            for tag in newly_added:
-                try:
-                    pushed_total += _push_nodes_for_tag(conn, identity, own_priv, link, tag, since=None)
-                except Exception:  # noqa: BLE001 — a relay hiccup during setup shouldn't fail the config change
-                    continue
+        for tag in newly_added:
+            try:
+                pushed_total += _push_nodes_for_tag(identity, own_priv, link, tag, since=None)
+            except Exception:  # noqa: BLE001 — a relay hiccup during setup shouldn't fail the config change
+                continue
         if pushed_total:
             msg += f" ({pushed_total} bestehende Node(s) initial gepusht.)"
     return msg
 
 
-def _push_nodes_for_tag(conn, identity, own_priv, link, tag: str, since=None) -> int:
+def _push_nodes_for_tag(identity, own_priv, link, tag: str, since=None) -> int:
     """Encrypts+pushes every curated node tagged `tag` to `link` and returns how
     many. `since` (a timestamp or None) restricts to nodes touched after it —
     None means "all of them" (used for the one-time catch-up when a tag is
@@ -278,18 +280,21 @@ def _push_nodes_for_tag(conn, identity, own_priv, link, tag: str, since=None) ->
     catch-up push, so both stay in sync with a single implementation."""
     peer_pub = PublicKey(bytes(link["peer_public_key"]))
     box = Box(own_priv, peer_pub)
-    if since:
-        nodes = conn.execute(
-            "SELECT path, title, body, type FROM memory_nodes "
-            "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags) AND updated_at > %s",
-            (tag, since),
-        ).fetchall()
-    else:
-        nodes = conn.execute(
-            "SELECT path, title, body, type FROM memory_nodes "
-            "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags)",
-            (tag,),
-        ).fetchall()
+    # Read in its own short transaction; the relay posts below run with no
+    # transaction open (v0.8.1 postmortem).
+    with diary_db.get_db() as conn:
+        if since:
+            nodes = conn.execute(
+                "SELECT path, title, body, type FROM memory_nodes "
+                "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags) AND updated_at > %s",
+                (tag, since),
+            ).fetchall()
+        else:
+            nodes = conn.execute(
+                "SELECT path, title, body, type FROM memory_nodes "
+                "WHERE deleted_at IS NULL AND origin = 'curated' AND %s = ANY(tags)",
+                (tag,),
+            ).fetchall()
     pushed = 0
     for n in nodes:
         payload = json.dumps({
@@ -326,20 +331,20 @@ def push_node_on_upsert(path: str, title: str, body: str, node_type: str, tag_li
             links = conn.execute(
                 "SELECT * FROM diary_links WHERE sync_tags && %s", (tag_list,)
             ).fetchall()
-            if not links:
-                return []
-            own_priv = PrivateKey(bytes(identity["private_key"]))
-            payload = json.dumps({"path": path, "title": title, "body": body, "type": node_type}).encode()
-            for link in links:
-                try:
-                    peer_pub = PublicKey(bytes(link["peer_public_key"]))
-                    box = Box(own_priv, peer_pub)
-                    ciphertext = bytes(box.encrypt(payload))
-                    _relay_post(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
-                                token=identity["relay_token"], json_body={"ciphertext": _b64(ciphertext)})
-                    pushed_to.append(link["peer_alias"])
-                except Exception:  # noqa: BLE001 — one unreachable link must not break the others or the save
-                    continue
+        if not links:
+            return []
+        own_priv = PrivateKey(bytes(identity["private_key"]))
+        payload = json.dumps({"path": path, "title": title, "body": body, "type": node_type}).encode()
+        for link in links:
+            try:
+                peer_pub = PublicKey(bytes(link["peer_public_key"]))
+                box = Box(own_priv, peer_pub)
+                ciphertext = bytes(box.encrypt(payload))
+                _relay_post(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
+                            token=identity["relay_token"], json_body={"ciphertext": _b64(ciphertext)})
+                pushed_to.append(link["peer_alias"])
+            except Exception:  # noqa: BLE001 — one unreachable link must not break the others or the save
+                continue
     except Exception:  # noqa: BLE001 — DB hiccup here must not break the save either
         return pushed_to
     return pushed_to
@@ -374,43 +379,47 @@ def diary_link_sync(alias: str, tag: str) -> str:
         if not link:
             return f"Kein Link mit Alias '{alias}' — zuerst diary_link_redeem_pairing_code() aufrufen."
 
-        own_priv = PrivateKey(bytes(identity["private_key"]))
-        box = Box(own_priv, PublicKey(bytes(link["peer_public_key"])))
+    own_priv = PrivateKey(bytes(identity["private_key"]))
+    box = Box(own_priv, PublicKey(bytes(link["peer_public_key"])))
 
-        pushed = _push_nodes_for_tag(conn, identity, own_priv, link, tag, since=link["last_synced_at"])
+    # Cursor = start of this sync, not its end: a peer message landing on the
+    # relay while we pull/upsert must still be fetched next time.
+    sync_started = datetime.now(timezone.utc)
+    pushed = _push_nodes_for_tag(identity, own_priv, link, tag, since=link["last_synced_at"])
 
-        # The relay stores/compares `created_at` as plain UTC ISO strings
-        # (deliberately no datetime parsing, see diary-relay/app.py) — the
-        # local Postgres session returns TIMESTAMPTZ values in its own session
-        # timezone (e.g. Europe/Berlin), so `since` MUST be normalized to UTC
-        # here or a "+02:00"-suffixed value can string-sort after genuinely
-        # newer "+00:00" relay timestamps and silently hide new messages
-        # (see /projects/diary-mcp/link-sync-pull-not-working-20260913).
-        params = ({"since": link["last_synced_at"].astimezone(timezone.utc).isoformat()}
-                  if link["last_synced_at"] else {})
-        pulled = _relay_get(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
-                             token=identity["relay_token"], params=params)
+    # The relay stores/compares `created_at` as plain UTC ISO strings
+    # (deliberately no datetime parsing, see diary-relay/app.py) — the
+    # local Postgres session returns TIMESTAMPTZ values in its own session
+    # timezone (e.g. Europe/Berlin), so `since` MUST be normalized to UTC
+    # here or a "+02:00"-suffixed value can string-sort after genuinely
+    # newer "+00:00" relay timestamps and silently hide new messages
+    # (see /projects/diary-mcp/link-sync-pull-not-working-20260913).
+    params = ({"since": link["last_synced_at"].astimezone(timezone.utc).isoformat()}
+              if link["last_synced_at"] else {})
+    pulled = _relay_get(identity["relay_url"], f"/links/{link['relay_link_id']}/messages",
+                         token=identity["relay_token"], params=params)
 
-        received = 0
-        for msg in pulled["messages"]:
-            plaintext = box.decrypt(_unb64(msg["ciphertext"]))
-            data = json.loads(plaintext)
-            # `data` was authenticated by successful Box decryption (it did come
-            # from the paired peer), but its CONTENT is still untrusted — a
-            # buggy or malicious peer could try to point `path` outside the
-            # /links/<alias>/ namespace (e.g. '/../feedback/x') or send an
-            # oversized payload. Skip anything that doesn't check out rather
-            # than let one bad message break the whole sync.
-            local_path = _sanitize_incoming_path(alias, data.get("path"))
-            if local_path is None:
-                continue
-            node_type = data.get("type") if data.get("type") in _VALID_MEMORY_TYPES else "note"
-            title = str(data.get("title") or "")[:_MAX_TITLE_LEN]
-            body = str(data.get("body") or "")[:_MAX_BODY_LEN]
-            memory_upsert(path=local_path, title=title, body=body, type=node_type, tags=f"from:{alias}")
-            received += 1
+    received = 0
+    for msg in pulled["messages"]:
+        plaintext = box.decrypt(_unb64(msg["ciphertext"]))
+        data = json.loads(plaintext)
+        # `data` was authenticated by successful Box decryption (it did come
+        # from the paired peer), but its CONTENT is still untrusted — a
+        # buggy or malicious peer could try to point `path` outside the
+        # /links/<alias>/ namespace (e.g. '/../feedback/x') or send an
+        # oversized payload. Skip anything that doesn't check out rather
+        # than let one bad message break the whole sync.
+        local_path = _sanitize_incoming_path(alias, data.get("path"))
+        if local_path is None:
+            continue
+        node_type = data.get("type") if data.get("type") in _VALID_MEMORY_TYPES else "note"
+        title = str(data.get("title") or "")[:_MAX_TITLE_LEN]
+        body = str(data.get("body") or "")[:_MAX_BODY_LEN]
+        memory_upsert(path=local_path, title=title, body=body, type=node_type, tags=f"from:{alias}")
+        received += 1
 
-        conn.execute("UPDATE diary_links SET last_synced_at = now() WHERE id = %s", (link["id"],))
+    with diary_db.get_db() as conn:
+        conn.execute("UPDATE diary_links SET last_synced_at = %s WHERE id = %s", (sync_started, link["id"]))
 
     return f"Sync mit '{alias}' (Tag '{tag}'): {pushed} gepusht, {received} empfangen."
 
@@ -423,11 +432,12 @@ def diary_link_unlink(alias: str) -> str:
         link = conn.execute("SELECT * FROM diary_links WHERE peer_alias = %s", (alias,)).fetchone()
         if not link:
             return f"Kein Link mit Alias '{alias}'."
-        if identity:
-            try:
-                _relay_delete(identity["relay_url"], f"/links/{link['relay_link_id']}",
-                               token=identity["relay_token"])
-            except Exception:  # noqa: BLE001 — local cleanup must still happen if the relay is unreachable
-                pass
+    if identity:
+        try:
+            _relay_delete(identity["relay_url"], f"/links/{link['relay_link_id']}",
+                           token=identity["relay_token"])
+        except Exception:  # noqa: BLE001 — local cleanup must still happen if the relay is unreachable
+            pass
+    with diary_db.get_db() as conn:
         conn.execute("DELETE FROM diary_links WHERE id = %s", (link["id"],))
     return f"Link '{alias}' entfernt."
