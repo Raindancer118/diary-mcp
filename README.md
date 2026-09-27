@@ -102,6 +102,18 @@ DIARY_REMOTE_URL=postgresql://localhost:54321/diary_mcp
 - **UserPromptSubmit** retrieves up to 3 curated memories per prompt, across all projects (current project boosted): OR query over the prompt's lexemes, BM25-style scoring with corpus document frequencies (cached for 6h in `~/.cache/diary-mcp/`), at least 2 matched terms, relative cutoff against the best hit. If a diary-mcp process already runs the shared embedding server, the prompt is also embedded over that socket and fused via RRF; the hook never loads a model itself. Each memory is injected at most once per session (reset on compaction). Trivial prompts (< 2 content words, bare slash commands) are skipped.
 - **SessionEnd** optionally extracts structured memories from the conversation (per-project opt-in via `memory_set_project_config`, off by default).
 
+Pins (`memory_pin`) are only allowed inside a project (`/projects/<slug>/…`); global rules reach the model as one-liners in the digest instead. Every injected pin block carries the instruction to keep pins relevant and `memory_unpin` the ones without value.
+
+### Statistics (v0.19.0)
+
+`memory_stats(days=30, project_slug="")` (MCP tool) and `GET /api/stats?days=30&project=<slug>` (diary-web, JSON) report:
+
+- **Corpus:** curated/extracted memories, approximate tokens, projects, embeddings, links, pins.
+- **Injection efficiency:** from the hook event log (`~/.cache/diary-mcp/injection_log.jsonl`, paths and sizes only, capped at 2 MB): sessions, prompts, hit rate, semantic share, average tokens per digest, per hit prompt and per session, latency, most-injected memories.
+- **File-based comparison:** Claude Code's `~/.claude/projects/*/memory` files (count, tokens, how many already exist in the diary). With `project_slug` it also compares the tokens loaded per session and the knowledge each system can reach.
+
+Token counts are estimates (characters / 3.7).
+
 ## Automatic linking (v0.13.0)
 
 Two complementary mechanisms keep the knowledge graph populated without a manual `memory_infer_links()` call:

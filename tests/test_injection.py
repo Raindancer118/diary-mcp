@@ -194,6 +194,23 @@ def test_retrieval_ignores_matches_on_common_words_only():
     assert all(not h["path"].startswith("/projects/demo/filler") for h in hits)
 
 
+def test_retrieval_ignores_colloquial_filler_and_low_coverage():
+    """Live false positive 2026-09-27: a long prompt matched memories that quote
+    Tom's filler words (halt, gern, möchte, dass, möglich) plus a few generic
+    terms, injecting three unrelated memories."""
+    import memory_injection as mi
+    _seed_retrieval_corpus()
+    _upsert("/feedback/quote", "Core nutzen",
+            "Tom: ich möchte halt gern, dass du wo immer möglich mit Core arbeitest.", 0.9)
+    _upsert("/projects/other/bridge", "Bridge Diagnose",
+            "Token basiert, Status abrufen über TCP.", 0.6)
+    prompt = ("Kannst du irgendwie einen Endpoint einbauen, wo die Token-Effizienz und Statistics "
+              "geholt werden können? Ich möchte auch gern, dass die Möglichkeit besteht, dass man "
+              "halt einen Vergleich zu File-Based Memories hat. Und das soll Claude halt abrufen können")
+    with _conn() as conn:
+        assert mi.retrieve_for_prompt(conn, prompt, "demo") == []
+
+
 def test_retrieval_skips_trivial_prompts_and_excluded_paths():
     import memory_injection as mi
     _seed_retrieval_corpus()
@@ -286,3 +303,47 @@ def test_project_context_full_excludes_noise_and_is_bounded():
     assert "Relevanter Inhalt." in out
     assert "xyz-junk" not in out and "/projects/demo/ext" not in out
     assert len(out) < 30000
+
+
+# ---------------------------------------------------------------------------
+# Pins exist only inside projects (user rule 2026-09-27) and always come with
+# the instruction to keep them relevant.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", ["/feedback/rule", "/user/me", "/references/x", "/projects/demo"])
+def test_pin_outside_project_is_rejected(path):
+    import diary_server
+    _upsert(path, "T", "B")
+    out = diary_server.memory_pin(path, on_start=True)
+    assert "nur innerhalb" in out
+    with _conn() as conn:
+        row = conn.execute("SELECT pin_triggers FROM memory_nodes WHERE path = %s", (path,)).fetchone()
+    assert not row["pin_triggers"]
+
+
+def test_pin_inside_project_returns_relevance_instruction():
+    import diary_server
+    _upsert("/projects/demo/key-fact", "Fakt", "Wichtig.")
+    out = diary_server.memory_pin("/projects/demo/key-fact", on_start=True)
+    assert "gesetzt" in out and mi_instruction() in out
+
+
+def mi_instruction():
+    import memory_injection as mi
+    return mi.PIN_INSTRUCTION
+
+
+def test_digest_ignores_global_pins_and_carries_instruction():
+    import memory_injection as mi
+    _upsert("/feedback/legacy-pin", "Legacy", "Alter globaler Pin.", 0.5)
+    _upsert("/projects/demo/pinned", "Projektpin", "Projektwissen.", 0.5)
+    with _conn() as conn:
+        conn.execute("UPDATE memory_nodes SET pin_triggers = '{start}' WHERE path IN "
+                     "('/feedback/legacy-pin', '/projects/demo/pinned')")
+    with _conn() as conn:
+        out = mi.build_session_digest(conn, "demo")
+        overview = mi.build_session_digest(conn, None)
+    pinned_section = out.split("## Gepinnt")[1].split("\n## ")[0]
+    assert "Projektwissen." in pinned_section and "Alter globaler Pin." not in pinned_section
+    assert mi.PIN_INSTRUCTION in pinned_section
+    assert "## Gepinnt" not in overview

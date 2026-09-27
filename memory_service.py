@@ -720,7 +720,11 @@ def memory_set_importance(path: str, importance: float) -> str:
 
 @mcp.tool()
 def memory_pin(path: str, on_start: bool = True, on_compact: bool = False) -> str:
-    """Pinnt ein Memory für automatisches Injizieren — sparsam einsetzen, da jeder Pin Kontext kostet!
+    """Pinnt ein Projekt-Memory für automatisches Injizieren — sparsam einsetzen, da jeder Pin Kontext kostet!
+
+    Nur innerhalb von /projects/<slug>/... erlaubt — globale Pfade (/user, /feedback,
+    /references …) und der Projekt-Knoten selbst sind nicht pinnbar. Nur wirklich
+    relevante Infos pinnen; Pins ohne Mehrwert per memory_unpin() aussortieren.
 
     on_start:    Wenn True, wird das Memory beim Session-Start automatisch in Claudes
                  Kontext geladen (setzt 'start' in pin_triggers). Gut für dauerhaft
@@ -732,6 +736,9 @@ def memory_pin(path: str, on_start: bool = True, on_compact: bool = False) -> st
 
     Gibt die resultierende pin_triggers-Liste zurück.
     """
+    if not memory_injection.is_pinnable(path):
+        return (f"Nicht gepinnt: Pins gibt es nur innerhalb eines Projekts (/projects/<slug>/...), "
+                f"'{path}' liegt außerhalb. Globale Regeln stehen im Session-Digest ohnehin als Einzeiler.")
     triggers: list[str] = []
     if on_start:
         triggers.append("start")
@@ -747,7 +754,7 @@ def memory_pin(path: str, on_start: bool = True, on_compact: bool = False) -> st
         if not result:
             return f"Node '{path}' nicht gefunden."
     trigger_str = ", ".join(triggers) if triggers else "(keine)"
-    return f"Pin für '{path}' gesetzt: [{trigger_str}]."
+    return f"Pin für '{path}' gesetzt: [{trigger_str}]. {memory_injection.PIN_INSTRUCTION}"
 
 
 @mcp.tool()

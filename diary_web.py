@@ -148,6 +148,13 @@ def api_health():
     return {"issues": issues, "stats": dict(stats) if stats else {}, "by_type": [dict(r) for r in by_type]}
 
 
+@app.get("/api/stats")
+def api_stats(days: int = 30, project: str = ""):
+    import memory_stats
+    with get_db() as conn:
+        return memory_stats.collect_stats(conn, days=days, project_slug=project)
+
+
 @app.get("/api/graph")
 def api_graph(scope: str = "", include_extracted: bool = False):
     """Knowledge-Graph als Node/Edge-Liste für die interaktive Visualisierung (/ graph)."""

@@ -1634,10 +1634,10 @@ class TestMemoryConsolidateReport:
         assert "cons-stale" in result
 
     def test_pinned_node_excluded_from_stale(self):
-        self._node_with_vec("/user/cons-pinned", [0.15] * 384, title="PinnedNode", importance=0.1)
-        self._age_node("/user/cons-pinned", days=200)
+        self._node_with_vec("/projects/cons/cons-pinned", [0.15] * 384, title="PinnedNode", importance=0.1)
+        self._age_node("/projects/cons/cons-pinned", days=200)
         import diary_server
-        diary_server.memory_pin("/user/cons-pinned", on_start=True)
+        diary_server.memory_pin("/projects/cons/cons-pinned", on_start=True)
         result = diary_server.memory_consolidate_report(stale_days=180)
         assert "cons-pinned" not in result
 

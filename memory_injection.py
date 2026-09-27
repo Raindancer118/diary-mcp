@@ -39,9 +39,35 @@ PROMPT_MIN_LEXEMES = 2
 LEX_MIN_MATCHES = 2
 LEX_MIN_SCORE = 7.0
 LEX_RELATIVE_CUTOFF = 0.5  # drop hits scoring below this share of the best one
+# A hit must explain this share of the prompt's matchable idf mass. Long prompts
+# otherwise match on a handful of generic terms scattered across a memory.
+LEX_MIN_COVERAGE = 0.35
+
+# Stemmed conversational filler that Postgres' german stopword list keeps.
+# Memories quoting the user contain the same filler, which made it look
+# relevant (live false positive 2026-09-27).
+_FILLER = frozenset("""
+    dass halt gern gerne mocht mochtest moglich moglichkeit kann kannst konnt irgendwi
+    irgendwas bitt mal eigent eigentlich einfach schon wirklich eben gerad genau nochmal
+    sowas etwa ding mach macht soll sollt sollst wurd wurde wurden gibt geht bess best
+    besteht jetzt dann denn also doch noch immer ganz bisschen klar okay hallo danke
+    brauch brauchst woll wollt will hatt hast habe gut neu
+""".split())
 SEM_MIN_SIM = 0.55
 SEM_TIMEOUT_S = 1.0
 DF_CACHE_TTL_S = 6 * 3600
+LOG_MAX_BYTES = 2_000_000
+
+# Pins live only inside projects (/projects/<slug>/...) and every injected pin
+# block carries this instruction, so pins get pruned instead of accumulating.
+PIN_INSTRUCTION = ("Pins nur für wirklich relevante, dauerhaft nötige Projekt-Infos. "
+                   "Bringt ein Pin keinen Mehrwert (veraltet, redundant, selten gebraucht), "
+                   "ihn per memory_unpin(path) aussortieren.")
+
+
+def is_pinnable(path: str) -> bool:
+    parts = path.strip("/").split("/")
+    return len(parts) >= 3 and parts[0] == "projects" and all(parts)
 
 _DOC = "to_tsvector('german', coalesce(title,'') || ' ' || coalesce(body,''))"
 _LIVE = ("deleted_at IS NULL AND origin = 'curated' "
@@ -136,19 +162,14 @@ def build_session_digest(conn, slug: str | None, trigger: str = "start",
                          budget_chars: int = DIGEST_BUDGET_CHARS) -> str:
     base = _project_base(slug)
     triggers = ["start", "compact"] if trigger == "compact" else ["start"]
-    scope = "(path LIKE '/user/%%' OR path LIKE '/feedback/%%'"
-    params: list = []
+    pinned = []
     if base:
-        scope += " OR path = %s OR path LIKE %s"
-        params += [base, f"{base}/%"]
-    scope += ")"
-
-    pinned = conn.execute(
-        f"SELECT path, type, title, body FROM memory_nodes "
-        f"WHERE {_LIVE} AND pin_triggers && %s::text[] AND {scope} "
-        f"ORDER BY importance DESC, path",
-        [triggers, *params],
-    ).fetchall()
+        pinned = conn.execute(
+            f"SELECT path, type, title, body FROM memory_nodes "
+            f"WHERE {_LIVE} AND pin_triggers && %s::text[] AND path LIKE %s "
+            f"ORDER BY importance DESC, path",
+            (triggers, f"{base}/%"),
+        ).fetchall()
     pinned_paths = {r["path"] for r in pinned}
 
     project_rows = []
@@ -186,7 +207,7 @@ def build_session_digest(conn, slug: str | None, trigger: str = "start",
     add(f"# diary-mcp Memory — Projekt '{label}' (automatisch geladen)")
 
     if pinned:
-        add("\n## Gepinnt")
+        add(f"\n## Gepinnt\n({PIN_INSTRUCTION})")
         for r in pinned:
             body = (r["body"] or "").strip()
             if len(body) > PINNED_BODY_MAX_CHARS:
@@ -239,7 +260,7 @@ def _prompt_lexemes(conn, prompt: str) -> list[str]:
         "FROM unnest(tsvector_to_array(to_tsvector('german', %s))) l WHERE length(l) > 2",
         (prompt[:4000],),
     ).fetchone()
-    return list(row["lx"])
+    return [lx for lx in row["lx"] if lx not in _FILLER]
 
 
 def _doc_freqs(conn) -> tuple[int, dict[str, int]]:
@@ -294,6 +315,9 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str])
     n, df = _doc_freqs(conn)
     n = max(n, len(rows))
     qset = set(lexemes)
+    # Terms absent from the corpus can't be matched by anything — leave them
+    # out of the coverage denominator.
+    query_mass = sum(_idf(n, df[lx]) for lx in qset if df.get(lx)) or 1.0
     hits = []
     for r in rows:
         if r["path"] in exclude:
@@ -302,7 +326,10 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str])
         if len(matched) < LEX_MIN_MATCHES:
             continue
         title_matched = qset & set(r["tlx"])
-        score = sum(_idf(n, df.get(lx, 1)) for lx in matched)
+        matched_mass = sum(_idf(n, df.get(lx, 1)) for lx in matched)
+        if matched_mass / query_mass < LEX_MIN_COVERAGE:
+            continue
+        score = matched_mass
         score += 0.5 * sum(_idf(n, df.get(lx, 1)) for lx in title_matched)
         if score < LEX_MIN_SCORE:
             continue
@@ -471,12 +498,45 @@ def slug_from_cwd(conn, cwd: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "misc"
 
 
+def log_event(event: dict) -> None:
+    """Append one hook event (paths and sizes only, never content) to the
+    injection log that memory_stats reads. Bounded: keeps the newer half."""
+    try:
+        path = _state_dir() / "injection_log.jsonl"
+        line = json.dumps({"ts": round(time.time(), 3), **event}, ensure_ascii=False) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+        if path.stat().st_size > LOG_MAX_BYTES:
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            keep, size = [], 0
+            for ln in reversed(lines):
+                if size + len(ln.encode()) > LOG_MAX_BYTES // 2:
+                    break
+                keep.append(ln)
+                size += len(ln.encode())
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text("".join(reversed(keep)), encoding="utf-8")
+            tmp.replace(path)
+    except Exception:
+        pass
+
+
 def _hook_output(event_name: str, context: str) -> str:
     return json.dumps({"hookSpecificOutput": {"hookEventName": event_name,
                                               "additionalContext": context}})
 
 
 def run_hook(event: str, payload: dict) -> str:
+    started = time.monotonic()
+    record: dict = {"event": event, "session": payload.get("session_id")}
+    out = _run_hook(event, payload, record)
+    if "slug" in record:  # reached the DB; skipped/failed runs aren't injection events
+        record["latency_ms"] = round((time.monotonic() - started) * 1000)
+        log_event(record)
+    return out
+
+
+def _run_hook(event: str, payload: dict, record: dict) -> str:
     try:
         import psycopg
         from psycopg.rows import dict_row
@@ -489,6 +549,7 @@ def run_hook(event: str, payload: dict) -> str:
                 digest = build_session_digest(conn, slug, trigger=trigger)
             # Fresh or summarized context → earlier per-prompt injections are gone.
             reset_session(session_id)
+            record.update(slug=slug, source=payload.get("source") or "startup", chars=len(digest))
             return _hook_output("SessionStart", digest)
         if event == "prompt":
             prompt = (payload.get("prompt") or "").strip()
@@ -499,13 +560,16 @@ def run_hook(event: str, payload: dict) -> str:
             with psycopg.connect(_database_url(), row_factory=dict_row, connect_timeout=2) as conn:
                 slug = slug_from_cwd(conn, cwd)
                 hits = retrieve_for_prompt(conn, prompt, slug, qvec=qvec, exclude=injected)
+                record.update(slug=slug, semantic=qvec is not None, hits=[h["path"] for h in hits], chars=0)
                 if not hits:
                     return ""
                 conn.execute(
                     "UPDATE memory_nodes SET access_count = access_count + 1, accessed_at = now() "
                     "WHERE path = ANY(%s)", ([h["path"] for h in hits],))
             remember_injected(session_id, injected | {h["path"] for h in hits})
-            return _hook_output("UserPromptSubmit", format_prompt_hits(hits))
+            text = format_prompt_hits(hits)
+            record["chars"] = len(text)
+            return _hook_output("UserPromptSubmit", text)
     except Exception:
         return ""
     return ""
