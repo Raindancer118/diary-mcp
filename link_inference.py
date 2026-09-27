@@ -242,9 +242,9 @@ def load_corpus(conn) -> Corpus:
 
 # ── candidates and features ────────────────────────────────────────────────
 
-def candidates(c: Corpus, focus: list[int] | None = None) -> set[tuple[int, int]]:
+def candidates(c: Corpus, focus: list[int] | None = None, include_inferred: bool = True) -> set[tuple[int, int]]:
     """Pairs worth scoring: semantic and lexical neighbours, two hops in the
-    deliberate graph, textual mentions and existing inferred links."""
+    deliberate graph, textual mentions and (for re-scoring) existing inferred links."""
     if focus is None:
         c.prepare_full()
     nodes = range(c.n) if focus is None else focus
@@ -277,7 +277,8 @@ def candidates(c: Corpus, focus: list[int] | None = None) -> set[tuple[int, int]
         for z in c.explicit_adj[i]:
             for j in c.explicit_adj[z]:
                 add(i, j)
-    for (a, b) in list(c.mentions) + [p for p, o in c.links.items() if "inferred" in o]:
+    inferred = [p for p, o in c.links.items() if "inferred" in o] if include_inferred else []
+    for (a, b) in list(c.mentions) + inferred:
         if focus_set is None or a in focus_set or b in focus_set:
             out.add((a, b))
     return out
@@ -325,7 +326,10 @@ def fit(c: Corpus) -> Model:
     pos = [p for p, o in c.links.items() if "explicit" in o and p not in c.mentions]
     if len(pos) < MIN_POSITIVES:
         return _default_model(len(pos))
-    neg = [p for p in candidates(c) if p not in c.links and p not in c.mentions]
+    # Labels and pool depend on deliberate links only — excluding already
+    # auto-linked pairs here would shift the model after every run.
+    neg = [p for p in candidates(c, include_inferred=False)
+           if "explicit" not in c.links.get(p, ()) and p not in c.mentions]
     if not neg:
         return _default_model(len(pos))
     X = np.array([features(c, i, j) for i, j in pos + neg])
@@ -439,7 +443,8 @@ def _apply(conn, c: Corpus, scored: list[Scored], *, dry_run: bool, auto_thresho
                 cur = conn.execute(
                     "UPDATE memory_links SET confidence = %s, evidence = %s, updated_at = now() "
                     "WHERE link_origin = 'inferred' AND ((from_id = %s AND to_id = %s) OR (from_id = %s AND to_id = %s)) "
-                    "AND (confidence IS DISTINCT FROM %s OR evidence IS DISTINCT FROM %s)",
+                    # confidence is REAL: compare at the stored precision, or every run rewrites every row
+                    "AND (confidence IS NULL OR abs(confidence - %s) > 1e-4 OR evidence IS DISTINCT FROM %s)",
                     (s.confidence, s.evidence, a, b, b, a, s.confidence, s.evidence))
                 report["backfilled"] += cur.rowcount
             elif "inferred" in c.links[pair]:
@@ -470,7 +475,9 @@ def _apply(conn, c: Corpus, scored: list[Scored], *, dry_run: bool, auto_thresho
             if state:  # pending: keep it current, it was already counted when first suggested
                 if not dry_run:
                     conn.execute("UPDATE link_suggestions SET confidence = %s, evidence = %s, updated_at = now() "
-                                 "WHERE id = %s AND status = 'pending'", (s.confidence, s.evidence, state[0]))
+                                 "WHERE id = %s AND status = 'pending' "
+                                 "AND (abs(confidence - %s) > 1e-4 OR evidence IS DISTINCT FROM %s)",
+                                 (s.confidence, s.evidence, state[0], s.confidence, s.evidence))
                 continue
             if not dry_run:
                 lo, hi = _canonical(a, b)

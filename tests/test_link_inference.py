@@ -246,6 +246,24 @@ def test_model_trains_on_explicit_links_only():
     assert all(w >= 0 for w in report["weights"].values())
 
 
+def test_trained_runs_are_stable():
+    """Auto-links must not feed back into training: a second full run with a
+    trained model changes nothing, not even the stored confidences."""
+    import diary_server, link_inference
+    for p in range(12):
+        for k in range(5):
+            _put(f"/projects/p{p}/n{k}", f"Notiz {k} zu Projekt {p} mit Thema t{p}{k % 2}")
+    for p in range(12):
+        for k in range(4):
+            diary_server.memory_link(f"/projects/p{p}/n{k}", f"/projects/p{p}/n{k + 1}")
+    _put("/projects/p0/extra", "siehe /projects/p1/n0 und /projects/p2/n0")
+    first = link_inference.run()
+    assert first["model"] == "trained"
+    second = link_inference.run()
+    assert (second["auto"], second["suggested"], second["backfilled"]) == (0, 0, 0)
+    assert second["weights"] == first["weights"]
+
+
 # ── plumbing ─────────────────────────────────────────────────────────────
 
 def test_link_confidence_is_synced(test_databases):
