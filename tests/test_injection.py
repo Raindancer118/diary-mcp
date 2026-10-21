@@ -245,7 +245,7 @@ def test_prompt_hook_injects_once_per_session():
     _seed_retrieval_corpus()
     payload = {"session_id": "s1", "cwd": "/somewhere/demo",
                "prompt": "Mach das Deployment auf Dorn per rsync"}
-    with patch("memory_injection._query_vector", return_value=None):
+    with patch("memory_injection._query_vector", return_value=(None, "patched")):
         first = mi.run_hook("prompt", payload)
         second = mi.run_hook("prompt", payload)
     ctx = json.loads(first)["hookSpecificOutput"]["additionalContext"]
@@ -258,7 +258,7 @@ def test_session_start_hook_is_lean_and_compact_resets_dedupe():
     import memory_injection as mi
     _seed_retrieval_corpus()
     prompt = {"session_id": "s2", "cwd": "/x/demo", "prompt": "rsync Deployment Dorn"}
-    with patch("memory_injection._query_vector", return_value=None):
+    with patch("memory_injection._query_vector", return_value=(None, "patched")):
         assert mi.run_hook("prompt", prompt)
         assert mi.run_hook("prompt", prompt) == ""
         out = mi.run_hook("session-start", {"session_id": "s2", "cwd": "/x/demo", "source": "compact"})

@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 HOOK_MAX_CHARS = 120
@@ -337,7 +338,23 @@ def _idf(n: int, df: int) -> float:
     return math.log(1 + (n - df + 0.5) / (df + 0.5))
 
 
-def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str]) -> list[dict]:
+@dataclass(frozen=True)
+class RetrievalParams:
+    """Every knob of the per-prompt gate; defaults are the live settings."""
+    max_hits: int = PROMPT_MAX_HITS
+    min_confidence: float = MIN_CONFIDENCE
+    min_importance: float = MIN_IMPORTANCE
+    lex_min_matches: int = LEX_MIN_MATCHES
+    lex_min_score: float = LEX_MIN_SCORE
+    sem_sim_zero: float = SEM_SIM_ZERO
+    sem_sim_full: float = SEM_SIM_FULL
+
+
+DEFAULT_PARAMS = RetrievalParams()
+
+
+def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str],
+                  params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
     tsq = " | ".join("'" + lx.replace("'", "''") + "'" for lx in lexemes)
     rows = conn.execute(
         f"SELECT path, title, body, importance, tsvector_to_array(to_tsvector('german', coalesce(title,''))) AS tlx, "
@@ -360,21 +377,18 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str])
         if r["path"] in exclude:
             continue
         matched = qset & set(r["dlx"])
-        if len(matched) < LEX_MIN_MATCHES:
+        if len(matched) < params.lex_min_matches:
             continue
         matched_mass = sum(_idf(n, df.get(lx, 1)) for lx in matched)
-        if matched_mass < LEX_MIN_SCORE:
+        if matched_mass < params.lex_min_score:
             continue
         # Confidence: the memory must cover the prompt's (idf-weighted) content
         # AND be about it — long logs mention everything somewhere, so the
         # title has to carry a good part of the query too.
         title_mass = sum(_idf(n, df.get(lx, 1)) for lx in qset & set(r["tlx"]))
         confidence = min(1.0, matched_mass / query_mass, 0.5 + title_mass / query_mass)
-        title_bonus = 0.5 * title_mass
-        in_project = bool(base) and (r["path"] == base or r["path"].startswith(base + "/"))
         hits.append({"path": r["path"], "title": r["title"], "body": r["body"],
-                     "importance": float(r["importance"] or 0.5), "confidence": confidence,
-                     "score": (matched_mass + title_bonus) * (1.3 if in_project else 1.0)})
+                     "importance": float(r["importance"] or 0.5), "lex_conf": confidence})
     return hits
 
 
@@ -403,48 +417,78 @@ def _semantic_hits(conn, qvec: list[float], exclude: set[str]) -> list[dict]:
         ).fetchall()
         rows = sorted(({**r, "sim": diary_embed.cosine(qvec, r["embedding"])} for r in cand),
                       key=lambda r: -r["sim"])[:10]
-    span = SEM_SIM_FULL - SEM_SIM_ZERO
     return [{"path": r["path"], "title": r["title"], "body": r["body"],
-             "importance": float(r["importance"] or 0.5), "score": float(r["sim"]),
-             "confidence": max(0.0, min(1.0, (float(r["sim"]) - SEM_SIM_ZERO) / span))}
+             "importance": float(r["importance"] or 0.5), "sim": float(r["sim"])}
             for r in rows if r["path"] not in exclude]
 
 
-def retrieve_for_prompt(conn, prompt: str, slug: str | None, qvec: list[float] | None = None,
-                        exclude: set[str] | None = None, limit: int = PROMPT_MAX_HITS) -> list[dict]:
+def score_candidates(conn, prompt: str, slug: str | None, qvec: list[float] | None = None,
+                     exclude: set[str] | None = None,
+                     params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
+    """Every memory either signal found, with the raw signals (lex_conf, sim)
+    kept apart so select_hits() can re-gate them under other parameters."""
     exclude = exclude or set()
     lexemes = _prompt_lexemes(conn, prompt)
     if len(lexemes) < PROMPT_MIN_LEXEMES and qvec is None:
         return []
-    base = _project_base(slug)
-    lex = _lexical_hits(conn, lexemes, base, exclude) if len(lexemes) >= PROMPT_MIN_LEXEMES else []
+    lex = (_lexical_hits(conn, lexemes, _project_base(slug), exclude, params)
+           if len(lexemes) >= PROMPT_MIN_LEXEMES else [])
     sem = _semantic_hits(conn, qvec, exclude) if qvec else []
-    # Independent evidence from both signals: 1 - (1 - a)(1 - b).
     merged: dict[str, dict] = {}
     for h in lex + sem:
-        prev = merged.get(h["path"])
-        if prev is None:
-            merged[h["path"]] = dict(h)
-        else:
-            prev["confidence"] = 1 - (1 - prev["confidence"]) * (1 - h["confidence"])
-    hits = [h for h in merged.values()
-            if h["confidence"] >= MIN_CONFIDENCE and h["importance"] >= MIN_IMPORTANCE]
-    hits.sort(key=lambda h: (-h["confidence"], -h["importance"], h["path"]))
-    return hits[:limit]
+        c = merged.setdefault(h["path"], {"path": h["path"], "title": h["title"], "body": h["body"],
+                                          "importance": h["importance"], "lex_conf": 0.0, "sim": None})
+        if "lex_conf" in h:
+            c["lex_conf"] = h["lex_conf"]
+        if "sim" in h:
+            c["sim"] = h["sim"]
+    return list(merged.values())
 
 
-def _query_vector(prompt: str) -> list[float] | None:
+def candidate_confidence(c: dict, params: RetrievalParams = DEFAULT_PARAMS) -> float:
+    sem = 0.0
+    if c.get("sim") is not None:
+        span = params.sem_sim_full - params.sem_sim_zero
+        sem = max(0.0, min(1.0, (c["sim"] - params.sem_sim_zero) / span)) if span > 0 else 0.0
+    # Independent evidence from both signals: 1 - (1 - a)(1 - b).
+    return 1 - (1 - c.get("lex_conf", 0.0)) * (1 - sem)
+
+
+def rank_candidates(cands: list[dict], params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
+    ranked = [{**c, "confidence": candidate_confidence(c, params)} for c in cands]
+    ranked.sort(key=lambda h: (-h["confidence"], -h["importance"], h["path"]))
+    return ranked
+
+
+def select_hits(cands: list[dict], params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
+    return [h for h in rank_candidates(cands, params)
+            if h["confidence"] >= params.min_confidence
+            and h["importance"] >= params.min_importance][:params.max_hits]
+
+
+def retrieve_for_prompt(conn, prompt: str, slug: str | None, qvec: list[float] | None = None,
+                        exclude: set[str] | None = None, limit: int | None = None,
+                        params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
+    if limit is not None:
+        params = replace(params, max_hits=limit)
+    return select_hits(score_candidates(conn, prompt, slug, qvec, exclude, params), params)
+
+
+def _query_vector(prompt: str) -> tuple[list[float] | None, str]:
     """Embedding via the already-running shared server only — never loads the
-    model in the short-lived hook process (that would stall every prompt)."""
+    model in the short-lived hook process (that would stall every prompt).
+    Returns (vector, reason); reason says why the vector is missing."""
     try:
         import diary_embed_ipc as ipc
         path = ipc.sock_path()
         if not path.exists():
-            return None
+            return None, "no_socket"
         vecs = ipc.request_remote([prompt[:2000]], timeout=SEM_TIMEOUT_S)
-        return vecs[0] if vecs else None
-    except Exception:
-        return None
+        return (vecs[0], "ok") if vecs else (None, "empty")
+    except TimeoutError:
+        return None, "timeout"
+    except Exception as e:
+        return None, type(e).__name__
 
 
 def format_prompt_hits(hits: list[dict]) -> str:
@@ -554,6 +598,17 @@ def log_event(event: dict) -> None:
         pass
 
 
+def _miss_info(cands: list[dict]) -> dict:
+    """Why nothing was injected — path and score of the best candidate only,
+    so thresholds can be tuned from the log without storing prompt content."""
+    if not cands:
+        return {"reason": "no_candidates"}
+    best = rank_candidates(cands)[0]
+    reason = "below_confidence" if best["confidence"] < MIN_CONFIDENCE else "low_importance"
+    return {"reason": reason, "best": {"path": best["path"], "conf": round(best["confidence"], 3),
+                                       "imp": best["importance"]}}
+
+
 def _hook_output(event_name: str, context: str) -> str:
     return json.dumps({"hookSpecificOutput": {"hookEventName": event_name,
                                               "additionalContext": context}})
@@ -588,13 +643,17 @@ def _run_hook(event: str, payload: dict, record: dict) -> str:
             prompt = (payload.get("prompt") or "").strip()
             if not prompt or prompt.startswith("/") and " " not in prompt:
                 return ""
-            qvec = _query_vector(prompt)
+            qvec, sem_reason = _query_vector(prompt)
             injected = load_injected(session_id)
             with psycopg.connect(_database_url(), row_factory=dict_row, connect_timeout=2) as conn:
                 slug = slug_from_cwd(conn, cwd)
-                hits = retrieve_for_prompt(conn, prompt, slug, qvec=qvec, exclude=injected)
+                cands = score_candidates(conn, prompt, slug, qvec=qvec, exclude=injected)
+                hits = select_hits(cands)
                 record.update(slug=slug, semantic=qvec is not None, hits=[h["path"] for h in hits], chars=0)
+                if sem_reason != "ok":
+                    record["semantic_reason"] = sem_reason
                 if not hits:
+                    record.update(_miss_info(cands))
                     return ""
                 conn.execute(
                     "UPDATE memory_nodes SET access_count = access_count + 1, accessed_at = now() "

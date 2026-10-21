@@ -38,7 +38,7 @@ def test_injection_log_records_hook_events_without_content():
             "Beim rsync auf Dorn immer --exclude .env setzen, sonst Secrets weg.", 0.9)
     for i in range(25):
         _upsert(f"/projects/demo/f{i}", f"Notiz {i}", f"Allgemeines Thema {i}.")
-    with patch("memory_injection._query_vector", return_value=None):
+    with patch("memory_injection._query_vector", return_value=(None, "patched")):
         mi.run_hook("session-start", {"session_id": "s", "cwd": "/x/demo"})
         mi.run_hook("prompt", {"session_id": "s", "cwd": "/x/demo", "prompt": "rsync Deployment auf Dorn"})
         mi.run_hook("prompt", {"session_id": "s", "cwd": "/x/demo", "prompt": "Wetter morgen Hamburg Regen"})

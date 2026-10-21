@@ -1,6 +1,6 @@
 [project]
 name = "diary-mcp"
-version = "0.26.1"
+version = "0.27.0"
 description = "MCP server for project diary + Claude memory tree — backed by PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ diary-mcp       = "diary_server:main"
 diary-admin-mcp = "diary_admin_server:main"
 diary-web       = "diary_web:main"
 diary-hook      = "memory_injection:main"
+diary-eval      = "retrieval_eval:main"
 
 [project.optional-dependencies]
 dev = [
@@ -33,7 +34,7 @@ py-modules = [
     "diary_admin_server", "sync_manager", "diary_link",
     "diary_db", "diary_config", "diary_logger", "diary_http_receiver", "diary_web", "diary_embed",
     "diary_embed_ipc", "memory_injection", "memory_stats", "link_inference",
-    "diary_web_autostart",
+    "diary_web_autostart", "retrieval_eval",
 ]
 packages = ["diary_web_assets"]
 
