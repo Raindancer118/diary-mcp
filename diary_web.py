@@ -229,6 +229,31 @@ async def api_suggestions_decide(request: Request):
     return {"done": done, "missing": missing}
 
 
+@app.get("/api/consolidation")
+def api_consolidation(limit: int = 200):
+    import consolidation
+    total, items = consolidation.list_pending(limit)
+    return {"pending": total, "items": items, "history": consolidation.history(20)}
+
+
+@app.post("/api/consolidation/decide")
+async def api_consolidation_decide(request: Request):
+    import consolidation
+    _same_origin_json(request)
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(400, "invalid JSON")
+    if not isinstance(payload, dict) or not isinstance(payload.get("ids") or [], list):
+        raise HTTPException(400, "{ids: [...], decision} expected")
+    try:
+        done, skipped = await run_in_threadpool(
+            consolidation.decide, payload.get("ids") or [], str(payload.get("decision", "")))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"done": done, "skipped": skipped}
+
+
 @app.get("/api/links/auto")
 def api_links_auto_info():
     import link_inference

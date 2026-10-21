@@ -372,6 +372,25 @@ _SCHEMA = [
         UNIQUE(from_id, to_id)
     )""",
     "CREATE INDEX IF NOT EXISTS link_suggestions_status_idx ON link_suggestions(status, confidence DESC)",
+    # consolidation_proposals (v0.29.0): queue of the nightly consolidation pass.
+    # Local only, like link_suggestions — decisions happen where Tom reviews.
+    # stamps = {path: updated_at} at proposal time; a changed memory makes the
+    # proposal 'outdated' instead of applying it. fingerprint keeps rejected
+    # proposals from coming back.
+    """CREATE TABLE IF NOT EXISTS consolidation_proposals (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        kind        TEXT NOT NULL,
+        paths       TEXT[] NOT NULL,
+        detail      JSONB NOT NULL DEFAULT '{}',
+        stamps      JSONB NOT NULL DEFAULT '{}',
+        fingerprint TEXT NOT NULL UNIQUE,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        decision    TEXT,
+        result      TEXT,
+        created_at  TIMESTAMPTZ DEFAULT now(),
+        decided_at  TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS consolidation_proposals_status_idx ON consolidation_proposals(status, kind)",
 
     # trigger_keywords: deterministic keyword-based auto-injection (v0.9.0). Distinct
     # from pin_triggers (session-start/compact lifecycle events) — these fire whenever

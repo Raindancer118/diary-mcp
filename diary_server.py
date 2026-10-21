@@ -53,6 +53,7 @@ import memory_service  # noqa: E402
 import search_engine  # noqa: E402
 import graph_core  # noqa: E402
 import link_inference  # noqa: E402
+import consolidation  # noqa: E402
 import sync_manager  # noqa: E402
 import diary_link  # noqa: E402
 import memory_stats  # noqa: E402

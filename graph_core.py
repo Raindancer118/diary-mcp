@@ -16,9 +16,10 @@ _SYMMETRIC_REL_TYPES = {"related", "supports", "contradicts"}
 def memory_link(from_path: str, to_path: str, rel_type: str = "related", note: str = "") -> str:
     """Erstellt eine Verknüpfung zwischen zwei Memory-Nodes (Knowledge Graph).
 
-    rel_type: related | supports | contradicts | requires | derived_from
+    rel_type: related | supports | contradicts | requires | derived_from | supersedes
+    (supersedes: from ersetzt to — lieber memory_supersede nutzen, das lässt to auch ablaufen)
     """
-    valid_types = {"related", "supports", "contradicts", "requires", "derived_from"}
+    valid_types = {"related", "supports", "contradicts", "requires", "derived_from", "supersedes"}
     if rel_type not in valid_types:
         return f"Ungültiger rel_type '{rel_type}'. Erlaubt: {', '.join(sorted(valid_types))}"
     with diary_db.get_db() as conn:
