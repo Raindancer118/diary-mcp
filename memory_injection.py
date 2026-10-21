@@ -61,6 +61,17 @@ SEM_SIM_ZERO = 0.50
 SEM_SIM_FULL = 0.80
 SEM_TIMEOUT_S = 1.0
 DF_CACHE_TTL_S = 6 * 3600
+# Usage feedback: a reply "used" an injected memory if it names its path or
+# if, among all memories, this one ranks in the top USE_TOP_SHARE for overlap
+# with the reply (idf mass of shared terms the prompt didn't contain, divided
+# by √ of the memory's own mass). Raw overlap is useless: long replies share
+# terms with nearly everything (checked on Tom's transcripts 2026-10-21).
+# Fact memories judged USE_MIN_SAMPLES times without one use stop being
+# injected; behaviour rules (/feedback, /user) shape conduct, not wording, so
+# they are judged but never suppressed.
+USE_TOP_SHARE = 0.01
+USE_MIN_SAMPLES = 3
+USE_SUPPRESSIBLE = ("/projects/", "/references/")
 LOG_MAX_BYTES = 2_000_000
 
 # Pins live only inside projects (/projects/<slug>/...) and every injected pin
@@ -515,12 +526,24 @@ def _semantic_hits(conn, qvec: list[float], exclude: set[str]) -> list[dict]:
             for r in rows if r["path"] not in exclude]
 
 
+def _never_used(conn) -> set[str]:
+    """Paths injected USE_MIN_SAMPLES+ times without any judged use."""
+    try:
+        with conn.transaction():  # savepoint: a missing table must not abort the caller's transaction
+            rows = conn.execute(
+                "SELECT path FROM injection_feedback GROUP BY path "
+                "HAVING count(*) >= %s AND NOT bool_or(used)", (USE_MIN_SAMPLES,)).fetchall()
+        return {r["path"] for r in rows if r["path"].startswith(USE_SUPPRESSIBLE)}
+    except Exception:
+        return set()
+
+
 def score_candidates(conn, prompt: str, slug: str | None, qvec: list[float] | None = None,
                      exclude: set[str] | None = None,
                      params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
     """Every memory either signal found, with the raw signals (lex_conf, sim)
     kept apart so select_hits() can re-gate them under other parameters."""
-    exclude = exclude or set()
+    exclude = set(exclude or ()) | _never_used(conn)
     lexemes = _prompt_lexemes(conn, prompt)
     if len(lexemes) < PROMPT_MIN_LEXEMES and qvec is None:
         return []
@@ -659,6 +682,123 @@ def reset_session(session_id: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Usage feedback (SessionEnd)
+# ---------------------------------------------------------------------------
+
+_INJECT_MARK = "# diary-mcp: passende Memories"
+_INJECT_PATH = re.compile(r"⟨(/[^⟩]+)⟩")
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "text":
+            parts.append(c.get("text", ""))
+        elif c.get("type") == "tool_use":
+            parts.append(json.dumps(c.get("input", {}), ensure_ascii=False))
+    return "\n".join(parts)
+
+
+def _is_prompt(row: dict) -> bool:
+    if row.get("type") != "user" or row.get("isMeta"):
+        return False
+    content = (row.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return True
+    return bool(content) and all(isinstance(c, dict) and c.get("type") == "text" for c in content)
+
+
+def injections_in_transcript(path) -> list[dict]:
+    """Each diary injection with the prompt it answered and everything Claude
+    wrote (text + tool inputs) until the next real prompt."""
+    out, current, last_prompt = [], None, ""
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if _is_prompt(row):
+            current = None
+            last_prompt = _text_of((row.get("message") or {}).get("content"))
+            continue
+        att = row.get("attachment") or {}
+        if row.get("type") == "attachment" and att.get("type") == "hook_additional_context":
+            text = "\n".join(att.get("content") or []) if isinstance(att.get("content"), list) else str(att.get("content"))
+            if _INJECT_MARK in text:
+                current = {"paths": _INJECT_PATH.findall(text), "prompt": last_prompt,
+                           "reply": "", "ts": row.get("timestamp")}
+                out.append(current)
+            continue
+        if current is not None and row.get("type") == "assistant":
+            current["reply"] += _text_of((row.get("message") or {}).get("content")) + "\n"
+    return [o for o in out if o["paths"] and o["ts"]]
+
+
+def _lexeme_set(conn, text: str) -> set[str]:
+    row = conn.execute(
+        "SELECT coalesce(array_agg(l), '{}') AS lx FROM unnest(tsvector_to_array(to_tsvector('german', %s))) l "
+        "WHERE length(l) > 2", (text[:20000],)).fetchone()
+    return set(row["lx"]) - _FILLER
+
+
+def _corpus_lexemes(conn) -> dict[str, set[str]]:
+    return {r["path"]: set(r["lx"]) - _FILLER for r in conn.execute(
+        f"SELECT path, tsvector_to_array({_DOC}) AS lx FROM memory_nodes WHERE {_LIVE}").fetchall()}
+
+
+def usage_rank(conn, path: str, prompt: str, reply: str,
+               corpus: dict[str, set[str]] | None = None) -> float:
+    """Share of memories that overlap the reply at least as much as `path`
+    (0.0 = named outright). Lower = more clearly used."""
+    if path in reply:
+        return 0.0
+    corpus = corpus if corpus is not None else _corpus_lexemes(conn)
+    if path not in corpus:
+        return 1.0
+    n, df = _doc_freqs(conn)
+    picked = _lexeme_set(conn, reply) - _lexeme_set(conn, prompt)
+
+    def norm(lexemes: set[str]) -> float:
+        own = sum(_idf(n, df.get(lx, 1)) for lx in lexemes)
+        return sum(_idf(n, df.get(lx, 1)) for lx in lexemes & picked) / math.sqrt(own or 1.0)
+
+    target = norm(corpus[path])
+    if target <= 0:
+        return 1.0
+    return sum(1 for lx in corpus.values() if norm(lx) >= target) / len(corpus)
+
+
+def is_used(rank: float, corpus_size: int) -> bool:
+    return rank * corpus_size <= max(1, round(USE_TOP_SHARE * corpus_size))
+
+
+def record_feedback(conn, session_id: str, transcript_path) -> dict:
+    judged = used = 0
+    injections = injections_in_transcript(transcript_path)
+    corpus = _corpus_lexemes(conn) if injections else {}
+    for inj in injections:
+        for path in inj["paths"]:
+            rank = usage_rank(conn, path, inj["prompt"], inj["reply"], corpus)
+            ok = is_used(rank, len(corpus))
+            cur = conn.execute(
+                "INSERT INTO injection_feedback (session_id, path, injected_at, used, score) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (session_id, path, inj["ts"], ok, rank))
+            if cur.rowcount:
+                judged += 1
+                used += ok
+    return {"judged": judged, "used": used}
+
+
+# ---------------------------------------------------------------------------
 # Hook entry point
 # ---------------------------------------------------------------------------
 
@@ -751,6 +891,14 @@ def _run_hook(event: str, payload: dict, record: dict) -> str:
             reset_session(session_id)
             record.update(slug=slug, source=payload.get("source") or "startup", chars=len(hint))
             return _hook_output("SessionStart", hint) if hint else ""
+        if event == "session-end":
+            transcript = payload.get("transcript_path")
+            if not transcript or not session_id:
+                return ""
+            with psycopg.connect(_database_url(), row_factory=dict_row, connect_timeout=3) as conn:
+                slug = slug_from_cwd(conn, cwd)
+                record.update(slug=slug, **record_feedback(conn, session_id, transcript))
+            return ""
         if event == "prompt":
             prompt = (payload.get("prompt") or "").strip()
             if not prompt or prompt.startswith("/") and " " not in prompt:

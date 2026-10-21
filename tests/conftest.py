@@ -131,6 +131,7 @@ def clean_memory_nodes(test_databases):
         # and trip false conflict detection).
         conn.execute("DELETE FROM diary_meta")
         conn.execute("DELETE FROM consolidation_proposals")
+        conn.execute("DELETE FROM injection_feedback")
         # diary_identity is a singleton table — leaking one test's identity
         # into the next would make every diary_link_init() call after the
         # first report "already exists".

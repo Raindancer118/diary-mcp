@@ -391,6 +391,20 @@ _SCHEMA = [
         decided_at  TIMESTAMPTZ
     )""",
     "CREATE INDEX IF NOT EXISTS consolidation_proposals_status_idx ON consolidation_proposals(status, kind)",
+    # injection_feedback (v0.30.0): per injected memory and session, whether
+    # Claude's reply drew on it (judged by the SessionEnd hook from the
+    # transcript). Memories injected USE_MIN_SAMPLES times without one use stop
+    # being injected. Local only — it describes this machine's sessions.
+    """CREATE TABLE IF NOT EXISTS injection_feedback (
+        session_id  TEXT NOT NULL,
+        path        TEXT NOT NULL,
+        injected_at TIMESTAMPTZ NOT NULL,
+        used        BOOLEAN NOT NULL,
+        score       REAL,
+        judged_at   TIMESTAMPTZ DEFAULT now(),
+        PRIMARY KEY (session_id, path, injected_at)
+    )""",
+    "CREATE INDEX IF NOT EXISTS injection_feedback_path_idx ON injection_feedback(path)",
 
     # trigger_keywords: deterministic keyword-based auto-injection (v0.9.0). Distinct
     # from pin_triggers (session-start/compact lifecycle events) — these fire whenever

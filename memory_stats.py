@@ -353,6 +353,16 @@ def _injection_stats(days: int) -> dict:
     }
 
 
+def _feedback_stats(conn, days: int) -> dict:
+    row = conn.execute(
+        "SELECT count(*) AS judged, count(*) FILTER (WHERE used) AS used FROM injection_feedback "
+        "WHERE injected_at >= now() - %s::interval", (f"{days} days",)).fetchone()
+    judged, used = int(row["judged"]), int(row["used"])
+    return {"judged": judged, "used": used,
+            "use_rate": round(used / judged, 3) if judged else 0.0,
+            "suppressed": len(memory_injection._never_used(conn))}
+
+
 # ---------------------------------------------------------------------------
 # File-based (vanilla) memory comparison
 # ---------------------------------------------------------------------------
@@ -513,7 +523,7 @@ def collect_stats(conn, days: int = 30, project_slug: str = "") -> dict:
         "quality": _quality_stats(conn),
         "graph": _graph_stats(conn),
         "journal": _journal_stats(conn),
-        "injection": _injection_stats(days),
+        "injection": {**_injection_stats(days), "feedback": _feedback_stats(conn, days)},
         "diary": diary,
         "vanilla": _vanilla_stats(conn, slug),
     }
@@ -635,6 +645,10 @@ def format_stats(st: dict) -> str:
         if inj["avg_tokens_per_session"]:
             ratio = c["approx_tokens"] / inj["avg_tokens_per_session"]
             lines.append(f"- Hebel: {ratio:,.0f}× so viel Wissen erreichbar wie pro Session an Tokens injiziert wird")
+        fb = inj.get("feedback") or {}
+        if fb.get("judged"):
+            lines.append(f"- Davon von Claude genutzt (am Session-Ende geprüft): {fb['used']}/{fb['judged']} "
+                         f"({fb['use_rate']:.0%}) · gesperrt wegen nie genutzt: {fb['suppressed']}")
         if inj["top_injected"]:
             lines.append("- Am häufigsten injiziert: " + ", ".join(f"{p} ({n}×)" for p, n in inj["top_injected"][:5]))
     else:
