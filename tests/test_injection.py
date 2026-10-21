@@ -339,12 +339,13 @@ def test_semantic_confidence_threshold():
     far = [0.6, 0.8] + [0.0] * 382       # cosine 0.6
     _upsert("/projects/demo/sem", "Fahrzeugpflege", "Winterreifen im Oktober wechseln.", 0.7, embedding=vec)
     with _conn() as conn:
-        assert [h["path"] for h in mi.retrieve_for_prompt(conn, "Pneus tauschen?", "demo", qvec=near)] \
-            == ["/projects/demo/sem"]
-        assert mi.retrieve_for_prompt(conn, "Pneus tauschen?", "demo", qvec=far) == []
+        threshold = mi.RetrievalParams(mode="threshold")
+        assert [h["path"] for h in mi.retrieve_for_prompt(conn, "Pneus tauschen?", "demo", qvec=near,
+                                                          params=threshold)] == ["/projects/demo/sem"]
+        assert mi.retrieve_for_prompt(conn, "Pneus tauschen?", "demo", qvec=far, params=threshold) == []
 
 
-def test_at_most_two_prompt_hits():
+def test_at_most_one_prompt_hit():
     import memory_injection as mi
     for i in range(4):
         _upsert(f"/projects/demo/dup{i}", f"Backup Strategie Restic {i}", "Backup Strategie Restic Hetzner Storagebox.", 0.9)
@@ -352,7 +353,7 @@ def test_at_most_two_prompt_hits():
         _upsert(f"/projects/demo/f{i}", f"Notiz {i}", f"Thema {i}.")
     with _conn() as conn:
         hits = mi.retrieve_for_prompt(conn, "Backup Strategie Restic Hetzner Storagebox", "demo")
-    assert len(hits) == 2
+    assert len(hits) == 1
 
 
 def test_hook_fails_silent_on_db_error(monkeypatch):

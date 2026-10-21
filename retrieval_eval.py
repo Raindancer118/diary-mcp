@@ -195,6 +195,80 @@ def format_failures(gold, cands, params: mi.RetrievalParams, top: int = 3) -> st
 
 
 # ---------------------------------------------------------------------------
+# Learned gate: fit + honest (cross-validated) evaluation
+# ---------------------------------------------------------------------------
+
+def _training_rows(gold, cands, idx):
+    X, y = [], []
+    for i in idx:
+        ok = set(gold[i].expected) | set(gold[i].acceptable)
+        for c, f in zip(cands[i], mi.candidate_features(cands[i])):
+            X.append(f)
+            y.append(1.0 if c["path"] in ok else 0.0)
+    return X, y
+
+
+def fit_model(gold, cands, idx=None, l2: float = 1.0, iters: int = 3000,
+              min_prob: float = mi.DEFAULT_MODEL.min_prob) -> mi.InjectionModel:
+    """L2-regularised logistic regression (bias unpenalised), full-batch
+    gradient descent — deterministic, no extra dependency besides numpy."""
+    import numpy as np
+    idx = range(len(gold)) if idx is None else idx
+    X, y = _training_rows(gold, cands, idx)
+    if not X:
+        return mi.DEFAULT_MODEL
+    X = np.c_[np.ones(len(X)), np.array(X)]
+    y = np.array(y)
+    w = np.zeros(X.shape[1])
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-np.clip(X @ w, -60, 60)))
+        grad = X.T @ (p - y) / len(y) + l2 * np.r_[0.0, w[1:]] / len(y)
+        w -= 1.0 * grad
+    weights = {"bias": round(float(w[0]), 4)} | {n: round(float(v), 4)
+                                                 for n, v in zip(mi.FEATURE_NAMES, w[1:])}
+    from datetime import date
+    return mi.InjectionModel(weights=weights, min_prob=min_prob, trained_on=len(list(idx)),
+                             fitted_at=date.today().isoformat())
+
+
+def cross_validate(gold, cands, folds: int = 10, l2: float = 1.0) -> list[list[dict]]:
+    """Per gold item: its candidates ranked by a model that never saw it."""
+    n = len(gold)
+    preds: list[list[dict] | None] = [None] * n
+    learned = mi.RetrievalParams(mode="learned", min_prob=0.0, max_hits=10 ** 6, min_importance=0.0)
+    for k in range(min(folds, n)):
+        test = list(range(k, n, folds))
+        model = fit_model(gold, cands, [i for i in range(n) if i not in set(test)], l2=l2)
+        for i in test:
+            preds[i] = mi.rank_candidates(cands[i], learned, model)
+    return preds
+
+
+def evaluate_predictions(gold, preds, min_prob: float, max_hits: int = 1,
+                         min_importance: float = mi.MIN_IMPORTANCE) -> EvalResult:
+    res = EvalResult()
+    for g, ranked in zip(gold, preds):
+        hits = [h["path"] for h in ranked
+                if h["confidence"] >= min_prob and h["importance"] >= min_importance][:max_hits]
+        ok = set(g.expected) | set(g.acceptable)
+        res.injected += len(hits)
+        res.correct += sum(1 for h in hits if h in ok)
+        res.prompts_injected += bool(hits)
+        if g.expected:
+            res.positives += 1
+            res.found += any(h in g.expected for h in hits)
+        else:
+            res.negatives += 1
+            res.negative_fp += any(h not in ok for h in hits)
+    return res
+
+
+def learned_frontier(gold, preds, max_hits: int = 1) -> list[tuple[float, EvalResult]]:
+    return [(round(t, 2), evaluate_predictions(gold, preds, t, max_hits))
+            for t in [x / 20 for x in range(4, 20)]]
+
+
+# ---------------------------------------------------------------------------
 # Gold-set building helpers
 # ---------------------------------------------------------------------------
 
@@ -273,7 +347,7 @@ def _connect():
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="diary-eval", description=__doc__.split("\n\n")[0])
-    ap.add_argument("command", nargs="?", choices=["eval", "mine", "pool"], default="eval")
+    ap.add_argument("command", nargs="?", choices=["eval", "fit", "mine", "pool"], default="eval")
     ap.add_argument("file", nargs="?", help="prompts JSONL for `pool`")
     ap.add_argument("--gold", type=Path, default=None)
     ap.add_argument("--sweep", action="store_true")
@@ -281,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--failures", action="store_true")
     ap.add_argument("--no-semantic", action="store_true")
     ap.add_argument("--limit", type=int, default=300)
+    ap.add_argument("--write", action="store_true", help="fit: save the model for the live hook")
     args = ap.parse_args(argv)
 
     if args.command == "mine":
@@ -310,6 +385,23 @@ def main(argv: list[str] | None = None) -> int:
     with _connect() as conn:
         cands = collect_candidates(conn, gold, vectors=vectors)
     print(f"gold set: {gold_path} · {len(gold)} prompts")
+    if args.command == "fit":
+        preds = cross_validate(gold, cands)
+        frontier = learned_frontier(gold, preds)
+        print("10-fold cross-validated (model never saw the prompt it scores), max 1 hit:")
+        for t, r in frontier:
+            print(f"  min_prob {t:.2f}: {format_result('cv', r)}")
+        ok = [(t, r) for t, r in frontier if r.precision >= args.precision_target and r.injected]
+        if not ok:
+            print(f"no threshold reaches precision ≥ {args.precision_target:.0%} — model not written")
+            return 1
+        t, r = max(ok, key=lambda x: (x[1].recall, x[1].precision, x[0]))
+        model = replace(fit_model(gold, cands), min_prob=t)
+        print(f"chosen min_prob {t:.2f} → {format_result('cv', r)}")
+        print("weights:", json.dumps(model.weights))
+        if args.write:
+            print(f"written: {mi.save_model(model)}")
+        return 0
     print(format_result("live", evaluate(gold, cands, mi.DEFAULT_PARAMS)))
     chosen = mi.DEFAULT_PARAMS
     if args.sweep:

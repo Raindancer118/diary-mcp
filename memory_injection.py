@@ -5,11 +5,11 @@ model without it having to remember a tool call.
 Three consumers share this module:
   • SessionStart hook  → build_session_hint(): project pins + one line on
     what exists and how to fetch it. Nothing else is preloaded.
-  • UserPromptSubmit hook → retrieve_for_prompt(): at most two memories, only
-    with ≥ 90 % confidence and importance ≥ 0.5. Lexical confidence = share of
-    the prompt's idf-weighted content a memory covers; semantic confidence
-    from cosine similarity via the already-running shared embedding server
-    (diary_embed_ipc) — the hook never loads a model itself.
+  • UserPromptSubmit hook → retrieve_for_prompt(): at most one memory, gated
+    by a logistic model over lexical coverage, cosine similarity (via the
+    already-running shared embedding server, diary_embed_ipc — the hook never
+    loads a model itself) and how clearly the memory leads both signals.
+    Fitted and measured with `diary-eval` on labelled real prompts.
   • memory_project_context / memory_context tools → build_session_digest():
     the token-budgeted project index Claude pulls on demand.
 
@@ -34,8 +34,9 @@ GLOBAL_MIN_IMPORTANCE = 0.7
 GLOBAL_MAX_LINES = 20
 
 # Per-prompt injection is deliberately conservative (Tom 2026-09-27): nothing
-# is better than a wrong memory — Claude can always search itself.
-PROMPT_MAX_HITS = 2
+# is better than a wrong memory — Claude can always search itself. One hit:
+# a second one cost precision on the gold set (94 % → 92 %) for no recall.
+PROMPT_MAX_HITS = 1
 PROMPT_SNIPPET_CHARS = 600
 PROMPT_MIN_LEXEMES = 2
 MIN_CONFIDENCE = 0.9
@@ -338,9 +339,99 @@ def _idf(n: int, df: int) -> float:
     return math.log(1 + (n - df + 0.5) / (df + 0.5))
 
 
+# ---------------------------------------------------------------------------
+# Learned gate. Raw similarity is a poor absolute signal (on Tom's labelled
+# prompts, right and wrong top hits overlap almost completely), but the right
+# memory is usually the clear #1 of both signals. A logistic model over these
+# relative features is fitted offline by `diary-eval fit`; DEFAULT_MODEL is
+# that fit, a written model file overrides it.
+# ---------------------------------------------------------------------------
+
+FEATURE_NAMES = ("sim", "lex", "sem_margin", "lex_margin", "sem_top", "lex_top",
+                 "both_top", "importance", "in_project")
+
+
+@dataclass(frozen=True)
+class InjectionModel:
+    weights: dict
+    min_prob: float = 0.5
+    trained_on: int = 0
+    fitted_at: str = ""
+
+    def prob(self, features) -> float:
+        z = self.weights.get("bias", 0.0) + sum(
+            self.weights.get(n, 0.0) * x for n, x in zip(FEATURE_NAMES, features))
+        return 1 / (1 + math.exp(-max(-60.0, min(60.0, z))))
+
+
+DEFAULT_MODEL = InjectionModel(weights={"bias": -4.91, "sim": 4.14, "lex": 3.19, "sem_margin": 2.46,
+                                        "lex_margin": 0.3, "sem_top": 1.68, "lex_top": 1.94,
+                                        "both_top": 0.87, "importance": -0.29, "in_project": 2.19},
+                               min_prob=0.5, trained_on=169, fitted_at="2026-10-21")
+
+
+def _model_path() -> Path:
+    env = os.environ.get("DIARY_INJECTION_MODEL")
+    if env:
+        return Path(env)
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "diary-mcp" / "injection_model.json"
+
+
+def load_model() -> InjectionModel:
+    """Model file if present and well-formed, else DEFAULT_MODEL. Never raises."""
+    try:
+        data = json.loads(_model_path().read_text())
+        weights = {k: float(v) for k, v in data["weights"].items()}
+        if set(weights) != set(FEATURE_NAMES) | {"bias"}:
+            return DEFAULT_MODEL
+        return InjectionModel(weights=weights, min_prob=float(data.get("min_prob", DEFAULT_MODEL.min_prob)),
+                              trained_on=int(data.get("trained_on", 0)), fitted_at=str(data.get("fitted_at", "")))
+    except Exception:
+        return DEFAULT_MODEL
+
+
+def save_model(model: InjectionModel) -> Path:
+    path = _model_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"weights": model.weights, "min_prob": model.min_prob,
+                               "trained_on": model.trained_on, "fitted_at": model.fitted_at}, indent=2))
+    tmp.replace(path)
+    return path
+
+
+def candidate_features(cands: list[dict]) -> list[list[float]]:
+    """Per candidate, in FEATURE_NAMES order. Margins are relative to the
+    best other candidate of the same signal."""
+    sims = sorted((c["sim"] for c in cands if c.get("sim") is not None), reverse=True)
+    lexs = sorted((c["lex_conf"] for c in cands if c.get("lex_conf", 0) > 0), reverse=True)
+    out = []
+    for c in cands:
+        s = c["sim"] if c.get("sim") is not None else 0.0
+        l = c.get("lex_conf", 0.0)
+        sem_top = c.get("sim") is not None and s == sims[0]
+        lex_top = l > 0 and l == lexs[0]
+        if sims:
+            other = (sims[1] if len(sims) > 1 else 0.0) if sem_top else sims[0]
+            sem_margin = s - other
+        else:
+            sem_margin = 0.0
+        if l > 0:
+            other = (lexs[1] if len(lexs) > 1 else 0.0) if lex_top else lexs[0]
+            lex_margin = l - other
+        else:
+            lex_margin = 0.0
+        out.append([s, l, sem_margin, lex_margin, float(sem_top), float(lex_top),
+                    float(sem_top and lex_top), float(c.get("importance", 0.5)),
+                    float(bool(c.get("in_project")))])
+    return out
+
+
 @dataclass(frozen=True)
 class RetrievalParams:
-    """Every knob of the per-prompt gate; defaults are the live settings."""
+    """Every knob of the per-prompt gate; defaults are the live settings.
+    mode 'learned' gates on the model probability (min_prob None → the
+    model's own threshold); 'threshold' is the pre-0.28 absolute gate."""
     max_hits: int = PROMPT_MAX_HITS
     min_confidence: float = MIN_CONFIDENCE
     min_importance: float = MIN_IMPORTANCE
@@ -348,6 +439,8 @@ class RetrievalParams:
     lex_min_score: float = LEX_MIN_SCORE
     sem_sim_zero: float = SEM_SIM_ZERO
     sem_sim_full: float = SEM_SIM_FULL
+    mode: str = "learned"
+    min_prob: float | None = None
 
 
 DEFAULT_PARAMS = RetrievalParams()
@@ -431,13 +524,16 @@ def score_candidates(conn, prompt: str, slug: str | None, qvec: list[float] | No
     lexemes = _prompt_lexemes(conn, prompt)
     if len(lexemes) < PROMPT_MIN_LEXEMES and qvec is None:
         return []
-    lex = (_lexical_hits(conn, lexemes, _project_base(slug), exclude, params)
+    base = _project_base(slug)
+    lex = (_lexical_hits(conn, lexemes, base, exclude, params)
            if len(lexemes) >= PROMPT_MIN_LEXEMES else [])
     sem = _semantic_hits(conn, qvec, exclude) if qvec else []
     merged: dict[str, dict] = {}
     for h in lex + sem:
         c = merged.setdefault(h["path"], {"path": h["path"], "title": h["title"], "body": h["body"],
-                                          "importance": h["importance"], "lex_conf": 0.0, "sim": None})
+                                          "importance": h["importance"], "lex_conf": 0.0, "sim": None,
+                                          "in_project": bool(base) and (h["path"] == base
+                                                                        or h["path"].startswith(base + "/"))})
         if "lex_conf" in h:
             c["lex_conf"] = h["lex_conf"]
         if "sim" in h:
@@ -454,15 +550,31 @@ def candidate_confidence(c: dict, params: RetrievalParams = DEFAULT_PARAMS) -> f
     return 1 - (1 - c.get("lex_conf", 0.0)) * (1 - sem)
 
 
-def rank_candidates(cands: list[dict], params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
-    ranked = [{**c, "confidence": candidate_confidence(c, params)} for c in cands]
+def rank_candidates(cands: list[dict], params: RetrievalParams = DEFAULT_PARAMS,
+                    model: InjectionModel | None = None) -> list[dict]:
+    if params.mode == "learned":
+        model = model or load_model()
+        confs = [model.prob(f) for f in candidate_features(cands)]
+    else:
+        confs = [candidate_confidence(c, params) for c in cands]
+    ranked = [{**c, "confidence": conf} for c, conf in zip(cands, confs)]
     ranked.sort(key=lambda h: (-h["confidence"], -h["importance"], h["path"]))
     return ranked
 
 
-def select_hits(cands: list[dict], params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
-    return [h for h in rank_candidates(cands, params)
-            if h["confidence"] >= params.min_confidence
+def gate_threshold(params: RetrievalParams = DEFAULT_PARAMS, model: InjectionModel | None = None) -> float:
+    if params.mode != "learned":
+        return params.min_confidence
+    return params.min_prob if params.min_prob is not None else (model or load_model()).min_prob
+
+
+def select_hits(cands: list[dict], params: RetrievalParams = DEFAULT_PARAMS,
+                model: InjectionModel | None = None) -> list[dict]:
+    if params.mode == "learned":
+        model = model or load_model()
+    threshold = gate_threshold(params, model)
+    return [h for h in rank_candidates(cands, params, model)
+            if h["confidence"] >= threshold
             and h["importance"] >= params.min_importance][:params.max_hits]
 
 
@@ -604,7 +716,7 @@ def _miss_info(cands: list[dict]) -> dict:
     if not cands:
         return {"reason": "no_candidates"}
     best = rank_candidates(cands)[0]
-    reason = "below_confidence" if best["confidence"] < MIN_CONFIDENCE else "low_importance"
+    reason = "below_confidence" if best["confidence"] < gate_threshold() else "low_importance"
     return {"reason": reason, "best": {"path": best["path"], "conf": round(best["confidence"], 3),
                                        "imp": best["importance"]}}
 
