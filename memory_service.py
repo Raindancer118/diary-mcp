@@ -34,6 +34,8 @@ CONTEXT_RECENT_LIMIT = 15
 # Memories should be small and specific (Tom 2026-09-27). Soft limit: saving
 # still works (sync/federation imports must never fail), the result just asks
 # to split.
+PROVENANCES = ("user", "claude", "import")
+PROVENANCE_LABEL = {"user": "von Tom gesagt", "claude": "von Claude erschlossen", "import": "importiert"}
 MEMORY_SOFT_MAX_CHARS = 1200
 CONTEXT_BRANCH_LIMIT = 40
 CONTEXT_GLOBAL_BUDGET = 4000
@@ -248,6 +250,7 @@ def memory_get(path: str) -> str:
         f"Wichtigkeit: {node['importance']:.1f} | Zugriffe: {node['access_count']}{pin_str}",
         f"Tags:       {', '.join(node['tags']) if node['tags'] else '—'}",
         f"Gültig bis: {str(node['valid_until'])[:10] if node['valid_until'] else '—'}",
+        f"Herkunft:   {PROVENANCE_LABEL.get(node.get('provenance'), 'unbekannt')}",
         f"Erstellt:   {str(node['created_at'])[:10]} | Geändert: {str(node['updated_at'])[:10]}",
         "",
         node["body"] or "(kein Inhalt)",
@@ -296,6 +299,7 @@ def memory_upsert(
     importance: float = 0.5,
     valid_until: str = "",
     origin: str = "curated",
+    provenance: str = "",
 ) -> str:
     """Erstellt oder aktualisiert einen Memory-Node.
 
@@ -311,10 +315,16 @@ def memory_upsert(
     origin:      'curated' (Default — bewusst gespeichert, Standard-Suche) oder
                  'extracted' (automatisch aus Transkript geerntet, nur auf Anfrage).
                  Für extrahierte Memories besser memory_save_extracted() nutzen.
+    provenance:  'user' (Tom hat es gesagt/entschieden) | 'claude' (von Claude
+                 erschlossen/vermutet) | 'import'. Leer = beim Update unverändert.
+                 Immer setzen: Schlüsse dürfen nicht als Toms Aussagen durchgehen.
 
     Hinweis: Das Pinning (automatisches Injizieren beim Session-Start oder nach
     Kompaktierung) wird separat über memory_pin() / memory_unpin() gesteuert.
     """
+    provenance_val = provenance.strip().lower() or None
+    if provenance_val and provenance_val not in PROVENANCES:
+        return f"Fehler: provenance muss einer von {', '.join(PROVENANCES)} sein (oder leer)."
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
     valid_until_val = valid_until.strip() if valid_until else None
     embedding = diary_embed.embed(f"{title}\n{body}")  # None if model unavailable
@@ -329,17 +339,20 @@ def memory_upsert(
             conn.execute(
                 "UPDATE memory_nodes SET title=%s, body=%s, type=%s, tags=%s, "
                 "importance=%s, valid_until=%s, origin=%s, embedding=%s, "
-                "deleted_at=NULL, updated_at=now() WHERE path=%s",
-                (title, body, type, tag_list, importance, valid_until_val, origin, embedding, path),
+                "provenance=COALESCE(%s, provenance), deleted_at=NULL, updated_at=now() WHERE path=%s",
+                (title, body, type, tag_list, importance, valid_until_val, origin, embedding,
+                 provenance_val, path),
             )
             _refresh_vector(conn, path, embedding)
             node_id = existing["id"]
             msg = f"Memory '{path}' aktualisiert."
         else:
             inserted = conn.execute(
-                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, valid_until, origin, embedding) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, origin, embedding),
+                "INSERT INTO memory_nodes (parent_id, path, slug, type, title, body, tags, importance, "
+                "valid_until, origin, embedding, provenance) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (parent_id, path, slug, type, title, body, tag_list, importance, valid_until_val, origin,
+                 embedding, provenance_val),
             ).fetchone()
             _refresh_vector(conn, path, embedding)
             node_id = inserted["id"]
@@ -393,7 +406,7 @@ def memory_save_extracted(path: str, title: str, body: str, type: str = "note",
     """
     ttl = (datetime.now() + timedelta(days=EXTRACTED_TTL_DAYS)).strftime("%Y-%m-%d")
     return memory_upsert(path=path, title=title, body=body, type=type, tags=tags,
-                         importance=importance, valid_until=ttl, origin="extracted")
+                         importance=importance, valid_until=ttl, origin="extracted", provenance="user")
 
 
 @mcp.tool()

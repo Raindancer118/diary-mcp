@@ -405,6 +405,9 @@ _SCHEMA = [
         PRIMARY KEY (session_id, path, injected_at)
     )""",
     "CREATE INDEX IF NOT EXISTS injection_feedback_path_idx ON injection_feedback(path)",
+    # provenance (v0.31.0): 'user' = Tom said it, 'claude' = Claude inferred it,
+    # 'import' = imported; NULL = unknown (everything older). Synced.
+    "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS provenance TEXT",
 
     # trigger_keywords: deterministic keyword-based auto-injection (v0.9.0). Distinct
     # from pin_triggers (session-start/compact lifecycle events) — these fire whenever

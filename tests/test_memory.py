@@ -492,6 +492,21 @@ class TestSync:
         finally:
             rconn.close()
 
+    def test_provenance_syncs(self):
+        """v0.31.0: who said it (user/claude/import) travels with the memory."""
+        self._reset_remote()
+        import diary_server
+        with patch("diary_embed.embed", return_value=None):
+            diary_server.memory_upsert(path="/user/sync-prov", title="P", body="b", provenance="user")
+        assert "fehlgeschlagen" not in diary_server.memory_sync().lower()
+        rconn = psycopg.connect(os.environ["DIARY_REMOTE_URL"], row_factory=dict_row)
+        try:
+            row = rconn.execute("SELECT provenance FROM memory_nodes WHERE path = %s",
+                                ("/user/sync-prov",)).fetchone()
+        finally:
+            rconn.close()
+        assert row["provenance"] == "user"
+
     def test_delete_propagates_and_does_not_resurrect(self):
         """Delete a node locally, sync, remote should tombstone it; re-sync should not resurrect."""
         self._reset_remote()

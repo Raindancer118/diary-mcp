@@ -22,18 +22,18 @@ _log = logging.getLogger(__name__)
 
 _SYNC_COLS = ("id::text, path, slug, type, title, body, tags, importance, "
               "valid_until, pin_triggers, origin, embedding, config, "
-              "deleted_at, created_at, updated_at")
+              "deleted_at, created_at, updated_at, provenance")
 _SYNC_INSERT = """INSERT INTO memory_nodes
        (path, slug, type, title, body, tags, importance, valid_until, pin_triggers,
-        origin, embedding, config, deleted_at, created_at, updated_at)
-       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        origin, embedding, config, deleted_at, created_at, updated_at, provenance)
+       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
        ON CONFLICT (path) DO UPDATE SET
            type=EXCLUDED.type, title=EXCLUDED.title, body=EXCLUDED.body,
            tags=EXCLUDED.tags, importance=EXCLUDED.importance,
            valid_until=EXCLUDED.valid_until, pin_triggers=EXCLUDED.pin_triggers,
            origin=EXCLUDED.origin, embedding=EXCLUDED.embedding,
            config=EXCLUDED.config, deleted_at=EXCLUDED.deleted_at,
-           updated_at=EXCLUDED.updated_at"""
+           updated_at=EXCLUDED.updated_at, provenance=EXCLUDED.provenance"""
 
 
 def _sync_row(n: dict) -> tuple:
@@ -41,7 +41,7 @@ def _sync_row(n: dict) -> tuple:
             n["importance"], n["valid_until"], n["pin_triggers"] or [],
             n["origin"], n["embedding"],
             json.dumps(n["config"]) if n.get("config") is not None else "{}",
-            n["deleted_at"], n["created_at"], n["updated_at"])
+            n["deleted_at"], n["created_at"], n["updated_at"], n.get("provenance"))
 
 
 def _last_sync_key() -> str:
@@ -194,6 +194,7 @@ def _ensure_remote_schema(conn) -> None:
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS config JSONB DEFAULT '{}'")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
     conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS pin_triggers TEXT[] DEFAULT '{}'")
+    conn.execute("ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS provenance TEXT")
     # Migration: backfill pin_triggers from old boolean columns if they still exist, then drop them.
     conn.execute("""
         DO $$

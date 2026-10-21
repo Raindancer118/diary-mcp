@@ -461,7 +461,8 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str],
                   params: RetrievalParams = DEFAULT_PARAMS) -> list[dict]:
     tsq = " | ".join("'" + lx.replace("'", "''") + "'" for lx in lexemes)
     rows = conn.execute(
-        f"SELECT path, title, body, importance, tsvector_to_array(to_tsvector('german', coalesce(title,''))) AS tlx, "
+        f"SELECT path, title, body, importance, provenance, "
+        f"tsvector_to_array(to_tsvector('german', coalesce(title,''))) AS tlx, "
         f"tsvector_to_array({_DOC}) AS dlx FROM memory_nodes "
         f"WHERE {_LIVE} AND {_NOT_AUTO} AND type <> 'category' "
         f"AND {_DOC} @@ to_tsquery('simple', %s) "
@@ -491,7 +492,7 @@ def _lexical_hits(conn, lexemes: list[str], base: str | None, exclude: set[str],
         # title has to carry a good part of the query too.
         title_mass = sum(_idf(n, df.get(lx, 1)) for lx in qset & set(r["tlx"]))
         confidence = min(1.0, matched_mass / query_mass, 0.5 + title_mass / query_mass)
-        hits.append({"path": r["path"], "title": r["title"], "body": r["body"],
+        hits.append({"path": r["path"], "title": r["title"], "body": r["body"], "provenance": r["provenance"],
                      "importance": float(r["importance"] or 0.5), "lex_conf": confidence})
     return hits
 
@@ -508,7 +509,7 @@ def _semantic_hits(conn, qvec: list[float], exclude: set[str]) -> list[dict]:
     if _has_pgvector(conn):
         vec = "[" + ",".join(f"{x:.6f}" for x in qvec) + "]"
         rows = conn.execute(
-            f"SELECT path, title, body, importance, 1 - (embedding_v <=> %s::vector) AS sim FROM memory_nodes "
+            f"SELECT path, title, body, importance, provenance, 1 - (embedding_v <=> %s::vector) AS sim FROM memory_nodes "
             f"WHERE {_LIVE} AND {_NOT_AUTO} AND embedding_v IS NOT NULL AND type <> 'category' "
             f"ORDER BY embedding_v <=> %s::vector LIMIT 10",
             (vec, vec),
@@ -516,12 +517,12 @@ def _semantic_hits(conn, qvec: list[float], exclude: set[str]) -> list[dict]:
     else:
         import diary_embed
         cand = conn.execute(
-            f"SELECT path, title, body, importance, embedding FROM memory_nodes "
+            f"SELECT path, title, body, importance, provenance, embedding FROM memory_nodes "
             f"WHERE {_LIVE} AND {_NOT_AUTO} AND embedding IS NOT NULL AND type <> 'category'"
         ).fetchall()
         rows = sorted(({**r, "sim": diary_embed.cosine(qvec, r["embedding"])} for r in cand),
                       key=lambda r: -r["sim"])[:10]
-    return [{"path": r["path"], "title": r["title"], "body": r["body"],
+    return [{"path": r["path"], "title": r["title"], "body": r["body"], "provenance": r["provenance"],
              "importance": float(r["importance"] or 0.5), "sim": float(r["sim"])}
             for r in rows if r["path"] not in exclude]
 
@@ -554,6 +555,7 @@ def score_candidates(conn, prompt: str, slug: str | None, qvec: list[float] | No
     merged: dict[str, dict] = {}
     for h in lex + sem:
         c = merged.setdefault(h["path"], {"path": h["path"], "title": h["title"], "body": h["body"],
+                                          "provenance": h.get("provenance"),
                                           "importance": h["importance"], "lex_conf": 0.0, "sim": None,
                                           "in_project": bool(base) and (h["path"] == base
                                                                         or h["path"].startswith(base + "/"))})
@@ -626,13 +628,17 @@ def _query_vector(prompt: str) -> tuple[list[float] | None, str]:
         return None, type(e).__name__
 
 
+_PROVENANCE_NOTE = {"user": " (von Tom gesagt)", "claude": " (von Claude erschlossen)"}
+
+
 def format_prompt_hits(hits: list[dict]) -> str:
     lines = ["# diary-mcp: passende Memories zu diesem Prompt (automatisch)"]
     for h in hits:
         body = (h["body"] or "").strip()
         if len(body) > PROMPT_SNIPPET_CHARS:
             body = body[:PROMPT_SNIPPET_CHARS].rstrip() + f" … [→ memory_get(\"{h['path']}\")]"
-        lines.append(f"## {h['title']} ⟨{h['path']}⟩\n{body}")
+        origin = _PROVENANCE_NOTE.get(h.get("provenance"), "")
+        lines.append(f"## {h['title']} ⟨{h['path']}⟩{origin}\n{body}")
     return "\n".join(lines)
 
 
