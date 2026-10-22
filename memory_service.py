@@ -6,6 +6,7 @@ config. The two-tier model (curated vs extracted) and pin_triggers live here.
 Split out of the former diary_server.py monolith (v0.10.0).
 """
 import json
+import os
 from datetime import datetime, timedelta
 
 import psycopg
@@ -290,6 +291,11 @@ def _refresh_vector(conn, path: str, embedding) -> None:
 
 
 @mcp.tool()
+def _forced_tags() -> list[str]:
+    """Tags an agent's own diary server stamps on everything it writes (DIARY_FORCE_TAGS)."""
+    return [t.strip() for t in os.environ.get("DIARY_FORCE_TAGS", "").split(",") if t.strip()]
+
+
 def memory_upsert(
     path: str,
     title: str,
@@ -326,6 +332,7 @@ def memory_upsert(
     if provenance_val and provenance_val not in PROVENANCES:
         return f"Fehler: provenance muss einer von {', '.join(PROVENANCES)} sein (oder leer)."
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    tag_list += [t for t in _forced_tags() if t.lower() not in {x.lower() for x in tag_list}]
     valid_until_val = valid_until.strip() if valid_until else None
     embedding = diary_embed.embed(f"{title}\n{body}")  # None if model unavailable
 
