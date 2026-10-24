@@ -290,12 +290,12 @@ def _refresh_vector(conn, path: str, embedding) -> None:
     )
 
 
-@mcp.tool()
 def _forced_tags() -> list[str]:
     """Tags an agent's own diary server stamps on everything it writes (DIARY_FORCE_TAGS)."""
     return [t.strip() for t in os.environ.get("DIARY_FORCE_TAGS", "").split(",") if t.strip()]
 
 
+@mcp.tool()
 def memory_upsert(
     path: str,
     title: str,
