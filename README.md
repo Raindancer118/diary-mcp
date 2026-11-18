@@ -1,8 +1,15 @@
 # diary-mcp
 
-MCP server for Claude — persistent memory tree and project diary, backed by PostgreSQL.
+[![CI](https://github.com/Raindancer118/diary-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Raindancer118/diary-mcp/actions/workflows/ci.yml)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-336791)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-Provides Claude with a structured, searchable, cross-session memory system and a project journal (log entries, milestones, tasks, wiki pages, reminders, error solutions). Supports bidirectional sync between machines via SSH tunnel.
+A long-term memory for Claude: a structured memory tree and project diary on PostgreSQL, with hybrid search and sync between machines.
+
+**Why.** Claude forgets everything between sessions. diary-mcp gives it one place for decisions, preferences and project state, and finds them again by meaning, not just by keyword. Memories are curated by default. Whatever gets extracted automatically from transcripts lives in a separate tier, so everyday search stays precise and cheap.
+
+**What you get.** A memory tree with importance, expiry and a knowledge graph, hybrid search (full text and multilingual embeddings fused with Reciprocal Rank Fusion), session hooks that inject the right memories at the right time, a project diary (logs, milestones, tasks, wiki, reminders, error solutions), a local web UI and bidirectional sync over an SSH tunnel.
 
 ## Features
 
@@ -104,7 +111,7 @@ DIARY_REMOTE_URL=postgresql://localhost:54321/diary_mcp
 
 Pins (`memory_pin`) are only allowed inside a project (`/projects/<slug>/…`); global rules reach the model as one-liners in the digest instead. Every injected pin block carries the instruction to keep pins relevant and `memory_unpin` the ones without value.
 
-### Web UI (v0.23.0)
+### Web UI
 
 `diary-web` serves three views, all offline (fonts are bundled, nothing is fetched from the internet):
 
@@ -114,7 +121,7 @@ Pins (`memory_pin`) are only allowed inside a project (`/projects/<slug>/…`); 
 
 Keys: `Ctrl/⌘ K` or `/` search, `1`–`4` switch views, `Esc` closes. Write endpoints (`/api/sync`, `/api/suggestions/decide`) require JSON and a same-origin `Origin` header (CSRF guard). Assets live in `diary_web_assets/` (package data); design decisions in `Design.md`. Honours `prefers-reduced-motion`; strict CSP, no framing.
 
-### Web UI autostart (v0.22.0)
+### Web UI autostart
 
 Every diary-mcp server checks at startup whether diary-web is listening on `127.0.0.1:8765` (`DIARY_WEB_PORT`). If it isn't, the server starts diary-web detached (it outlives the MCP process; log: `~/.cache/diary-mcp/diary-web.log`) and opens it in the browser. An already running UI is left alone, so new Claude sessions don't open more tabs. A file lock ensures only one of several concurrently starting sessions does this. Skipped without `WAYLAND_DISPLAY`/`DISPLAY`, over SSH (e.g. the Dorn instance) and with `DIARY_WEB_AUTOSTART=0`.
 
@@ -122,7 +129,7 @@ Every diary-mcp server checks at startup whether diary-web is listening on `127.
 
 Memories should be small and specific: one fact per memory, no filler, bullet points; they only need to be readable for Claude. `memory_upsert` still saves bodies over 1200 characters but asks to split them, and `memory_stats` counts them as cleanup candidates.
 
-### Statistics (v0.19.0)
+### Statistics
 
 `memory_stats(days=30, project_slug="")` (MCP tool) and `GET /api/stats?days=30&project=<slug>` (diary-web, JSON) report:
 
@@ -132,7 +139,7 @@ Memories should be small and specific: one fact per memory, no filler, bullet po
 
 Token counts are estimates (characters / 3.7).
 
-## Automatic linking (v0.24.0)
+## Automatic linking
 
 Every candidate pair of curated memories gets a **confidence** (`link_inference.py`):
 
@@ -153,7 +160,7 @@ The model is refitted nightly on the **deliberate** links only (set by hand or a
 
 Runs at write time (`memory_upsert`, ~65 ms with a warm per-process cache, at most `AUTO_LINK_MAX_NEW` non-mention links per save) and nightly over the whole tree (`scripts/link_inference_cron.py`, systemd user timer `diary-link-inference.timer`, 04:30, log `~/.local/share/diary-link-inference.log`). `memory_stats` and diary-web show auto-link and suggestion counts. The admin tool `memory_infer_links(threshold)` is the older pure-cosine variant for manual use.
 
-## Backup export (v0.14.0)
+## Backup export
 
 `scripts/memory_backup_export.py` mirrors every curated node as a Markdown file (frontmatter: title, type, tags, importance, valid_until, pin_triggers, updated_at) into a separate, private git repo — [diary-mcp-backup](https://github.com/Raindancer118/diary-mcp-backup) — giving a human-readable, diffable point-in-time backup independent of Postgres. Wipes and rewrites the whole `memory-tree/` directory each run so deletions show up as real diffs; commits + pushes only when something changed.
 
@@ -168,7 +175,7 @@ Deployed locally as a systemd user timer (daily, 04:00, i.e. before the link-inf
 
 `memory_list_by_tag(tag, include_extracted=False)` — the `tags` column (settable since the original schema via `memory_upsert(tags=...)`) was write-only until v0.14.0; this queries curated nodes by exact tag match.
 
-## Diary federation (v0.15.0)
+## Diary federation
 
 E2EE pairing/sync with another person's diary-mcp instance via the separate
 [diary-relay](https://github.com/Raindancer118/diary-relay) service — see
@@ -196,7 +203,7 @@ tests) during development.
 **Live at https://diary-relay.tstieh.de** (deployed 12.09.2026) — pass this
 URL as `relay_url` to `diary_link_init`.
 
-### Automatic sync (v0.16.0)
+### Automatic sync
 
 Opt-in, on top of the manual tool — same two-mechanism pattern as
 [Automatic linking](#automatic-linking-v0240) (write-time + periodic batch):
@@ -278,7 +285,7 @@ createdb diary_mcp_pytest && createdb diary_mcp_pytest_remote
 uv run pytest
 ```
 
-98 tests cover upsert/update, access tracking, tombstones, two-tier visibility (incl. the extracted-tier tripwire), hybrid search, contradiction surfacing, embedding fallback, sync round-trip, extracted lifecycle, and project config.
+337 tests cover upsert/update, access tracking, tombstones, two-tier visibility (incl. the extracted-tier tripwire), hybrid search, contradiction surfacing, embedding fallback, sync round-trip, extracted lifecycle, and project config.
 
 CI runs on GitHub Actions with a pgvector service container.
 
@@ -312,3 +319,7 @@ suite reloads `diary_db`/`diary_embed` between DB targets, and a `from...import`
 keep pointing at the stale pre-reload function object.
 
 Memory nodes are stored with UUID primary keys (conflict-free sync), `path` unique index, `importance` (0–1), `access_count`/`accessed_at`, `valid_until`, `origin` (curated|extracted), `trigger_keywords` (retired in v0.10.0, column kept for schema stability — no destructive migration on the live synced DB), and a 384-dimensional embedding column. The knowledge graph lives in a `memory_links` table.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
